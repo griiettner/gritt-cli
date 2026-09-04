@@ -225,13 +225,14 @@ tickets:
   - id: TKT-0013
     namespace: griiettner
     title: Complete cross-platform reproducible builds, diagnostics, documentation, end-to-end verification, and integrated hardening
-    status: planning
+    status: done
     owner: griiettner
     priority: normal
     created: 2026-09-04
     updated: 2026-09-04
     artifacts:
       task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0013/task.md
+      report: .agents/tasks/griiettner/TKT-0001-0025/TKT-0013/report.md
     dependencies:
       - TKT-0012
     areas:

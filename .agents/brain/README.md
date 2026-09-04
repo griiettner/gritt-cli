@@ -235,6 +235,7 @@ The local schema contains:
 | `documents_turso_fts`       | File-level Turso FTS index          |
 | `document_chunks_turso_fts` | Chunk retrieval index               |
 | `index_runs`          | Index execution history             |
+| `gritt_*`             | The Gritt product namespace: sessions, events, continuations, telemetry, analytics, content log, and `gritt_schema_migrations`. Owned by the `gritt` binary, never touched by `gritt-agent` |
 
 Turso 0.7.2 is compiled into the binary with local FTS enabled and Cloud sync
 disabled. No system database, account, credentials, or network access is
