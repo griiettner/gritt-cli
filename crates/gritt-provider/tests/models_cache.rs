@@ -205,3 +205,85 @@ async fn a_failed_refresh_is_not_retried_until_the_interval_passes() {
         .unwrap();
     assert_eq!(transport.request_count(), 4);
 }
+
+#[tokio::test]
+async fn a_failed_refresh_is_throttled_even_when_stale_fallback_is_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ModelCache::new(dir.path());
+    let strict = ModelListPolicy {
+        stale_fallback: false,
+        ..ModelListPolicy::default()
+    };
+    let keys = keys();
+    let profile = profile(Protocol::ChatCompletions);
+    let now = Utc::now();
+    let transport = FixtureTransport::new(
+        [
+            FixtureResponse::json(200, fixture("chat-completions", "models.json")),
+            FixtureResponse::json(503, r#"{"error":{"message":"down"}}"#),
+        ],
+        64,
+    );
+    load_models(&cache, &transport, &*keys, &profile, &strict, now, false)
+        .await
+        .unwrap();
+    let next_day = now + Duration::hours(25);
+    let error = load_models(
+        &cache, &transport, &*keys, &profile, &strict, next_day, false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::StaleModelList);
+    assert_eq!(transport.request_count(), 2);
+
+    // Inside the interval the failed attempt is honored: no request leaves.
+    let soon = next_day + Duration::hours(1);
+    let error = load_models(&cache, &transport, &*keys, &profile, &strict, soon, false)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::StaleModelList);
+    assert_eq!(transport.request_count(), 2);
+    assert!(error.diagnostic.unwrap()["last_attempt_at"].is_string());
+
+    // After the interval the refresh is attempted again.
+    let later = next_day + Duration::hours(25);
+    let _ = load_models(&cache, &transport, &*keys, &profile, &strict, later, false).await;
+    assert_eq!(transport.request_count(), 3);
+}
+
+#[tokio::test]
+async fn a_failed_first_fetch_is_not_retried_until_the_interval_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ModelCache::new(dir.path());
+    let policy = ModelListPolicy::default();
+    let keys = keys();
+    let profile = profile(Protocol::Responses);
+    let now = Utc::now();
+    let transport = FixtureTransport::new(
+        [FixtureResponse::json(
+            500,
+            r#"{"error":{"message":"down"}}"#,
+        )],
+        64,
+    );
+    let error = load_models(&cache, &transport, &*keys, &profile, &policy, now, false)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::MissingModelList);
+    assert_eq!(transport.request_count(), 1);
+
+    let soon = now + Duration::hours(1);
+    let error = load_models(&cache, &transport, &*keys, &profile, &policy, soon, false)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::MissingModelList);
+    assert_eq!(
+        transport.request_count(),
+        1,
+        "throttled attempt must not fetch"
+    );
+
+    // Forcing bypasses the throttle.
+    let _ = load_models(&cache, &transport, &*keys, &profile, &policy, soon, true).await;
+    assert_eq!(transport.request_count(), 2);
+}

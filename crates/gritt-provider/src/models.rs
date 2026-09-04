@@ -17,14 +17,17 @@ use serde::{Deserialize, Serialize};
 use crate::adapter::{provider_error, CapabilitySource, KeyProvider};
 use crate::transport::{HttpRequest, HttpTransport};
 
-/// The on-disk shape: one file per profile. `last_attempt_at` records the
-/// most recent refresh attempt, successful or not, so a failing provider is
-/// retried at most once per interval.
+/// The on-disk shape: one file per profile. `fetched_at` is `None` until a
+/// fetch has succeeded. `last_attempt_at` records the most recent refresh
+/// attempt, successful or not, so a failing provider is retried at most
+/// once per interval whether or not a list has ever been cached.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedModelList {
-    pub fetched_at: DateTime<Utc>,
+    #[serde(default)]
+    pub fetched_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub last_attempt_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub models: Vec<ModelInfo>,
 }
 
@@ -147,10 +150,11 @@ pub async fn fetch_models(
 }
 
 /// Loads the list, refreshing at most once per `policy.refresh_interval`.
-/// A failed refresh returns the cached list marked stale when the policy
-/// allows it, records the attempt so the provider is not retried again
-/// until the interval passes, and no cache plus a failed refresh is
-/// `MissingModelList`. `force_refresh` bypasses both timers.
+/// Every refresh attempt, successful or not, is recorded in the cache so
+/// the provider is not asked again until the interval passes. Inside that
+/// window a failed refresh answers from the cache: the stale list when the
+/// policy allows it, otherwise `StaleModelList`, or `MissingModelList` when
+/// no list was ever fetched. `force_refresh` bypasses both timers.
 pub async fn load_models(
     cache: &ModelCache,
     transport: &dyn HttpTransport,
@@ -164,32 +168,26 @@ pub async fn load_models(
     let interval =
         Duration::seconds(i64::try_from(policy.refresh_interval_secs).unwrap_or(i64::MAX));
     if let Some(cached) = &cached {
-        if !force_refresh && now.signed_duration_since(cached.fetched_at) < interval {
-            return Ok(ModelList {
-                profile: profile.name.clone(),
-                status: ModelListStatus::Fresh {
-                    fetched_at: cached.fetched_at,
-                },
-                models: cached.models.clone(),
-            });
+        if let Some(fetched_at) = cached.fetched_at {
+            if !force_refresh && now.signed_duration_since(fetched_at) < interval {
+                return Ok(ModelList {
+                    profile: profile.name.clone(),
+                    status: ModelListStatus::Fresh { fetched_at },
+                    models: cached.models.clone(),
+                });
+            }
         }
         let attempted_recently = cached
             .last_attempt_at
             .is_some_and(|attempt| now.signed_duration_since(attempt) < interval);
-        if !force_refresh && attempted_recently && policy.stale_fallback {
-            return Ok(ModelList {
-                profile: profile.name.clone(),
-                status: ModelListStatus::Stale {
-                    fetched_at: cached.fetched_at,
-                },
-                models: cached.models.clone(),
-            });
+        if !force_refresh && attempted_recently {
+            return from_cache_after_failure(profile, policy, cached, None);
         }
     }
     match fetch_models(transport, keys, profile).await {
         Ok(models) => {
             let fresh = CachedModelList {
-                fetched_at: now,
+                fetched_at: Some(now),
                 last_attempt_at: Some(now),
                 models,
             };
@@ -200,39 +198,59 @@ pub async fn load_models(
                 models: fresh.models,
             })
         }
-        Err(error) => match cached {
-            Some(mut cached) if policy.stale_fallback => {
-                cached.last_attempt_at = Some(now);
-                cache.write(&profile.name, &cached)?;
-                Ok(ModelList {
-                    profile: profile.name.clone(),
-                    status: ModelListStatus::Stale {
-                        fetched_at: cached.fetched_at,
-                    },
-                    models: cached.models,
-                })
-            }
-            Some(cached) => Err(Error::new(
-                ErrorKind::StaleModelList,
-                format!(
-                    "model list refresh for `{}` failed and stale fallback is disabled (cached {})",
-                    profile.name, cached.fetched_at
-                ),
-            )
-            .with_diagnostic(
-                serde_json::json!({ "cause": error.message, "detail": error.diagnostic }),
-            )),
-            None => Err(Error::new(
-                ErrorKind::MissingModelList,
-                format!(
-                    "no cached model list for `{}` and the refresh failed: {}",
-                    profile.name, error.message
-                ),
-            )
-            .with_diagnostic(
-                serde_json::json!({ "cause": error.message, "detail": error.diagnostic }),
-            )),
-        },
+        Err(error) => {
+            let mut attempted = cached.unwrap_or(CachedModelList {
+                fetched_at: None,
+                last_attempt_at: None,
+                models: Vec::new(),
+            });
+            attempted.last_attempt_at = Some(now);
+            cache.write(&profile.name, &attempted)?;
+            from_cache_after_failure(profile, policy, &attempted, Some(error))
+        }
+    }
+}
+
+/// Answers a load whose refresh failed, now or earlier in the interval.
+fn from_cache_after_failure(
+    profile: &ProviderProfile,
+    policy: &ModelListPolicy,
+    cached: &CachedModelList,
+    cause: Option<Error>,
+) -> Result<ModelList> {
+    let diagnostic = match &cause {
+        Some(error) => serde_json::json!({ "cause": error.message, "detail": error.diagnostic }),
+        None => serde_json::json!({
+            "cause": "refresh attempted earlier in the interval and failed",
+            "last_attempt_at": cached.last_attempt_at,
+        }),
+    };
+    match cached.fetched_at {
+        Some(fetched_at) if policy.stale_fallback => Ok(ModelList {
+            profile: profile.name.clone(),
+            status: ModelListStatus::Stale { fetched_at },
+            models: cached.models.clone(),
+        }),
+        Some(fetched_at) => Err(Error::new(
+            ErrorKind::StaleModelList,
+            format!(
+                "model list refresh for `{}` failed and stale fallback is disabled (cached {})",
+                profile.name, fetched_at
+            ),
+        )
+        .with_diagnostic(diagnostic)),
+        None => Err(Error::new(
+            ErrorKind::MissingModelList,
+            format!(
+                "no cached model list for `{}` and the refresh failed: {}",
+                profile.name,
+                cause
+                    .as_ref()
+                    .map(|error| error.message.as_str())
+                    .unwrap_or("not retried inside the refresh interval")
+            ),
+        )
+        .with_diagnostic(diagnostic)),
     }
 }
 

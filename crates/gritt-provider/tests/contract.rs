@@ -689,3 +689,62 @@ async fn cancellation_while_connecting_drops_the_send_and_yields_cancelled() {
         assert!(!cancel.is_cancelled());
     }
 }
+
+#[tokio::test]
+async fn short_keys_are_redacted_everywhere() {
+    const SHORT_KEY: &str = "ab1";
+    for protocol in PROTOCOLS {
+        let body = format!(
+            r#"{{"error":{{"message":"invalid key {SHORT_KEY}","echo":"Bearer {SHORT_KEY}"}}}}"#
+        );
+        let (mut context, _, _) =
+            make_context(protocol, vec![FixtureResponse::json(401, body)], 16);
+        context.keys = Arc::new(gritt_provider::adapter::StaticKey(
+            gritt_core::secret::Secret::new(SHORT_KEY),
+        ));
+        let adapter = adapter_for(context);
+        let error = adapter
+            .send(prompt(protocol, false))
+            .await
+            .err()
+            .expect("expected an error");
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        let diagnostic = serde_json::to_string(&error.diagnostic).unwrap();
+        for text in [&display, &debug, &diagnostic] {
+            assert!(!text.contains(SHORT_KEY), "{protocol:?}: short key leaked");
+            assert!(text.contains("[redacted]"), "{protocol:?}");
+        }
+        assert!(error.message.ends_with("invalid key [redacted]"));
+    }
+}
+
+#[tokio::test]
+async fn a_failed_request_does_not_leak_its_capability_warning_into_the_next() {
+    for protocol in PROTOCOLS {
+        let (context, transport, _) = make_context(
+            protocol,
+            vec![
+                FixtureResponse::json(500, r#"{"error":{"message":"down"}}"#),
+                sse(protocol, "stream-text.sse"),
+            ],
+            32,
+        );
+        let adapter = adapter_for(context);
+        // Tools are requested with no capability data, so a warning is
+        // queued; the request then fails before any stream exists.
+        let error = adapter.send(prompt(protocol, true)).await.err();
+        assert!(error.is_some(), "{protocol:?}");
+        // A clean request that asks for nothing unreported carries none.
+        let events = collect(adapter.send(prompt(protocol, false)).await.unwrap()).await;
+        assert_eq!(transport.request_count(), 2, "{protocol:?}");
+        assert_eq!(text_of(&events), "Hello, world", "{protocol:?}");
+        assert!(
+            events.iter().all(|event| event
+                .diagnostic
+                .as_ref()
+                .is_none_or(|d| d.get("capability_warning").is_none())),
+            "{protocol:?}: warning leaked into the next request"
+        );
+    }
+}

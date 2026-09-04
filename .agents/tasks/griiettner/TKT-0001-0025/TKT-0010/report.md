@@ -94,13 +94,17 @@ seven files per protocol.
   strict `Some(true)` gate would refuse tools on every native profile. The
   PM approved this during the TKT-0010 review. The gap is visible instead: a
   `capability_warning` diagnostic naming the unreported features and the
-  model is attached to the first event of that stream.
+  model is attached to the first event of that stream. The warning is
+  scoped to its request: the next capability check drops any earlier
+  warning, and a key or send failure clears it, so a failed request cannot
+  attach its warning to a later one.
 - Redaction. Every key resolved for a request is registered with the event
   emitter. Provider error messages and bodies, stream error elements, and
   event diagnostics are redacted against those keys before anything is
-  retained, and a retained body is capped at 4096 characters. An endpoint
-  that echoes a credential therefore cannot place it in an error,
-  transcript, or telemetry record.
+  retained, and a retained body is capped at 4096 characters. Every
+  non-empty key value is redacted whatever its length. An endpoint that
+  echoes a credential therefore cannot place it in an error, transcript, or
+  telemetry record.
 - Wire sequence. The Responses normalizer tracks `sequence_number` without
   reordering events. A gap or regression attaches a `sequence_warning`
   diagnostic to the events of that element, and the completion diagnostic
@@ -110,9 +114,12 @@ seven files per protocol.
   turn ends with the terminal `Cancelled` event. A turn started while the
   token is already cancelled ends the same way without a request. The token
   has a `reset` so a session can continue after a cancelled turn.
-- Refresh throttling. The cache file records `last_attempt_at`. After a
-  failed refresh the stale list is served without another fetch until the
-  interval passes; `force_refresh` bypasses the throttle.
+- Refresh throttling. The cache file records `last_attempt_at` for every
+  attempt, and `fetched_at` is empty until a fetch has succeeded. Inside the
+  interval after a failed refresh no request leaves: the stale list is
+  served when fallback is on, `StaleModelList` is returned when it is off,
+  and `MissingModelList` when no list was ever fetched. `force_refresh`
+  bypasses the throttle.
 - Cache file names append an FNV-1a hash of the profile name, so `a/b` and
   `a_b` no longer share a file.
 - Continuation state. Chat Completions and Messages store the wire-form
@@ -186,10 +193,11 @@ All run from the worktree root on 2026-09-04:
 
 - `cargo fmt --all --check`: pass.
 - `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test -p gritt-provider`: pass, 44 tests after the review fix round
-  (19 unit, 17 contract, 4 cache, 1 TCP end to end, 3 live tests that skip
-  without keys). Before the fix round: 34.
-- `cargo test --workspace`: pass, 70 tests after the fix round (60 before).
+- `cargo test -p gritt-provider`: pass, 49 tests after the second review
+  fix round (20 unit, 19 contract, 6 cache, 1 TCP end to end, 3 live tests
+  that skip without keys). After the first round: 44. Before: 34.
+- `cargo test --workspace`: pass, 75 tests after the second fix round (70
+  after the first, 60 before).
 - `cargo build --release`: pass, 1m 34s.
 - `gritt-agent ticket validate --repo-root .`: `tkt_validate ok (0
   warnings)`.
@@ -239,6 +247,16 @@ All run from the worktree root on 2026-09-04:
 
 ## Updates
 
+- 2026-09-04 second review fix round. The re-review found two incomplete
+  fixes and one new defect: keys shorter than four characters escaped
+  redaction; the refresh throttle applied only when stale fallback was on;
+  and a capability warning queued by a request that then failed could
+  attach to the next request. Redaction now covers every non-empty key,
+  every failed attempt is recorded and honored for the interval on both
+  policy paths and when nothing was ever cached, and the warning is cleared
+  by the next capability check and by every pre-stream failure. Five tests
+  cover the three cases. The validation set was rerun and is recorded
+  above.
 - 2026-09-04 review fix round. The PR #2 reviewer returned `needs-fix` with
   seven findings: provider bodies could carry an echoed key into errors and
   diagnostics; a failed refresh was retried on every load; unreported

@@ -70,7 +70,9 @@ impl AdapterContext {
     /// Resolves the key and registers it with the emitter so every error
     /// message and diagnostic produced for this request is redacted.
     pub fn key_for(&self, emitter: &EventEmitter) -> Result<Secret> {
-        let key = self.key()?;
+        let key = self
+            .key()
+            .inspect_err(|_| emitter.clear_pending_diagnostic())?;
         emitter.protect(key.clone());
         Ok(key)
     }
@@ -80,12 +82,15 @@ impl AdapterContext {
     /// because OpenAI and Anthropic lists report no capability flags at all
     /// (recorded exception in TKT-0010). The gap is made visible instead: a
     /// `capability_warning` diagnostic naming the unreported features is
-    /// attached to the first event of the stream.
+    /// attached to the first event of the stream. The warning is scoped to
+    /// this request: any warning left by an earlier request is dropped
+    /// here, and every pre-stream failure clears it again.
     pub fn check_capabilities(
         &self,
         request: &PromptRequest,
         emitter: &EventEmitter,
     ) -> Result<Option<ModelCapabilities>> {
+        emitter.clear_pending_diagnostic();
         let capabilities = self
             .capabilities
             .capabilities(&self.profile.name, &request.model);
@@ -126,8 +131,22 @@ impl AdapterContext {
     /// Sends the request and fails on a non-success status with the
     /// redacted provider body kept in the diagnostic. Cancellation is
     /// observed while the transport waits for the connection and headers;
-    /// the pending send is dropped and `Cancelled` is returned.
+    /// the pending send is dropped and `Cancelled` is returned. Any failure
+    /// here ends the request, so a queued capability warning is cleared and
+    /// cannot attach to a later request.
     pub async fn send_checked(
+        &self,
+        request: HttpRequest,
+        emitter: &EventEmitter,
+    ) -> Result<HttpResponse> {
+        let result = self.send_unchecked(request, emitter).await;
+        if result.is_err() {
+            emitter.clear_pending_diagnostic();
+        }
+        result
+    }
+
+    async fn send_unchecked(
         &self,
         request: HttpRequest,
         emitter: &EventEmitter,
@@ -153,14 +172,13 @@ impl AdapterContext {
 pub const MAX_DIAGNOSTIC_BODY_CHARS: usize = 4096;
 const REDACTED: &str = "[redacted]";
 
-/// Replaces every occurrence of each secret with `[redacted]`. Secrets
-/// shorter than four characters are skipped so a trivial value cannot
-/// mangle unrelated text.
+/// Replaces every occurrence of each non-empty secret with `[redacted]`.
+/// Length is no exemption: a short credential is still a credential.
 pub fn redact_text(text: &str, secrets: &[Secret]) -> String {
     let mut out = text.to_owned();
     for secret in secrets {
         let value = secret.expose();
-        if value.len() >= 4 && out.contains(value) {
+        if !value.is_empty() && out.contains(value) {
             out = out.replace(value, REDACTED);
         }
     }
@@ -260,6 +278,11 @@ impl EventEmitter {
     /// `capability_warning`.
     pub fn set_pending_diagnostic(&self, diagnostic: serde_json::Value) {
         *self.pending_diagnostic.lock().expect("pending diagnostic") = Some(diagnostic);
+    }
+
+    /// Drops a queued diagnostic so it cannot attach to another request.
+    pub fn clear_pending_diagnostic(&self) {
+        *self.pending_diagnostic.lock().expect("pending diagnostic") = None;
     }
 
     fn merge_pending(&self, diagnostic: Option<serde_json::Value>) -> Option<serde_json::Value> {
@@ -507,11 +530,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn redaction_replaces_every_occurrence_and_skips_short_values() {
-        let secrets = vec![Secret::new("sk-live-1234"), Secret::new("ab")];
+    fn redaction_replaces_every_occurrence_including_short_values() {
+        let secrets = vec![
+            Secret::new("sk-live-1234"),
+            Secret::new("ab"),
+            Secret::new(""),
+        ];
         assert_eq!(
             redact_text("key sk-live-1234 twice sk-live-1234 ab", &secrets),
-            "key [redacted] twice [redacted] ab"
+            "key [redacted] twice [redacted] [redacted]"
         );
         let value = serde_json::json!({
             "sk-live-1234": ["Bearer sk-live-1234", 7, { "nested": "sk-live-1234" }]
@@ -538,5 +565,13 @@ mod tests {
         assert_eq!(diagnostic["capability_warning"]["features"][0], "tools");
         let second = emitter.text("hi".into(), None);
         assert!(second.diagnostic.is_none());
+    }
+
+    #[test]
+    fn clearing_the_pending_warning_keeps_it_off_later_events() {
+        let emitter = EventEmitter::new(SessionId("s".into()), Protocol::Responses);
+        emitter.set_pending_diagnostic(serde_json::json!({ "features": ["tools"] }));
+        emitter.clear_pending_diagnostic();
+        assert!(emitter.text("hi".into(), None).diagnostic.is_none());
     }
 }
