@@ -30,7 +30,10 @@ Chain facts:
 - Worktree: `/Users/griiettner/Projects/grittflow/gritt-cli-tkt-0012`
 - Branch: `tkt-0012-04-connectors`
 - Base: `feature/tkt-0008-gritt-cli` at `fb2d9bb` (PR #3 merge)
-- Commits and PR: recorded in the Updates section once the PR is open
+- Commits: `ef2a974` (implementation, fixtures, ticket artifacts) and the
+  report update commit that follows it
+- PR: https://github.com/griiettner/gritt-cli/pull/4 into
+  `feature/tkt-0008-gritt-cli`
 
 What landed:
 
@@ -167,7 +170,13 @@ All run from the worktree root on 2026-09-04:
   events with usage and completion; `--connector cursor` failed with the
   not-installed message; `--connector grok` failed naming the valid
   names; the native path failed only on its own missing configuration.
-- `gritt-agent ticket validate` and both chain checks: see Updates.
+- `gritt-agent ticket validate --repo-root .`: ok, 0 warnings.
+- `gritt-agent ticket chain-check --ticket TKT-0012 --base
+  feature/tkt-0008-gritt-cli`: ok, 0 warnings, 50 changed files,
+  merge-base equal to the base tip `fb2d9bb`.
+- `gritt-agent ticket chain-check --ticket TKT-0012 --base main`: ok,
+  7 warnings, all expected: the merged TKT-0009, TKT-0010, and TKT-0011
+  ticket files and the merge-base gap against `main`.
 
 Benchmarks: none required. Test duration for the connector crate is about
 5 s; the cancellation and timeout tests dominate.
@@ -208,5 +217,5 @@ Benchmarks: none required. Test duration for the connector crate is about
 
 ## Updates
 
-- Pending: PR link, commits, and chain-check results are added after the
-  PR opens.
+- 2026-09-04 PR #4 opened; the report records the PR, the commits, and
+  both chain-check results.
