@@ -128,7 +128,9 @@ impl ProviderAdapter for MessagesAdapter {
                 // Messages has no response-format field; the harness must
                 // use a tool for structured output instead. This runs before
                 // the capability check so no request-scoped warning is
-                // queued for a request that never reaches the wire.
+                // queued for a request that never reaches the wire, and it
+                // drops any warning an earlier unpolled stream left behind.
+                self.emitter.clear_pending_diagnostic();
                 return Err(Error::unsupported_capability(
                     &request.model,
                     "structured output on the Messages protocol",
@@ -161,6 +163,9 @@ impl ProviderAdapter for MessagesAdapter {
         results: Vec<ToolResult>,
     ) -> BoxFuture<'_, Result<EventStream<'_>>> {
         Box::pin(async move {
+            // A continuation never queues its own warning, so anything still
+            // pending belongs to an earlier stream that was dropped unpolled.
+            self.emitter.clear_pending_diagnostic();
             {
                 let mut state = self.state.lock().expect("messages state");
                 if state.model.is_none() {

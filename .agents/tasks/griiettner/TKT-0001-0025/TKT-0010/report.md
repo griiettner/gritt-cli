@@ -247,6 +247,14 @@ All run from the worktree root on 2026-09-04:
 
 ## Updates
 
+- 2026-09-04 fourth review fix round. The Messages structured-output
+  refusal ran before the capability check, so it skipped the cleanup that
+  drops a warning left by an earlier stream dropped before its first poll,
+  and a following continuation could carry it. The refusal now clears the
+  pending diagnostic, and every `submit_tool_results` on all three adapters
+  clears it on entry because a continuation never queues its own warning.
+  One contract test covers the unpolled stream, refusal, and continuation
+  sequence. Validation rerun: 79 workspace tests pass.
 - 2026-09-04 third review fix round. The re-review found two remaining
   defects: redaction replaced secrets in registration order, so a short
   secret that is a substring of a longer one could leave the longer one's

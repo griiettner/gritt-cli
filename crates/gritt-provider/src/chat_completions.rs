@@ -196,6 +196,9 @@ impl ProviderAdapter for ChatCompletionsAdapter {
         results: Vec<ToolResult>,
     ) -> BoxFuture<'_, Result<EventStream<'_>>> {
         Box::pin(async move {
+            // A continuation never queues its own warning, so anything still
+            // pending belongs to an earlier stream that was dropped unpolled.
+            self.emitter.clear_pending_diagnostic();
             {
                 let mut state = self.state.lock().expect("chat state");
                 if state.model.is_none() {

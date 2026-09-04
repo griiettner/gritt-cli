@@ -158,6 +158,9 @@ impl ProviderAdapter for ResponsesAdapter {
         results: Vec<ToolResult>,
     ) -> BoxFuture<'_, Result<EventStream<'_>>> {
         Box::pin(async move {
+            // A continuation never queues its own warning, so anything still
+            // pending belongs to an earlier stream that was dropped unpolled.
+            self.emitter.clear_pending_diagnostic();
             {
                 let state = self.state.lock().expect("responses state");
                 if state.previous_response_id.is_none() {

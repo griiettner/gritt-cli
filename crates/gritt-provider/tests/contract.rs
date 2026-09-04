@@ -844,3 +844,60 @@ async fn messages_structured_output_refusal_leaves_no_warning_for_the_continuati
         "stale capability warning leaked into the continuation"
     );
 }
+
+#[tokio::test]
+async fn a_dropped_unpolled_stream_leaves_no_warning_after_a_messages_refusal() {
+    let (context, transport, _) = make_context(
+        Protocol::Messages,
+        vec![
+            sse(Protocol::Messages, "stream-tool-use.sse"),
+            sse(Protocol::Messages, "stream-text.sse"),
+            sse(Protocol::Messages, "stream-tool-result.sse"),
+        ],
+        16,
+    );
+    let adapter = adapter_for(context);
+    let events = collect(
+        adapter
+            .send(prompt(Protocol::Messages, true))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::ToolCall { .. })));
+    // Tools are unreported under NoCapabilities, so this queues a warning;
+    // dropping the stream before its first poll leaves it pending.
+    let unpolled = adapter
+        .send(prompt(Protocol::Messages, true))
+        .await
+        .unwrap();
+    drop(unpolled);
+    let mut refused = prompt(Protocol::Messages, true);
+    refused.options.structured_output = Some(serde_json::json!({ "type": "object" }));
+    let error = adapter
+        .send(refused)
+        .await
+        .err()
+        .expect("expected an error");
+    assert_eq!(error.kind, ErrorKind::UnsupportedCapability);
+    let follow_up = adapter
+        .submit_tool_results(vec![ToolResult {
+            call_id: ToolCallId("toolu_fx_1".into()),
+            name: "file_read".into(),
+            is_error: false,
+            output: "hi".into(),
+        }])
+        .await
+        .unwrap();
+    let events = collect(follow_up).await;
+    assert_eq!(transport.request_count(), 3);
+    assert!(
+        events.iter().all(|event| event
+            .diagnostic
+            .as_ref()
+            .is_none_or(|d| d.get("capability_warning").is_none())),
+        "stale capability warning from the unpolled stream leaked into the continuation"
+    );
+}
