@@ -168,19 +168,31 @@ pub struct ShellOutput {
     pub cancelled: bool,
 }
 
-/// Environment variable name suffixes that mark a credential. Variables
-/// with these suffixes, plus every configured profile key variable and
-/// `AGENT_MEMORY_API_KEY`, are removed from the shell child's environment
-/// so an approved command cannot hand a key back to the model.
-pub const SECRET_ENV_SUFFIXES: [&str; 3] = ["_API_KEY", "_TOKEN", "_SECRET"];
+/// Name fragments that mark a credential. Any variable whose name
+/// contains one of these (case-insensitive), every configured profile key
+/// variable, and `AGENT_MEMORY_API_KEY` are removed from the shell child's
+/// environment so an approved command cannot hand a key back to the model.
+/// The conventional cloud and VCS names (`AWS_SECRET_ACCESS_KEY`,
+/// `GITHUB_TOKEN`, `NPM_TOKEN`) all fall under this rule.
+pub const SECRET_ENV_MARKERS: [&str; 6] =
+    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"];
+
+/// Variables that a shell needs and never carry a credential.
+const PLAIN_ENV_NAMES: [&str; 12] = [
+    "PATH", "HOME", "TMPDIR", "TEMP", "TMP", "TERM", "LANG", "USER", "SHELL", "PWD", "LOGNAME",
+    "SHLVL",
+];
 
 pub fn is_secret_env_name(name: &str, blocked: &[String]) -> bool {
     let upper = name.to_ascii_uppercase();
+    if PLAIN_ENV_NAMES.contains(&upper.as_str()) || upper.starts_with("LC_") {
+        return false;
+    }
     upper == "AGENT_MEMORY_API_KEY"
         || blocked.iter().any(|known| known.eq_ignore_ascii_case(name))
-        || SECRET_ENV_SUFFIXES
+        || SECRET_ENV_MARKERS
             .iter()
-            .any(|suffix| upper.ends_with(suffix))
+            .any(|marker| upper.contains(marker))
 }
 
 /// The names in the current environment a shell child must not inherit.
@@ -623,8 +635,17 @@ mod tests {
         assert!(is_secret_env_name("APP_SECRET", &blocked));
         assert!(is_secret_env_name("AGENT_MEMORY_API_KEY", &blocked));
         assert!(is_secret_env_name("my_provider_credential", &blocked));
+        assert!(is_secret_env_name("AWS_SECRET_ACCESS_KEY", &blocked));
+        assert!(is_secret_env_name("GITHUB_TOKEN", &blocked));
+        assert!(is_secret_env_name("NPM_TOKEN", &blocked));
+        assert!(is_secret_env_name("DB_PASSWORD", &blocked));
+        assert!(is_secret_env_name("pgpasswd", &blocked));
+        assert!(is_secret_env_name("KEYCHAIN_PATH", &blocked));
         assert!(!is_secret_env_name("PATH", &blocked));
         assert!(!is_secret_env_name("HOME", &blocked));
+        assert!(!is_secret_env_name("TERM", &blocked));
+        assert!(!is_secret_env_name("LC_ALL", &blocked));
+        assert!(!is_secret_env_name("CARGO_HOME", &blocked));
     }
 
     #[cfg(unix)]
@@ -634,6 +655,8 @@ mod tests {
         std::env::set_var("GRITT_TEST_SHELL_API_KEY", "shell-env-secret-8841");
         std::env::set_var("GRITT_TEST_PROFILE_CRED", "profile-env-secret-8842");
         std::env::set_var("GRITT_TEST_PLAIN", "plain-value-8843");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "aws-env-secret-8844");
+        std::env::set_var("GITHUB_TOKEN", "github-env-secret-8845");
         let registry = ProcessRegistry::new();
         let output = run_shell(
             &ws,
@@ -647,7 +670,10 @@ mod tests {
         assert_eq!(output.status, Some(0));
         assert!(!output.stdout.contains("shell-env-secret-8841"));
         assert!(!output.stdout.contains("profile-env-secret-8842"));
+        assert!(!output.stdout.contains("aws-env-secret-8844"));
+        assert!(!output.stdout.contains("github-env-secret-8845"));
         assert!(output.stdout.contains("plain-value-8843"));
+        assert!(output.stdout.contains("PATH="));
     }
 
     #[cfg(unix)]

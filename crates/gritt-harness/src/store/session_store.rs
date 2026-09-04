@@ -68,6 +68,37 @@ impl Store {
         Ok(())
     }
 
+    /// Records the phase the model was last told about, or clears it.
+    pub async fn set_told_phase(&self, id: &SessionId, phase: Option<Phase>) -> Result<()> {
+        self.connection()
+            .execute(
+                "UPDATE gritt_sessions SET told_phase = ?1 WHERE id = ?2",
+                turso::params![phase.map(phase_name), id.0.clone()],
+            )
+            .await
+            .map_err(storage_error)?;
+        Ok(())
+    }
+
+    /// The phase the model was last told about, `None` when unknown.
+    pub async fn told_phase(&self, id: &SessionId) -> Result<Option<Phase>> {
+        let mut rows = self
+            .connection()
+            .query(
+                "SELECT told_phase FROM gritt_sessions WHERE id = ?1",
+                turso::params![id.0.clone()],
+            )
+            .await
+            .map_err(storage_error)?;
+        match rows.next().await.map_err(storage_error)? {
+            Some(row) => {
+                let text: Option<String> = row.get(0).map_err(storage_error)?;
+                text.as_deref().map(parse_phase).transpose()
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Finds a session by name, for `--session NAME` and `/resume NAME`.
     pub async fn find_by_name(&self, name: &str) -> Result<Option<Session>> {
         let mut rows = self
@@ -446,6 +477,17 @@ mod tests {
             store.get(&native.id).await.unwrap().unwrap().phase,
             Phase::Coding
         );
+        assert_eq!(store.told_phase(&native.id).await.unwrap(), None);
+        store
+            .set_told_phase(&native.id, Some(Phase::Planning))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.told_phase(&native.id).await.unwrap(),
+            Some(Phase::Planning)
+        );
+        store.set_told_phase(&native.id, None).await.unwrap();
+        assert_eq!(store.told_phase(&native.id).await.unwrap(), None);
         store.rename(&native.id, "renamed".into()).await.unwrap();
         assert_eq!(
             store.find_by_name("renamed").await.unwrap().unwrap().id,

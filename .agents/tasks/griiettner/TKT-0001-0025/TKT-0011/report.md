@@ -97,23 +97,38 @@ it is not. Ctrl-C cancels a running turn and exits when nothing runs.
   When the phase changes after that, the next user message is prefixed
   with a phase transition note naming the tools that are now available or
   withdrawn, so the retained system instruction cannot mislead the model.
+  The phase the model was last told about is persisted in the
+  `told_phase` column (migration `0003_session_told_phase`), so a phase
+  change followed by an exit still sends the note on resume, and a
+  session with no recorded value sends the current-phase note rather
+  than assuming the model heard it.
 - Recorded exception, shell confinement: ADR-009 runs shell under approval
   and bounds only the file tools to the workspace. No operating-system
   sandbox is built. Instead the shell child runs in the workspace root,
   the approval prompt states that the command runs with the user's
   authority and may reach outside the workspace, and a command that names
-  an absolute path outside the workspace, a drive path, or a `..`
-  component gets the stronger prompt. TKT-0013 documents this boundary
-  in the tool and privacy docs.
+  an absolute path outside the workspace, a drive path, a `..` component,
+  or a path the shell would expand (`~`, `~user`, `$VAR`, `${VAR}`,
+  `%VAR%`) gets the stronger prompt. Such a command is never allowed
+  silently: an `allow` outcome from any rule becomes `ask`; `deny` stays
+  `deny`. TKT-0013 documents this boundary in the tool and privacy docs.
 - Shell children never inherit credentials. Every configured profile key
-  variable, `AGENT_MEMORY_API_KEY`, and any variable ending in `_API_KEY`,
-  `_TOKEN`, or `_SECRET` is removed from the child environment.
+  variable, `AGENT_MEMORY_API_KEY`, and any variable whose name contains
+  `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, or `CREDENTIAL` is
+  removed from the child environment, which covers the conventional
+  names such as `AWS_SECRET_ACCESS_KEY` and `GITHUB_TOKEN`. `PATH`,
+  `HOME`, `TERM`, the locale variables, and the other plain shell
+  variables are kept.
 - Session events keep tool arguments and outputs because resume and the
   transcript need them, but every event, tool result, approval resource,
   and content-log row is redacted against the active key before it is
-  shown, stored, or sent back to the provider. Approval events record the
-  tool, the resource, the reason, and the decision; the diff preview is
-  shown and never stored.
+  shown, stored, or sent back to the provider. The adapter's continuation
+  state is redacted the same way before it is saved, and the diff preview
+  is redacted before it is shown and never stored. The redacted approval
+  request is built once and is what the interface, the events, and the
+  transcript all see. While content logging is off, the stored approval
+  request keeps only the tool, the resource, and the call id; the reason
+  and the destructive flag are shown and not persisted.
 - A session resumes only in the workspace it was recorded in. Canonical
   paths are compared and a mismatch names both paths and the
   `--workspace` flag that resolves it.
@@ -121,6 +136,18 @@ it is not. Ctrl-C cancels a running turn and exits when nothing runs.
   REPL read the answer on a blocking thread so Ctrl-C can end the turn;
   the full-screen mode drops the approval view on Esc. A cancel during a
   pending approval denies the tool and ends the turn as cancelled.
+- One reader owns stdin. `LineInput` runs a reader thread that forwards
+  lines over a channel; the REPL loop takes commands from it and the
+  approval prompter takes answers from it, so neither holds the stdin
+  lock while the other waits. A prompter whose turn was cancelled gives
+  up its wait within 100 ms, so the next typed line reaches the loop as
+  a command instead of answering a question that is gone. Print mode
+  uses the same owner.
+- The diff preview is built before any approval event is recorded, so a
+  preview that cannot be built refuses the call without leaving an
+  unmatched request. An approval prompt that cannot be written denies at
+  once, and print mode reports an output failure on its closing write
+  with a non-zero exit code.
 - Tool calls whose arguments fail to resolve, including paths outside the
   workspace, never reach the policy; the refusal is still recorded as an
   error tool result and returned to the model.
@@ -180,10 +207,10 @@ All run from the worktree root on 2026-09-04:
 
 - `cargo fmt --all --check`: pass.
 - `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test -p gritt-harness`: pass, 52 tests (36 unit, 16 integration)
-  after the review fix round; 39 before it.
-- `cargo test --workspace`: pass, 127 tests after the fix round; 114
-  before it.
+- `cargo test -p gritt-harness`: pass, 61 tests (40 unit, 21 integration)
+  after the second review fix round; 52 after the first, 39 before it.
+- `cargo test --workspace`: pass, 136 tests after the second fix round;
+  127 after the first, 114 before it.
 - `cargo build --release`: pass, 1m 40s cold.
 - Manual terminal pass with `target/release/gritt` in a scratch workspace
   with a profile whose key is absent: `config` reports the profile with
@@ -195,7 +222,12 @@ All run from the worktree root on 2026-09-04:
   instead of a panic. The scripted REPL integration test
   `repl_runs_a_scripted_session_end_to_end` drives `run_repl` through a
   planning turn, `/code`, an approved write, a cancelled shell command,
-  `/sessions`, `/resume`, `/history`, and `/quit` against fixtures. Resize, keyboard-only navigation, and the approval
+  `/sessions`, `/resume`, `/history`, and `/quit` against fixtures, with
+  the two `y` answers read from the same shared input as the commands.
+  After the second fix round the release binary's `repl` over piped
+  input was run again: `/help`, an unknown command, a prompt that fails
+  on the missing key, and `/quit` behave as before through the shared
+  stdin owner. Resize, keyboard-only navigation, and the approval
   and diff views could not be exercised without an interactive terminal;
   the state reducer and renderer are covered by unit tests through
   ratatui's `TestBackend`, and the manual TTY pass is a follow-up for
@@ -254,6 +286,19 @@ crossterm 0.29.0 (MIT), diffy 0.5.2 (MIT OR Apache-2.0), uuid 1.26.0
 
 ## Updates
 
+- 2026-09-04 second review fix round. The re-review kept nine findings.
+  Resolved: shell commands that reach outside the workspace, including
+  `~` and variable expansions, are forced to `ask` with the stronger
+  prompt whatever rule matched, with an authority-line test; the
+  credential filter matches name fragments so `AWS_SECRET_ACCESS_KEY`
+  and `GITHUB_TOKEN` are stripped; continuation state is redacted before
+  it is saved; the interface receives the redacted approval request and
+  preview; the last told phase is persisted so an exit after `/code`
+  still sends the note; one reader owns stdin for the REPL loop and its
+  approval prompter; stored approval requests drop the reason and
+  diagnostic while content logging is off; the preview is built before
+  the request is recorded; and a failed approval prompt or closing write
+  ends the turn with a failure. Tests cover each.
 - 2026-09-04 review fix round. The chain reviewer returned twelve
   findings. Resolved: shell approval wording and outside-workspace
   stronger prompt with the recorded exception; credential variables

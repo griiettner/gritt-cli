@@ -10,9 +10,9 @@ use clap::{Args, Parser, Subcommand};
 use gritt_core::event::{ApprovalDecision, EventKind};
 use gritt_core::session::{Phase, SessionStore};
 use gritt_core::{Error, Result};
-use gritt_harness::agent::{AgentBuilder, ApprovalMode, SessionSelector, TurnStatus};
+use gritt_harness::agent::{AgentBuilder, ApprovalMode, SessionSelector, TurnStatus, Ui};
 use gritt_harness::modes::print::{read_yes_no, PrintUi, PrintUiOptions};
-use gritt_harness::modes::repl::{run_repl, CancelSlot};
+use gritt_harness::modes::repl::{run_repl, CancelSlot, LineInput};
 use gritt_harness::store::{resolve_location, Store};
 use gritt_harness::telemetry::Telemetry;
 use gritt_harness::tools::Workspace;
@@ -226,21 +226,36 @@ async fn warm_catalog(builder: &AgentBuilder, args: &SessionArgs) {
     }
 }
 
-fn stdin_prompter() -> gritt_harness::modes::print::Prompter {
-    Arc::new(|_, _, _| {
+/// Answers approvals from the shared stdin owner. The wait gives up as
+/// soon as the running turn is cancelled, so the next typed line is a
+/// command for the loop, not a stale answer.
+fn stdin_prompter(input: LineInput, slot: CancelSlot) -> gritt_harness::modes::print::Prompter {
+    Arc::new(move |_, _, _| {
         eprint!("approve? [y/N] ");
         let _ = std::io::stderr().flush();
-        let stdin = std::io::stdin();
-        let mut lock = stdin.lock();
-        read_yes_no(&mut lock)
+        let cancelled = || {
+            slot.lock()
+                .expect("cancel slot")
+                .as_ref()
+                .is_some_and(|handle| handle.is_cancelled())
+        };
+        match input.next_line_until(cancelled) {
+            Some(line) => read_yes_no(&mut std::io::Cursor::new(line.into_bytes())),
+            None => ApprovalDecision::Denied,
+        }
     })
 }
 
-fn print_options(verbose: bool, approval: ApprovalMode) -> PrintUiOptions {
+fn print_options(
+    verbose: bool,
+    approval: ApprovalMode,
+    input: &LineInput,
+    slot: &CancelSlot,
+) -> PrintUiOptions {
     match approval {
         ApprovalMode::Ask => PrintUiOptions {
             verbose,
-            prompter: stdin_prompter(),
+            prompter: stdin_prompter(input.clone(), Arc::clone(slot)),
         },
         ApprovalMode::ApproveAll => PrintUiOptions {
             verbose,
@@ -289,10 +304,11 @@ async fn run_print(
         .await?;
     let slot: CancelSlot = Arc::new(Mutex::new(Some(agent.handle())));
     install_ctrl_c(Arc::clone(&slot));
+    let input = LineInput::from_reader(std::io::BufReader::new(std::io::stdin()));
     let mut ui = PrintUi::new(
         std::io::stdout(),
         std::io::stderr(),
-        print_options(verbose, builder.approval),
+        print_options(verbose, builder.approval, &input, &slot),
     );
     // The interface already showed a failed turn's error event.
     let outcome = match agent.run_turn(prompt, &mut ui).await {
@@ -307,6 +323,12 @@ async fn run_print(
         }
     };
     ui.finish();
+    // The closing newline is the last write; a pipe that broke there
+    // still means the reader did not get the whole answer.
+    if let Some(message) = ui.output_error() {
+        eprintln!("error: output failed: {message}");
+        return Ok(ExitCode::FAILURE);
+    }
     if verbose {
         eprintln!(
             "session: {} ({})",
@@ -340,15 +362,17 @@ async fn run_repl_mode(
     let slot: CancelSlot = Arc::new(Mutex::new(None));
     install_ctrl_c(Arc::clone(&slot));
     println!("gritt repl: {} (/help for commands)", agent.session().name);
-    let stdin = std::io::stdin();
-    let mut input = stdin.lock();
+    // One reader owns stdin: the loop takes commands from it and the
+    // approval prompter takes answers from it, never both at once.
+    let input = LineInput::from_reader(std::io::BufReader::new(std::io::stdin()));
+    let options = print_options(verbose, builder.approval, &input, &slot);
     run_repl(
         &builder,
         agent,
-        &mut input,
+        &input,
         std::io::stdout(),
         std::io::stderr(),
-        print_options(verbose, builder.approval),
+        options,
         slot,
     )
     .await?;

@@ -751,6 +751,141 @@ async fn approval_requests_with_a_key_in_the_command_are_redacted() {
     assert!(requested.resource.contains("[redacted]"));
     assert!(!requested.resource.contains(KEY));
     assert!(!serde_json::to_string(&stored).unwrap().contains(KEY));
+    // The interface received the same redacted request, not the raw one.
+    assert_eq!(ui.asked.len(), 1);
+    assert!(!ui.asked[0].0.resource.contains(KEY));
+    assert!(ui.asked[0].0.resource.contains("[redacted]"));
+    assert!(!ui.asked[0].1.reason.contains(KEY));
+    // The adapter's continuation state holds the model's tool call with
+    // the key in its arguments; it is stored redacted too.
+    let continuation = fx
+        .builder
+        .store
+        .load_continuation(&agent.session().id)
+        .await
+        .unwrap()
+        .expect("continuation saved");
+    let dump = serde_json::to_string(&continuation.state).unwrap();
+    assert!(!dump.contains(KEY), "key reached the continuation store");
+    assert!(dump.contains("[redacted]"));
+}
+
+#[tokio::test]
+async fn diff_previews_and_stored_approvals_never_carry_the_key() {
+    let fx = fixture_builder(
+        vec![
+            FixtureResponse::sse(tool_call_sse(
+                native::FILE_WRITE,
+                serde_json::json!({"path": "creds.txt", "content": "token=rotated\n"}),
+            )),
+            FixtureResponse::sse(fixture("stream-text.sse")),
+        ],
+        ApprovalMode::Ask,
+        None,
+    )
+    .await;
+    std::fs::write(
+        fx.builder.workspace_root().join("creds.txt"),
+        format!("token={KEY}\n"),
+    )
+    .unwrap();
+    let mut agent = fx
+        .builder
+        .open(
+            SessionSelector::New { name: None },
+            None,
+            None,
+            Some(Phase::Coding),
+        )
+        .await
+        .unwrap();
+    let mut ui = RecordingUi {
+        answers: vec![ApprovalDecision::Approved],
+        ..Default::default()
+    };
+    agent.run_turn("rotate it", &mut ui).await.unwrap();
+    let (request, decision, preview) = &ui.asked[0];
+    let preview = preview.as_deref().expect("a write shows a diff");
+    assert!(preview.contains("-token=[redacted]"), "{preview}");
+    assert!(!preview.contains(KEY));
+    // Content logging is off, so the stored request is the projection:
+    // tool, resource, and call id, without the reason or the diagnostic.
+    assert!(!decision.reason.is_empty());
+    assert!(!request.reason.is_empty());
+    let stored = fx
+        .builder
+        .store
+        .read_events(&agent.session().id)
+        .await
+        .unwrap();
+    let requested = stored
+        .iter()
+        .find(|event| matches!(event.kind, EventKind::ApprovalRequested { .. }))
+        .expect("approval requested");
+    let EventKind::ApprovalRequested { request: kept } = &requested.kind else {
+        unreachable!()
+    };
+    assert_eq!(kept.tool, native::FILE_WRITE);
+    assert!(kept.resource.ends_with("creds.txt"));
+    assert!(kept.call_id.is_some());
+    assert!(kept.reason.is_empty());
+    assert!(requested.diagnostic.is_none());
+    assert!(!serde_json::to_string(&stored).unwrap().contains(KEY));
+}
+
+#[tokio::test]
+async fn a_preview_that_cannot_be_built_leaves_no_approval_request_behind() {
+    let fx = fixture_builder(
+        vec![
+            FixtureResponse::sse(tool_call_sse(
+                native::FILE_WRITE,
+                serde_json::json!({"path": "bin.dat", "content": "text\n"}),
+            )),
+            FixtureResponse::sse(fixture("stream-text.sse")),
+        ],
+        ApprovalMode::Ask,
+        None,
+    )
+    .await;
+    std::fs::write(
+        fx.builder.workspace_root().join("bin.dat"),
+        [0xff, 0xfe, 0x00, 0x80],
+    )
+    .unwrap();
+    let mut agent = fx
+        .builder
+        .open(
+            SessionSelector::New { name: None },
+            None,
+            None,
+            Some(Phase::Coding),
+        )
+        .await
+        .unwrap();
+    let mut ui = RecordingUi {
+        answers: vec![ApprovalDecision::Approved],
+        ..Default::default()
+    };
+    let outcome = agent.run_turn("overwrite it", &mut ui).await.unwrap();
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert!(ui.asked.is_empty(), "nothing was asked");
+    let results = tool_results(&ui.events);
+    assert_eq!(results.len(), 1);
+    assert!(results[0].1);
+    assert!(results[0].2.contains("cannot preview"), "{}", results[0].2);
+    let stored = fx
+        .builder
+        .store
+        .read_events(&agent.session().id)
+        .await
+        .unwrap();
+    let k = kinds(&stored);
+    assert!(!k.contains(&"approval_requested"), "{k:?}");
+    assert!(!k.contains(&"approval_decided"));
+    assert_eq!(
+        std::fs::read(fx.builder.workspace_root().join("bin.dat")).unwrap(),
+        [0xff, 0xfe, 0x00, 0x80]
+    );
 }
 
 #[tokio::test]
@@ -812,6 +947,80 @@ async fn a_phase_change_sends_a_transition_note_on_the_next_turn() {
         .as_str()
         .unwrap()
         .starts_with("[Phase changed to planning."));
+}
+
+#[tokio::test]
+async fn a_phase_change_survives_exit_before_the_next_turn() {
+    let fx = fixture_builder(
+        vec![
+            FixtureResponse::sse(fixture("stream-text.sse")),
+            FixtureResponse::sse(fixture("stream-text.sse")),
+            FixtureResponse::sse(fixture("stream-text.sse")),
+        ],
+        ApprovalMode::Ask,
+        None,
+    )
+    .await;
+    let mut agent = fx
+        .builder
+        .open(SessionSelector::Named("later".into()), None, None, None)
+        .await
+        .unwrap();
+    let mut ui = RecordingUi::default();
+    agent.run_turn("plan it", &mut ui).await.unwrap();
+    // `/code`, then the process exits before another turn runs.
+    agent.set_phase(Phase::Coding).await.unwrap();
+    let id = agent.session().id.clone();
+    drop(agent);
+    assert_eq!(
+        fx.builder.store.told_phase(&id).await.unwrap(),
+        Some(Phase::Planning)
+    );
+
+    let mut resumed = fx
+        .builder
+        .open(SessionSelector::Named("later".into()), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(resumed.phase(), Phase::Coding);
+    resumed.run_turn("build it", &mut ui).await.unwrap();
+    let second = fx.transport.requests()[1].body_json().unwrap();
+    assert_eq!(second["tools"].as_array().unwrap().len(), 3);
+    let user = second["messages"].as_array().unwrap().last().unwrap();
+    let content = user["content"].as_str().unwrap();
+    assert!(
+        content.starts_with("[Phase changed to coding."),
+        "the model was never told about coding: {content}"
+    );
+    assert_eq!(
+        fx.builder.store.told_phase(&id).await.unwrap(),
+        Some(Phase::Coding)
+    );
+    drop(resumed);
+
+    // Once told, a later resume in the same phase sends no note.
+    let mut again = fx
+        .builder
+        .open(SessionSelector::Named("later".into()), None, None, None)
+        .await
+        .unwrap();
+    again.run_turn("continue", &mut ui).await.unwrap();
+    let third = fx.transport.requests()[2].body_json().unwrap();
+    let user = third["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(user["content"], "continue");
+
+    // An unknown told phase (a session from before the column existed)
+    // is treated conservatively: the note goes out.
+    fx.builder.store.set_told_phase(&id, None).await.unwrap();
+    drop(again);
+    let legacy = fx
+        .builder
+        .open(SessionSelector::Named("later".into()), None, None, None)
+        .await
+        .unwrap();
+    let request = legacy.request_preview("once more");
+    let last = request.messages.last().unwrap();
+    assert!(last.content.starts_with("[Phase changed to coding."));
 }
 
 #[tokio::test]
@@ -1002,10 +1211,129 @@ async fn print_mode_stops_the_turn_when_stdout_breaks() {
     )));
 }
 
+/// Fails any write that carries `needle`, and everything after it.
+#[derive(Clone)]
+struct TrippingWriter {
+    inner: SharedBuffer,
+    needle: &'static str,
+    tripped: Arc<Mutex<bool>>,
+}
+
+impl std::io::Write for TrippingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut tripped = self.tripped.lock().unwrap();
+        if *tripped || String::from_utf8_lossy(buf).contains(self.needle) {
+            *tripped = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken pipe",
+            ));
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_failed_approval_prompt_denies_and_ends_the_turn() {
+    let fx = fixture_builder(
+        vec![
+            FixtureResponse::sse(tool_call_sse(
+                native::FILE_WRITE,
+                serde_json::json!({"path": "unseen.txt", "content": "x\n"}),
+            )),
+            FixtureResponse::sse(fixture("stream-text.sse")),
+        ],
+        ApprovalMode::Ask,
+        None,
+    )
+    .await;
+    let mut agent = fx
+        .builder
+        .open(
+            SessionSelector::New { name: None },
+            None,
+            None,
+            Some(Phase::Coding),
+        )
+        .await
+        .unwrap();
+    let out = SharedBuffer::default();
+    let err = TrippingWriter {
+        inner: SharedBuffer::default(),
+        needle: "approval needed",
+        tripped: Arc::new(Mutex::new(false)),
+    };
+    let asked = Arc::new(Mutex::new(0));
+    let counter = Arc::clone(&asked);
+    let mut ui = PrintUi::new(
+        out,
+        err.clone(),
+        PrintUiOptions {
+            verbose: false,
+            prompter: Arc::new(move |_, _, _| {
+                *counter.lock().unwrap() += 1;
+                ApprovalDecision::Approved
+            }),
+        },
+    );
+    let error = agent.run_turn("write it", &mut ui).await.unwrap_err();
+    assert!(error.message.contains("output failed"), "{}", error.message);
+    assert_eq!(*asked.lock().unwrap(), 0, "no one waited for an answer");
+    assert!(!fx.builder.workspace_root().join("unseen.txt").exists());
+    assert!(err.inner.contents().contains("-> file_write unseen.txt"));
+    // The turn stopped at the failed prompt: cancelled, and nothing after
+    // the approval request was persisted.
+    assert!(agent.handle().is_cancelled());
+    assert_eq!(fx.transport.request_count(), 1);
+    let stored = fx
+        .builder
+        .store
+        .read_events(&agent.session().id)
+        .await
+        .unwrap();
+    let k = kinds(&stored);
+    assert!(k.contains(&"approval_requested"));
+    assert!(!k.contains(&"tool_result"));
+}
+
+#[tokio::test]
+async fn finishing_the_output_reports_a_failure_on_the_last_write() {
+    let fx = fixture_builder(
+        vec![FixtureResponse::sse(fixture("stream-text.sse"))],
+        ApprovalMode::DenyAll,
+        None,
+    )
+    .await;
+    let mut agent = fx
+        .builder
+        .open(SessionSelector::New { name: None }, None, None, None)
+        .await
+        .unwrap();
+    // Every text delta fits; only the closing newline from `finish` fails.
+    let out = FailingWriter {
+        written: Arc::new(Mutex::new(0)),
+        limit: "Hello, world".len(),
+    };
+    let mut ui = PrintUi::new(
+        out,
+        SharedBuffer::default(),
+        PrintUiOptions::deny_all(false),
+    );
+    let outcome = agent.run_turn("hi", &mut ui).await.unwrap();
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert!(ui.output_error().is_none());
+    ui.finish();
+    assert!(ui.output_error().is_some_and(|m| m.contains("broken pipe")));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn repl_runs_a_scripted_session_end_to_end() {
-    use gritt_harness::modes::repl::{run_repl, CancelSlot};
+    use gritt_harness::modes::repl::{run_repl, CancelSlot, LineInput};
 
     let marker = format!("gritt-repl-cancel-{}", std::process::id());
     let fx = fixture_builder(
@@ -1035,8 +1363,12 @@ async fn repl_runs_a_scripted_session_end_to_end() {
         .open(SessionSelector::Named("first".into()), None, None, None)
         .await
         .unwrap();
-    let script = "plan this\n/code\nwrite the file\nrun the long thing\n/sessions\n/resume first\nback again\n/history\n/quit\n";
-    let mut input = std::io::Cursor::new(script.as_bytes().to_vec());
+    // The answers to the two approvals (`y`) sit in the same script as the
+    // commands: the prompter and the loop share one input owner, the way
+    // the binary shares stdin, so this exercises the path that used to
+    // deadlock on the stdin lock.
+    let script = "plan this\n/code\nwrite the file\ny\nrun the long thing\ny\n/sessions\n/resume first\nback again\n/history\n/quit\n";
+    let input = LineInput::from_reader(std::io::Cursor::new(script.as_bytes().to_vec()));
     let out = SharedBuffer::default();
     let err = SharedBuffer::default();
     let asked = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -1047,6 +1379,8 @@ async fn repl_runs_a_scripted_session_end_to_end() {
     // so the third turn is cancelled while its child is running.
     let canceller = Arc::clone(&slot);
     let runtime = tokio::runtime::Handle::current();
+    let answers = input.clone();
+    let cancel_check = Arc::clone(&slot);
     let options = PrintUiOptions {
         verbose: false,
         prompter: Arc::new(move |request, _, _| {
@@ -1060,13 +1394,25 @@ async fn repl_runs_a_scripted_session_end_to_end() {
                     }
                 });
             }
-            ApprovalDecision::Approved
+            let cancelled = || {
+                cancel_check
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|handle| handle.is_cancelled())
+            };
+            match answers.next_line_until(cancelled) {
+                Some(line) => gritt_harness::modes::print::read_yes_no(&mut std::io::Cursor::new(
+                    line.into_bytes(),
+                )),
+                None => ApprovalDecision::Denied,
+            }
         }),
     };
     let agent = run_repl(
         &fx.builder,
         agent,
-        &mut input,
+        &input,
         out.clone(),
         err.clone(),
         options,

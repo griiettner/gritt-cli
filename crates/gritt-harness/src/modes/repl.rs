@@ -3,7 +3,9 @@
 //! the binary's Ctrl-C handler through the agent's cancel handle.
 
 use std::io::{BufRead, Write};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use gritt_core::session::{Phase, SessionStore};
 use gritt_core::Result;
@@ -13,6 +15,61 @@ use crate::modes::print::{PrintUi, PrintUiOptions};
 
 /// Where the binary's Ctrl-C handler finds the running turn, if any.
 pub type CancelSlot = Arc<Mutex<Option<CancelHandle>>>;
+
+/// The one owner of an input stream. A reader thread forwards lines over
+/// a channel; the REPL loop and the approval prompter both take lines
+/// from here, so neither can hold the underlying reader's lock while the
+/// other waits on it. Cloning shares the same stream.
+#[derive(Clone)]
+pub struct LineInput {
+    lines: Arc<Mutex<Receiver<String>>>,
+}
+
+impl LineInput {
+    /// Starts the reader thread over `reader`. Lines keep their trailing
+    /// newline. The thread ends at end of input or a read error.
+    pub fn from_reader<R: BufRead + Send + 'static>(mut reader: R) -> Self {
+        let (tx, rx): (SyncSender<String>, Receiver<String>) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            lines: Arc::new(Mutex::new(rx)),
+        }
+    }
+
+    /// Blocks for the next line; `None` at end of input.
+    pub fn next_line(&self) -> Option<String> {
+        self.lines.lock().expect("line input").recv().ok()
+    }
+
+    /// Blocks for the next line, giving up with `None` once `give_up`
+    /// returns true (polled every 100 ms) or at end of input. A cancelled
+    /// approval stops waiting this way, so the line the user types next
+    /// reaches the loop instead of answering a question that is gone.
+    pub fn next_line_until(&self, give_up: impl Fn() -> bool) -> Option<String> {
+        let lines = self.lines.lock().expect("line input");
+        loop {
+            match lines.recv_timeout(Duration::from_millis(100)) {
+                Ok(line) => return Some(line),
+                Err(RecvTimeoutError::Timeout) => {
+                    if give_up() {
+                        return None;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplCommand {
@@ -56,10 +113,10 @@ Ctrl-C cancels a running turn; a second Ctrl-C at the prompt quits.";
 
 /// Runs the loop until `/quit` or end of input. Returns the agent so the
 /// caller can inspect the final session.
-pub async fn run_repl<I: BufRead, O: Write + Send, E: Write + Send>(
+pub async fn run_repl<O: Write + Send, E: Write + Send>(
     builder: &AgentBuilder,
     mut agent: NativeAgent,
-    input: &mut I,
+    input: &LineInput,
     out: O,
     err: E,
     options: PrintUiOptions,
@@ -81,11 +138,10 @@ pub async fn run_repl<I: BufRead, O: Write + Send, E: Write + Send>(
             );
             let _ = out.flush();
         }
-        let mut line = String::new();
-        let read = input.read_line(&mut line).unwrap_or(0);
-        if read == 0 {
+        let reader = input.clone();
+        let Ok(Some(line)) = tokio::task::spawn_blocking(move || reader.next_line()).await else {
             break;
-        }
+        };
         match parse_command(&line) {
             ReplCommand::Empty => {}
             ReplCommand::Quit => break,
@@ -175,6 +231,25 @@ pub async fn run_repl<I: BufRead, O: Write + Send, E: Write + Send>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_input_forwards_lines_and_gives_up_on_request() {
+        let input = LineInput::from_reader(std::io::Cursor::new(b"one\ntwo\n".to_vec()));
+        assert_eq!(input.next_line().as_deref(), Some("one\n"));
+        let shared = input.clone();
+        assert_eq!(shared.next_line_until(|| false).as_deref(), Some("two\n"));
+        assert_eq!(input.next_line(), None);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
+        let waiting = LineInput {
+            lines: Arc::new(Mutex::new(rx)),
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(waiting.next_line_until(|| true), None);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        tx.send("late\n".into()).unwrap();
+        assert_eq!(waiting.next_line().as_deref(), Some("late\n"));
+    }
 
     #[test]
     fn commands_parse() {

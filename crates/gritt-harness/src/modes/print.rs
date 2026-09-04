@@ -230,6 +230,11 @@ impl<O: Write + Send, E: Write + Send> Ui for PrintUi<O, E> {
             .write_all(text.as_bytes())
             .and_then(|()| self.err.flush());
         self.note(result);
+        if self.failure.is_some() {
+            // Nobody can see the question, so nobody can answer it. Deny
+            // now; the loop ends the turn on `output_error` right after.
+            return Box::pin(async { ApprovalDecision::Denied });
+        }
         let prompter = Arc::clone(&self.options.prompter);
         let request = request.clone();
         let decision = decision.clone();
@@ -292,6 +297,30 @@ mod tests {
             describe_call("file_read", &serde_json::json!({ "path": "a.txt" })),
             "file_read a.txt"
         );
+    }
+
+    #[test]
+    fn shell_approvals_state_the_users_authority() {
+        use gritt_core::event::ApprovalId;
+        let request = |tool: &str| ApprovalRequest {
+            id: ApprovalId("a".into()),
+            tool: tool.into(),
+            resource: "cat /etc/hosts".into(),
+            reason: "rule".into(),
+            call_id: None,
+        };
+        let decision = Decision {
+            outcome: gritt_core::policy::PolicyOutcome::Ask,
+            reason: "rule; the command names a path outside the workspace".into(),
+            destructive: true,
+            rule: Some(0),
+        };
+        let shell = approval_text(&request(native::SHELL), &decision, None);
+        assert!(shell.starts_with("DESTRUCTIVE approval needed: shell on cat /etc/hosts"));
+        assert!(shell.contains("runs with your authority and may reach outside the workspace"));
+        let write = approval_text(&request(native::FILE_WRITE), &decision, Some("+x\n"));
+        assert!(!write.contains("your authority"));
+        assert!(write.ends_with("+x\n"));
     }
 
     #[test]

@@ -13,9 +13,13 @@ use gritt_core::{Error, Result};
 use turso::{Builder, Connection};
 
 /// Ordered product migrations. Append; never edit an applied entry.
-pub const MIGRATIONS: [(&str, &str); 2] = [
+pub const MIGRATIONS: [(&str, &str); 3] = [
     ("0001_product_tables", include_str!("product_schema.sql")),
     ("0002_content_log", include_str!("content_log.sql")),
+    (
+        "0003_session_told_phase",
+        include_str!("session_told_phase.sql"),
+    ),
 ];
 
 /// Tables and indexes owned by `gritt-agent`. The store must never touch
@@ -189,7 +193,8 @@ mod tests {
             applied,
             vec![
                 "0001_product_tables".to_string(),
-                "0002_content_log".to_string()
+                "0002_content_log".to_string(),
+                "0003_session_told_phase".to_string()
             ]
         );
         drop(first);

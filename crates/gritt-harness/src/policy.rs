@@ -61,10 +61,13 @@ pub fn looks_destructive(command: &str) -> bool {
 }
 
 /// True when a shell command names a path outside the workspace: an
-/// absolute path elsewhere, a drive-letter path, or a `..` component. The
-/// shell itself is not confined (ADR-009 runs it under approval, and only
-/// the file tools are workspace-bounded), so such a command gets the
-/// stronger prompt instead of a different outcome. `/dev/null` is exempt.
+/// absolute path elsewhere, a drive-letter path, a `..` component, or a
+/// path the shell would expand (`~`, `~user`, `$VAR`, `${VAR}`, `%VAR%`),
+/// which is treated conservatively as outside because the expansion is
+/// unknown here. The shell itself is not confined (ADR-009 runs it under
+/// approval, and only the file tools are workspace-bounded), so such a
+/// command is forced to at least `ask` with the stronger prompt.
+/// `/dev/null` is exempt.
 pub fn reaches_outside_workspace(command: &str, workspace: &Path) -> bool {
     let root = workspace.to_string_lossy().replace('\\', "/");
     let root = root.trim_end_matches('/');
@@ -85,11 +88,45 @@ pub fn reaches_outside_workspace(command: &str, workspace: &Path) -> bool {
             if token == "/dev/null" {
                 return false;
             }
+            if shell_expands(&token) {
+                return true;
+            }
             let bytes = token.as_bytes();
             let absolute = token.starts_with('/')
                 || (bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic());
             absolute && token != root && !token.starts_with(&format!("{root}/"))
         })
+}
+
+/// True for a token the shell would expand into a path Gritt cannot see:
+/// `~`, `~user`, `$VAR`, `${VAR}`, or `%VAR%`.
+fn shell_expands(token: &str) -> bool {
+    if token.starts_with('~') {
+        return true;
+    }
+    let mut chars = token.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '$' => match chars.peek() {
+                Some('{') => return true,
+                Some(next) if next.is_ascii_alphanumeric() || *next == '_' => return true,
+                _ => {}
+            },
+            '%' => {
+                let rest: String = chars.clone().collect();
+                if let Some(end) = rest.find('%') {
+                    let name = &rest[..end];
+                    if !name.is_empty()
+                        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Matches `pattern` against `text` where `*` spans anything except `/`,
@@ -166,7 +203,10 @@ impl PolicyEngine {
             || wildcard_match(&rule.resource, &resource.display().replace('\\', "/"))
     }
 
-    /// The gate. First matching rule wins; otherwise the fallback.
+    /// The gate. First matching rule wins; otherwise the fallback. A
+    /// shell command that reaches outside the workspace is never allowed
+    /// silently: an `allow` outcome becomes `ask` with the stronger
+    /// prompt, whichever rule produced it. `deny` stays `deny`.
     pub fn evaluate(&self, tool: &str, resource: &Resource) -> Decision {
         let (destructive, outside) = match resource {
             Resource::Command(command) => (
@@ -176,33 +216,47 @@ impl PolicyEngine {
             _ => (false, false),
         };
         let destructive = destructive || outside;
-        for (index, rule) in self.config.rules.iter().enumerate() {
-            if self.rule_matches(rule, tool, resource) {
+        let (outcome, reason, rule) = match self
+            .config
+            .rules
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| self.rule_matches(rule, tool, resource))
+        {
+            Some((index, rule)) => {
                 let reason = if rule.reason.is_empty() {
                     format!("rule {index} for `{}`", rule.tool)
                 } else {
                     rule.reason.clone()
                 };
-                let reason = if rule.outcome == PolicyOutcome::Ask && outside {
-                    format!("{reason}; the command names a path outside the workspace")
-                } else if rule.outcome == PolicyOutcome::Ask && destructive {
-                    format!("{reason}; the command looks destructive")
-                } else {
-                    reason
-                };
-                return Decision {
-                    outcome: rule.outcome,
-                    reason,
-                    destructive,
-                    rule: Some(index),
-                };
+                (rule.outcome, reason, Some(index))
             }
-        }
+            None => (
+                self.config.fallback,
+                "no policy rule matched".to_string(),
+                None,
+            ),
+        };
+        let (outcome, reason) = if outside && outcome == PolicyOutcome::Allow {
+            (
+                PolicyOutcome::Ask,
+                format!("{reason}; the command names a path outside the workspace, so it must be approved"),
+            )
+        } else if outcome == PolicyOutcome::Ask && outside {
+            (
+                outcome,
+                format!("{reason}; the command names a path outside the workspace"),
+            )
+        } else if outcome == PolicyOutcome::Ask && destructive {
+            (outcome, format!("{reason}; the command looks destructive"))
+        } else {
+            (outcome, reason)
+        };
         Decision {
-            outcome: self.config.fallback,
-            reason: "no policy rule matched".into(),
+            outcome,
+            reason,
             destructive,
-            rule: None,
+            rule,
         }
     }
 }
@@ -279,6 +333,73 @@ mod tests {
             "type C:\\Windows\\x",
             Path::new("/ws")
         ));
+    }
+
+    #[test]
+    fn shell_expansions_count_as_outside_the_workspace() {
+        for command in [
+            "cat ~/secrets",
+            "ls ~bob/x",
+            "cat $HOME/.ssh/id_rsa",
+            "cat ${HOME}/x",
+            "type %USERPROFILE%\\x",
+            "cp a ~",
+        ] {
+            let decision = engine().evaluate(native::SHELL, &Resource::Command(command.into()));
+            assert_eq!(decision.outcome, PolicyOutcome::Ask, "{command}");
+            assert!(decision.destructive, "{command}");
+            assert!(
+                decision.reason.contains("outside the workspace"),
+                "{command}: {}",
+                decision.reason
+            );
+        }
+        for command in ["echo 100%", "echo a$ b", "printf '%s' x", "ls /ws/src"] {
+            let decision = engine().evaluate(native::SHELL, &Resource::Command(command.into()));
+            assert!(!decision.destructive, "{command}: {}", decision.reason);
+        }
+    }
+
+    #[test]
+    fn an_allow_rule_cannot_let_a_command_outside_the_workspace_run_silently() {
+        let mut config = PolicyConfig::workspace_defaults();
+        config.rules.insert(
+            0,
+            PolicyRule {
+                tool: native::SHELL.into(),
+                resource: "*".into(),
+                outcome: PolicyOutcome::Allow,
+                reason: "shell is free".into(),
+            },
+        );
+        let engine = PolicyEngine::new(config, "/ws");
+        let inside = engine.evaluate(native::SHELL, &Resource::Command("cargo test".into()));
+        assert_eq!(inside.outcome, PolicyOutcome::Allow);
+        for command in ["cat /etc/passwd", "ls ../x", "cat ~/.netrc", "cat $HOME/x"] {
+            let outside = engine.evaluate(native::SHELL, &Resource::Command(command.into()));
+            assert_eq!(outside.outcome, PolicyOutcome::Ask, "{command}");
+            assert!(outside.destructive, "{command}");
+            assert!(
+                outside.reason.contains("must be approved"),
+                "{}",
+                outside.reason
+            );
+            assert_eq!(outside.rule, Some(0));
+        }
+        // A deny stays a deny.
+        let mut config = PolicyConfig::workspace_defaults();
+        config.rules.insert(
+            0,
+            PolicyRule {
+                tool: native::SHELL.into(),
+                resource: "*".into(),
+                outcome: PolicyOutcome::Deny,
+                reason: "no shell".into(),
+            },
+        );
+        let engine = PolicyEngine::new(config, "/ws");
+        let denied = engine.evaluate(native::SHELL, &Resource::Command("cat /etc/passwd".into()));
+        assert_eq!(denied.outcome, PolicyOutcome::Deny);
     }
 
     #[test]

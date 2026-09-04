@@ -156,6 +156,19 @@ fn redact_event(mut event: Event, secrets: &[Secret]) -> Event {
     event
 }
 
+/// The copy of an event that is persisted while content logging is off.
+/// An approval request keeps the tool, the resource, and the call id (an
+/// identifier, not content); the reason and the destructive diagnostic
+/// are shown to the interface and not stored. Every other event is
+/// stored as shown.
+pub fn persisted_projection(mut event: Event) -> Event {
+    if let EventKind::ApprovalRequested { request } = &mut event.kind {
+        request.reason = String::new();
+        event.diagnostic = None;
+    }
+    event
+}
+
 /// The note prepended to the first user message after a phase change.
 pub fn phase_transition_note(phase: Phase) -> &'static str {
     match phase {
@@ -260,7 +273,12 @@ impl NativeAgent {
             self.tools.registry().kill_all().await;
             return Err(Error::config(format!("output failed: {message}")));
         }
-        self.store.append_events(vec![event]).await
+        let stored = if self.telemetry.content_logging() {
+            event
+        } else {
+            persisted_projection(event)
+        };
+        self.store.append_events(vec![stored]).await
     }
 
     fn system_prompt(&self) -> String {
@@ -316,6 +334,12 @@ impl NativeAgent {
         }
     }
 
+    /// The request the next turn would send for `prompt`, without sending
+    /// it. Tests use it to inspect the phase note and tool list.
+    pub fn request_preview(&self, prompt: &str) -> PromptRequest {
+        self.request(prompt)
+    }
+
     /// Runs one user turn to completion.
     pub async fn run_turn(&mut self, prompt: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
         let started_at = Utc::now();
@@ -346,7 +370,12 @@ impl NativeAgent {
             }
         };
         self.started = true;
-        self.sent_phase = Some(self.session.phase);
+        if self.sent_phase != Some(self.session.phase) {
+            self.sent_phase = Some(self.session.phase);
+            self.store
+                .set_told_phase(&self.session.id, self.sent_phase)
+                .await?;
+        }
         loop {
             let mut pending_calls: Vec<ToolCall> = Vec::new();
             let mut wants_tools = false;
@@ -427,7 +456,10 @@ impl NativeAgent {
         if outcome.status == TurnStatus::Cancelled {
             self.tools.registry().kill_all().await;
         }
-        if let Some(state) = adapter.continuation().await? {
+        if let Some(mut state) = adapter.continuation().await? {
+            // The adapter's state carries the conversation, tool results
+            // included; it is stored redacted like every other row.
+            state.state = redact_value(state.state, &self.secrets);
             self.store
                 .save_continuation(&self.session.id, state)
                 .await?;
@@ -553,12 +585,31 @@ impl NativeAgent {
                 false
             }
             PolicyOutcome::Ask => {
+                // The preview is built before anything is recorded: a
+                // preview that cannot be built (unreadable or non-UTF-8
+                // target) refuses the call, leaving no unmatched request.
+                let preview = if self.approval == ApprovalMode::Ask {
+                    match self.tools.preview(call) {
+                        Ok(preview) => preview.map(|text| redact_text(&text, &self.secrets)),
+                        Err(error) => {
+                            return self.refuse_call(ui, call, error.message).await;
+                        }
+                    }
+                } else {
+                    None
+                };
+                // One redacted request serves the interface, the events,
+                // and the transcript; the raw resource never leaves here.
                 let request = ApprovalRequest {
                     id: ApprovalId(uuid::Uuid::new_v4().to_string()),
                     tool: call.name.clone(),
-                    resource: resource.display(),
-                    reason: decision.reason.clone(),
+                    resource: redact_text(&resource.display(), &self.secrets),
+                    reason: redact_text(&decision.reason, &self.secrets),
                     call_id: Some(call.id.clone()),
+                };
+                let decision = Decision {
+                    reason: request.reason.clone(),
+                    ..decision.clone()
                 };
                 let event = self.harness_event(
                     EventKind::StatusChanged {
@@ -578,15 +629,6 @@ impl NativeAgent {
                     ApprovalMode::ApproveAll => ApprovalDecision::Approved,
                     ApprovalMode::DenyAll => ApprovalDecision::Denied,
                     ApprovalMode::Ask => {
-                        // A preview that cannot be built (unreadable or
-                        // non-UTF-8 target) refuses the call rather than
-                        // showing a misleading new-file diff.
-                        let preview = match self.tools.preview(call) {
-                            Ok(preview) => preview,
-                            Err(error) => {
-                                return self.refuse_call(ui, call, error.message).await;
-                            }
-                        };
                         // The wait races cancellation so Ctrl-C or Esc
                         // during a pending approval ends the turn.
                         let cancel = self.cancel.clone();
@@ -743,7 +785,6 @@ impl AgentBuilder {
             SessionSelector::Named(name) => self.store.find_by_name(name).await?,
             SessionSelector::Id(id) => self.store.get(id).await?,
         };
-        let mut previous_phase = None;
         let session = match existing {
             Some(mut session) => {
                 // Policy and tools use the current workspace, so a session
@@ -762,7 +803,6 @@ impl AgentBuilder {
                         session.workspace.display()
                     )));
                 }
-                previous_phase = Some(session.phase);
                 if let Some(phase) = phase {
                     if session.phase != phase {
                         self.store.set_phase(&session.id, phase).await?;
@@ -797,23 +837,14 @@ impl AgentBuilder {
                 session
             }
         };
-        self.agent_for_with(session, previous_phase).await
+        self.agent_for(session).await
     }
 
-    /// Builds the agent for a stored session. The model is assumed to have
-    /// been told about the session's current phase.
+    /// Builds the agent for a stored session. The phase the model was last
+    /// told about is read from the store; when it differs from the
+    /// session's phase, or is unknown, the next turn sends the transition
+    /// note rather than assuming the model already heard it.
     pub async fn agent_for(&self, session: Session) -> Result<NativeAgent> {
-        let phase = session.phase;
-        self.agent_for_with(session, Some(phase)).await
-    }
-
-    /// `told_phase` is the phase the model last heard about; a resumed
-    /// session whose phase was just switched sends a transition note.
-    async fn agent_for_with(
-        &self,
-        session: Session,
-        told_phase: Option<Phase>,
-    ) -> Result<NativeAgent> {
         let SessionKind::Native {
             provider_profile,
             model,
@@ -862,7 +893,11 @@ impl AgentBuilder {
             .collect();
         let tools = NativeTools::new(self.workspace.clone(), ProcessRegistry::new())
             .with_blocked_env(blocked_env);
-        let sent_phase = if started { told_phase } else { None };
+        let sent_phase = if started {
+            self.store.told_phase(&session.id).await?
+        } else {
+            None
+        };
         let labels = BTreeMap::from([
             ("profile".to_string(), provider_profile.clone()),
             ("model".to_string(), model.clone()),
