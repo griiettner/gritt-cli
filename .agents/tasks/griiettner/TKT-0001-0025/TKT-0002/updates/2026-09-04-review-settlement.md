@@ -102,8 +102,8 @@ closed by TKT-0003 except `chain-check`'s repeated reads, which stays as is.
   and `cargo test`: 96 tests pass on macOS.
 - `gritt-agent ticket sync --check`, `ticket validate`, and
   `skill sync --check` on this repository: clean.
-- The `agent-cli` workflow result for the pushed commit is recorded in
-  TKT-0003's report once observed.
+- The `agent-cli` workflow ran on commit `e2bd3c9` (run 33838989615):
+  `verify (ubuntu-latest)` and `verify (windows-latest)` both succeeded.
 
 ## Remaining follow-up
 
