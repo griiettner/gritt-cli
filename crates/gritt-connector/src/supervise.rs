@@ -29,12 +29,41 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::health::{find_executable, probe, version_at_least, version_token, ProbeOutput};
 use crate::process::{self, Launch, Line, Supervised};
-use crate::redact::{cap, redact_value};
+use crate::redact::{cap, redact_text, redact_value};
 
 /// Longest raw line kept in a diagnostic.
 pub const MAX_RAW_BYTES: usize = 2048;
 /// Stderr lines kept for the exit diagnostic.
 const STDERR_TAIL: usize = 20;
+/// Time an agent gets to flush trailing output and exit after its
+/// terminal event, capped by the idle timeout.
+const WRAP_UP: Duration = Duration::from_secs(10);
+
+/// The launch arguments as a diagnostic: the prompt is user content and
+/// any `name=value` argument may carry a value, so neither is recorded
+/// raw. The connector's own secrets are redacted on top of this.
+pub fn diagnostic_args(args: &[String], prompt: &str) -> Vec<String> {
+    args.iter()
+        .map(|arg| {
+            if arg == prompt {
+                "[prompt]".to_owned()
+            } else if let Some((name, _)) = arg.split_once('=') {
+                format!("{name}=[redacted]")
+            } else {
+                arg.clone()
+            }
+        })
+        .collect()
+}
+
+/// What the agent's own terminal event said, kept so the process exit can
+/// be judged against it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalKind {
+    Completed,
+    Error(String),
+    Cancelled,
+}
 
 /// One normalized event with its raw diagnostic detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,7 +368,7 @@ impl<P: Protocol> ExternalConnector<P> {
                     &self.sessions,
                     &request.session_id,
                     TaskState::Failed,
-                    Some(error.message.clone()),
+                    Some(redact_text(&error.message, &self.secrets)),
                     None,
                     None,
                 );
@@ -365,9 +394,10 @@ impl<P: Protocol> ExternalConnector<P> {
             cancel,
             tx,
             sequence: 0,
+            terminal: None,
             launch_diagnostic: serde_json::json!({
                 "program": launch.program.display().to_string(),
-                "args": launch.args,
+                "args": diagnostic_args(&launch.args, &request.prompt),
                 "transport": supervised.transport,
                 "external_id": external_id,
                 "pid": pid,
@@ -429,6 +459,8 @@ struct Driver {
     cancel: Arc<CancelFlag>,
     tx: mpsc::Sender<Result<Event>>,
     sequence: u64,
+    /// The agent's own terminal event, once emitted.
+    terminal: Option<TerminalKind>,
     launch_diagnostic: serde_json::Value,
 }
 
@@ -461,6 +493,14 @@ impl Driver {
             },
             other => other,
         };
+        match &kind {
+            EventKind::Completed { .. } => self.terminal = Some(TerminalKind::Completed),
+            EventKind::Error { message, .. } => {
+                self.terminal = Some(TerminalKind::Error(message.clone()));
+            }
+            EventKind::Cancelled => self.terminal = Some(TerminalKind::Cancelled),
+            _ => {}
+        }
         let event = Event {
             session_id: self.session_id.clone(),
             sequence: self.sequence,
@@ -504,7 +544,9 @@ impl Driver {
         let mut first_line = true;
         let mut consumer_gone = false;
         loop {
-            let limit = if first_line {
+            let limit = if self.normalizer.terminal_seen() {
+                WRAP_UP.min(self.timeouts.idle)
+            } else if first_line {
                 self.timeouts.startup
             } else {
                 self.timeouts.idle
@@ -521,6 +563,15 @@ impl Driver {
                 break;
             };
             match next {
+                Err(_) if self.normalizer.terminal_seen() => {
+                    // The agent finished its turn but neither exited nor
+                    // closed its output in time: its own verdict stands,
+                    // and it is made to go away.
+                    supervised.control.kill().await;
+                    self.finish_after_terminal(&mut outcome, None, &stderr_tail, malformed, true)
+                        .await;
+                    break;
+                }
                 Err(_) => {
                     supervised.control.kill().await;
                     let message = if first_line {
@@ -550,7 +601,14 @@ impl Driver {
                         supervised.control.kill().await;
                     }
                     if self.normalizer.terminal_seen() {
-                        outcome.state = TaskState::Completed;
+                        self.finish_after_terminal(
+                            &mut outcome,
+                            exit,
+                            &stderr_tail,
+                            malformed,
+                            false,
+                        )
+                        .await;
                         break;
                     }
                     let diagnostic = serde_json::json!({
@@ -589,7 +647,7 @@ impl Driver {
                             ))
                             .await;
                             outcome.state = TaskState::Failed;
-                            outcome.error = Some(message);
+                            outcome.error = Some(self.redact(&message));
                         }
                         None => {
                             let message = "the agent closed its output but did not exit".to_owned();
@@ -642,6 +700,9 @@ impl Driver {
                             continue;
                         }
                     };
+                    // Every line is normalized, including anything after
+                    // the terminal event: a trailing error must not be
+                    // lost behind an earlier completion.
                     let events = self.normalizer.message(value);
                     for normalized in events {
                         if !self.emit(normalized).await {
@@ -650,19 +711,6 @@ impl Driver {
                         }
                     }
                     if consumer_gone {
-                        break;
-                    }
-                    if self.normalizer.terminal_seen() {
-                        // Let the agent wrap up, then make sure it is gone.
-                        if supervised
-                            .control
-                            .wait(Duration::from_secs(10))
-                            .await
-                            .is_none()
-                        {
-                            supervised.control.kill().await;
-                        }
-                        outcome.state = TaskState::Completed;
                         break;
                     }
                 }
@@ -674,6 +722,76 @@ impl Driver {
         }
         outcome.external_id = self.normalizer.external_id();
         outcome
+    }
+
+    fn redact(&self, text: &str) -> String {
+        redact_text(text, &self.secrets)
+    }
+
+    /// Settles the outcome once the agent has spoken its terminal event
+    /// and its process has ended (or been ended). An error terminal stays
+    /// an error, a cancellation stays a cancellation, and a completion is
+    /// downgraded to an error when the process then exited non-zero.
+    async fn finish_after_terminal(
+        &mut self,
+        outcome: &mut DriverOutcome,
+        exit: Option<process::ExitOutcome>,
+        stderr_tail: &[String],
+        malformed: u64,
+        killed: bool,
+    ) {
+        match self.terminal.clone() {
+            Some(TerminalKind::Error(message)) => {
+                outcome.state = TaskState::Failed;
+                outcome.error = Some(message);
+            }
+            Some(TerminalKind::Cancelled) => {
+                outcome.state = TaskState::Cancelled;
+            }
+            Some(TerminalKind::Completed) | None => match exit {
+                Some(exit) if !exit.success => {
+                    let message = format!(
+                        "the agent exited with status {} after finishing{}",
+                        exit.code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "unknown".into()),
+                        stderr_tail
+                            .last()
+                            .map(|line| format!(": {line}"))
+                            .unwrap_or_default()
+                    );
+                    self.emit(Normalized::with(
+                        EventKind::Error {
+                            error_kind: ErrorKind::Connector,
+                            message: message.clone(),
+                        },
+                        serde_json::json!({
+                            "exit": exit.code,
+                            "stderr": stderr_tail,
+                            "malformed_lines": malformed,
+                        }),
+                    ))
+                    .await;
+                    outcome.state = TaskState::Failed;
+                    outcome.error = Some(self.redact(&message));
+                }
+                _ => {
+                    if killed {
+                        self.emit(Normalized::with(
+                            EventKind::StatusChanged {
+                                status: SessionStatus::Finished,
+                            },
+                            serde_json::json!({
+                                "note": "the agent did not exit after finishing and was stopped",
+                                "stderr": stderr_tail,
+                            }),
+                        ))
+                        .await;
+                    }
+                    outcome.state = TaskState::Completed;
+                }
+            },
+        }
     }
 }
 

@@ -645,3 +645,188 @@ fn connector_names_parse() {
     assert_eq!(parse_connector_id("native"), Some(ConnectorId::Native));
     assert_eq!(parse_connector_id("grok"), None);
 }
+
+#[tokio::test]
+async fn a_trailing_error_after_the_terminal_event_is_not_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("late-error.jsonl");
+    let mut lines = std::fs::read_to_string(fixture("codex", "text")).unwrap();
+    lines.push_str("{\"type\":\"error\",\"message\":\"upload failed after the turn\"}\n");
+    std::fs::write(&path, lines).unwrap();
+    let fake = Fake::new(&[("FAKE_AGENT_FIXTURE", path.display().to_string())]);
+    let connector = fake.connector(Codex, "codex");
+    let events = collect(&connector, fake.request("x")).await;
+    let kinds = no_status(kinds(&events));
+    assert!(
+        kinds.contains(&"completed:endturn".to_string()),
+        "{kinds:?}"
+    );
+    assert_eq!(kinds.last().map(String::as_str), Some("error"), "{kinds:?}");
+    let inspection = connector
+        .inspect(&SessionId("s-test".into()))
+        .await
+        .unwrap();
+    assert_eq!(inspection.state, TaskState::Failed);
+    assert!(inspection.diagnostic.unwrap()["last_error"]
+        .as_str()
+        .unwrap()
+        .contains("upload failed"));
+}
+
+#[tokio::test]
+async fn a_nonzero_exit_after_the_terminal_event_is_an_error() {
+    let fake = Fake::new(&[
+        (
+            "FAKE_AGENT_FIXTURE",
+            fixture("codex", "text").display().to_string(),
+        ),
+        ("FAKE_AGENT_EXIT", "2".into()),
+    ]);
+    let connector = fake.connector(Codex, "codex");
+    let events = collect(&connector, fake.request("x")).await;
+    assert_eq!(text_of(&events), "PONG");
+    let last = events.last().unwrap();
+    assert!(
+        matches!(&last.kind, EventKind::Error { message, .. } if message.contains("status 2") && message.contains("after finishing")),
+        "{:?}",
+        last.kind
+    );
+    assert_eq!(last.diagnostic.as_ref().unwrap()["exit"], 2);
+    assert_eq!(
+        connector
+            .inspect(&SessionId("s-test".into()))
+            .await
+            .unwrap()
+            .state,
+        TaskState::Failed
+    );
+}
+
+#[tokio::test]
+async fn inspection_never_returns_a_secret_from_stderr() {
+    let fake = Fake::new(&[
+        (
+            "FAKE_AGENT_STDERR",
+            "auth failed for sk-stderr-secret".into(),
+        ),
+        ("FAKE_AGENT_EXIT", "4".into()),
+    ]);
+    let connector = fake
+        .connector(Codex, "codex")
+        .with_secrets(vec![Secret::new("sk-stderr-secret")]);
+    let events = collect(&connector, fake.request("x")).await;
+    let dump = serde_json::to_string(&events).unwrap();
+    assert!(!dump.contains("sk-stderr-secret"), "{dump}");
+    let inspection = connector
+        .inspect(&SessionId("s-test".into()))
+        .await
+        .unwrap();
+    let diagnostic = serde_json::to_string(&inspection.diagnostic).unwrap();
+    assert!(diagnostic.contains("[redacted]"), "{diagnostic}");
+    assert!(!diagnostic.contains("sk-stderr-secret"), "{diagnostic}");
+}
+
+#[tokio::test]
+async fn launch_diagnostics_omit_the_prompt_and_argument_values() {
+    let fake = Fake::new(&[(
+        "FAKE_AGENT_FIXTURE",
+        fixture("codex", "text").display().to_string(),
+    )]);
+    let mut settings = fake.settings("codex");
+    settings.extra_args = BTreeMap::from([(
+        "codex".to_owned(),
+        vec!["--sandbox=workspace-write".to_owned()],
+    )]);
+    let connector = ExternalConnector::new(Codex, &settings);
+    let events = collect(&connector, fake.request("the private prompt")).await;
+    let launch = events[0].diagnostic.as_ref().unwrap();
+    let args = serde_json::to_string(&launch["args"]).unwrap();
+    assert!(args.contains("[prompt]"), "{args}");
+    assert!(!args.contains("private prompt"), "{args}");
+    assert!(args.contains("--sandbox=[redacted]"), "{args}");
+    assert!(!args.contains("workspace-write"), "{args}");
+}
+
+#[tokio::test]
+async fn credential_bearing_extra_args_are_refused() {
+    use gritt_connector::{default_connectors_with_secrets, validate_extra_args};
+    let settings = ConnectorSettings {
+        extra_args: BTreeMap::from([("codex".to_owned(), vec!["--api-key=sk-in-args".to_owned()])]),
+        ..ConnectorSettings::default()
+    };
+    let error = validate_extra_args(&settings, &[]).unwrap_err();
+    assert_eq!(error.kind, gritt_core::ErrorKind::Config);
+    assert!(error.message.contains("connectors.extra_args.codex"));
+    assert!(!error.message.contains("sk-in-args"));
+    assert!(default_connectors_with_secrets(&settings, Vec::new()).is_err());
+
+    let settings = ConnectorSettings {
+        extra_args: BTreeMap::from([("claude".to_owned(), vec!["sk-known".to_owned()])]),
+        ..ConnectorSettings::default()
+    };
+    let error = validate_extra_args(&settings, &[Secret::new("sk-known")]).unwrap_err();
+    assert!(!error.message.contains("sk-known"));
+
+    let settings = ConnectorSettings {
+        extra_args: BTreeMap::from([(
+            "codex".to_owned(),
+            vec![
+                "--full-auto".to_owned(),
+                "--sandbox=workspace-write".to_owned(),
+            ],
+        )]),
+        ..ConnectorSettings::default()
+    };
+    assert!(validate_extra_args(&settings, &[Secret::new("sk-known")]).is_ok());
+    assert_eq!(
+        default_connectors_with_secrets(&settings, Vec::new())
+            .unwrap()
+            .len(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn a_pty_agent_that_lingers_after_finishing_is_stopped_within_the_bound() {
+    let fake = Fake::new(&[
+        (
+            "FAKE_AGENT_FIXTURE",
+            fixture("codex", "text").display().to_string(),
+        ),
+        ("FAKE_AGENT_SLEEP", "60".into()),
+    ]);
+    let mut settings = fake.settings("codex");
+    settings.pty = vec!["codex".into()];
+    let connector = ExternalConnector::new(Codex, &settings).with_timeouts(Timeouts {
+        health: Duration::from_secs(5),
+        startup: Duration::from_secs(10),
+        idle: Duration::from_secs(1),
+    });
+    let started = std::time::Instant::now();
+    let events = collect(&connector, fake.request("x")).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "cleanup took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(text_of(&events), "PONG");
+    assert!(events.iter().any(|e| matches!(
+        e.kind,
+        EventKind::Completed {
+            stop_reason: StopReason::EndTurn
+        }
+    )));
+    let pid = events[0].diagnostic.as_ref().unwrap()["pid"]
+        .as_u64()
+        .unwrap() as u32;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!is_alive(pid).await, "pty agent {pid} still alive");
+    assert_eq!(
+        connector
+            .inspect(&SessionId("s-test".into()))
+            .await
+            .unwrap()
+            .state,
+        TaskState::Completed
+    );
+}

@@ -67,15 +67,32 @@ impl ControlPlane {
         out
     }
 
-    /// Key values the harness can resolve, redacted out of connector
-    /// output.
+    /// Key values the harness can resolve plus every credential-like
+    /// variable in this process's environment, redacted out of connector
+    /// output. The agents keep their environment (ADR-010); only what they
+    /// echo back is filtered.
     pub fn known_secrets(&self) -> Vec<Secret> {
-        self.builder
+        let blocked: Vec<String> = self
+            .builder
+            .config
+            .profiles
+            .values()
+            .map(|profile| profile.key.env_var_name.clone())
+            .collect();
+        let mut secrets: Vec<Secret> = self
+            .builder
             .config
             .profiles
             .iter()
             .filter_map(|(name, profile)| self.builder.keys.key(name, &profile.key).ok())
-            .collect()
+            .collect();
+        let vars: Vec<(String, String)> = std::env::vars().collect();
+        secrets.extend(gritt_core::secret::secret_env_values(
+            vars.iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+            &blocked,
+        ));
+        secrets
     }
 
     /// Opens or creates a session and returns its driver. An existing
@@ -90,6 +107,7 @@ impl ControlPlane {
         phase: Option<Phase>,
     ) -> Result<Box<dyn Driver>> {
         let existing = self.builder.find_session(&selector, phase).await?;
+        let existing_id = existing.as_ref().map(|session| session.id.clone());
         let session = match existing {
             Some(session) => {
                 if let (Some(wanted), SessionKind::Connector { id }) = (connector, &session.kind) {
@@ -111,12 +129,29 @@ impl ControlPlane {
                 }
                 Some(id) => {
                     // Refuse before creating anything the store would then
-                    // list as a session that never ran.
-                    if self.connector(id).is_none() {
+                    // list as a session that never ran: the connector must
+                    // be registered and its executable found.
+                    let Some(connector) = self.connector(id) else {
                         return Err(Error::connector(format!(
                             "connector {} is not available",
                             id.as_str()
                         )));
+                    };
+                    match connector.info().await {
+                        Ok(info) if info.auth == AuthState::NotInstalled => {
+                            return Err(Error::connector(format!(
+                                "connector {} is not installed; nothing was created",
+                                id.as_str()
+                            )));
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            return Err(Error::connector(format!(
+                                "connector {} cannot start: {}",
+                                id.as_str(),
+                                error.message
+                            )));
+                        }
                     }
                     let now = Utc::now();
                     let session_id = SessionId(uuid::Uuid::new_v4().to_string());
@@ -141,17 +176,28 @@ impl ControlPlane {
                 let connector = self.connector(*id).ok_or_else(|| {
                     Error::connector(format!("connector {} is not available", id.as_str()))
                 })?;
-                Ok(Box::new(
-                    ConnectorSession::open(
-                        session,
-                        connector,
-                        Arc::clone(&self.builder.store),
-                        Arc::clone(&self.builder.telemetry),
-                        self.builder.approval,
-                        self.known_secrets(),
-                    )
-                    .await?,
-                ))
+                let created_now = existing_id.is_none();
+                let session_id = session.id.clone();
+                let opened = ConnectorSession::open(
+                    session,
+                    connector,
+                    Arc::clone(&self.builder.store),
+                    Arc::clone(&self.builder.telemetry),
+                    self.builder.approval,
+                    self.known_secrets(),
+                )
+                .await;
+                match opened {
+                    Ok(driver) => Ok(Box::new(driver)),
+                    Err(error) => {
+                        // A row for a session that never opened is noise in
+                        // the list; only one created in this call is removed.
+                        if created_now {
+                            let _ = self.builder.store.remove(&session_id).await;
+                        }
+                        Err(error)
+                    }
+                }
             }
         }
     }

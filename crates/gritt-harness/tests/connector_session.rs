@@ -591,3 +591,84 @@ async fn the_connector_runner_relays_native_approvals() {
     let standalone = NativeConnector::new(Arc::clone(&fx.plane.builder));
     assert_eq!(standalone.id(), ConnectorId::Native);
 }
+
+#[tokio::test]
+async fn inherited_credentials_echoed_by_an_agent_are_redacted() {
+    // The agent keeps its environment (ADR-010); what it echoes back is
+    // filtered on the way to the screen and the store.
+    std::env::set_var("FAKE_SERVICE_TOKEN", "svc-token-7781");
+    let scratch = tempfile::tempdir().unwrap();
+    let leak = scratch.path().join("leak.jsonl");
+    std::fs::write(
+        &leak,
+        "{\"type\":\"thread.started\",\"thread_id\":\"t-leak\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"i\",\"type\":\"agent_message\",\"text\":\"token is svc-token-7781\"}}\n{\"type\":\"turn.completed\",\"usage\":{}}\n",
+    )
+    .unwrap();
+    let wrapper = fake_agent(
+        scratch.path(),
+        &[("FAKE_AGENT_FIXTURE", leak.display().to_string())],
+    );
+    let fx = fixture(
+        Vec::new(),
+        ApprovalMode::DenyAll,
+        vec![codex_connector(&wrapper)],
+    )
+    .await;
+    let mut driver = fx
+        .plane
+        .open(
+            SessionSelector::Named("leaky".into()),
+            Some(ConnectorId::Codex),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut ui = RecordingUi::default();
+    let outcome = driver.run_turn("x", &mut ui).await.unwrap();
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(text_of(&ui.events), "token is [redacted]");
+    let session = fx
+        .plane
+        .builder
+        .store
+        .find_by_name("leaky")
+        .await
+        .unwrap()
+        .unwrap();
+    let stored = fx
+        .plane
+        .builder
+        .store
+        .read_events(&session.id)
+        .await
+        .unwrap();
+    let dump = serde_json::to_string(&stored).unwrap();
+    assert!(!dump.contains("svc-token-7781"), "{dump}");
+    assert!(dump.contains("[redacted]"));
+}
+
+#[tokio::test]
+async fn a_connector_that_is_not_installed_leaves_no_session_row() {
+    let settings = ConnectorSettings {
+        executables: BTreeMap::from([("codex".to_owned(), "/definitely/not/codex".to_owned())]),
+        ..ConnectorSettings::default()
+    };
+    let missing: Arc<dyn Connector> = Arc::new(ExternalConnector::new(Codex, &settings));
+    let fx = fixture(Vec::new(), ApprovalMode::DenyAll, vec![missing]).await;
+    let error = fx
+        .plane
+        .open(
+            SessionSelector::Named("ghost".into()),
+            Some(ConnectorId::Codex),
+            None,
+            None,
+            None,
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(error.message.contains("not installed"), "{}", error.message);
+    assert!(fx.plane.builder.store.list().await.unwrap().is_empty());
+}

@@ -5,7 +5,7 @@
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gritt_core::connector::Transport;
 use gritt_core::session::BoxFuture;
@@ -50,35 +50,50 @@ impl ChildControl for PtyChild {
             if let Some(pid) = self.pid {
                 crate::process::kill_tree(pid).await;
             }
-            let child = Arc::clone(&self.child);
-            let _ = tokio::task::spawn_blocking(move || {
-                let mut child = child.lock().expect("pty child");
+            // The lock is only ever held for a non-blocking call, so a
+            // waiter elsewhere can never wedge this.
+            {
+                let mut child = self.child.lock().expect("pty child");
                 let _ = child.kill();
-                let _ = child.wait();
-            })
-            .await;
+            }
+            let _ = poll_exit(&self.child, Duration::from_secs(5)).await;
         })
     }
 
     fn wait(&mut self, limit: Duration) -> BoxFuture<'_, Option<ExitOutcome>> {
-        Box::pin(async move {
-            let child = Arc::clone(&self.child);
-            let waiter = tokio::task::spawn_blocking(move || {
-                let mut child = child.lock().expect("pty child");
-                child.wait().ok()
-            });
-            match tokio::time::timeout(limit, waiter).await {
-                Ok(Ok(Some(status))) => Some(ExitOutcome {
+        Box::pin(async move { poll_exit(&self.child, limit).await })
+    }
+}
+
+/// Polls the child with `try_wait` until it exits or `limit` passes.
+/// Nothing blocks while the child mutex is held, so `kill` and `wait`
+/// cannot deadlock each other.
+async fn poll_exit(
+    child: &Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+    limit: Duration,
+) -> Option<ExitOutcome> {
+    let deadline = Instant::now() + limit;
+    loop {
+        let status = child.lock().expect("pty child").try_wait();
+        match status {
+            Ok(Some(status)) => {
+                return Some(ExitOutcome {
                     code: Some(status.exit_code() as i32),
                     success: status.success(),
-                }),
-                Ok(_) => Some(ExitOutcome {
+                })
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return Some(ExitOutcome {
                     code: None,
                     success: false,
-                }),
-                Err(_) => None,
+                })
             }
-        })
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

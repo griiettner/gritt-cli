@@ -84,9 +84,28 @@ Version probes use `--version`; auth probes use `codex login status`,
   `[connectors.extra_args]`. The native connector relays approvals.
 - External agents keep their full environment. Stripping credential
   variables, as the native shell tool does, would break the agents' own
-  authentication. Instead every profile key the resolver can produce is
-  redacted out of connector events and diagnostics, once in the connector
-  and again in the harness runner.
+  authentication. Instead every profile key the resolver can produce and
+  every value of a credential-like variable in Gritt's own environment
+  (the `gritt-core` name rule the shell tool also uses) is redacted out of
+  connector events and diagnostics, once in the connector and again in the
+  harness runner. Launch diagnostics record `[prompt]` for the prompt and
+  `name=[redacted]` for any `name=value` argument. A credential-bearing
+  `[connectors.extra_args]` entry is refused at startup with a config
+  error that names the flag, never the value.
+- The native `--approve-all`, `--deny-all`, and `--ask` flags are accepted
+  with an external connector but print a warning on stderr that the agent
+  applies its own approval policy and that `[connectors.extra_args]` is
+  where its permission flags go.
+- The agent's terminal event is a verdict, not a stop signal. The driver
+  keeps reading until the process exits (bounded by the idle timeout, at
+  most ten seconds after the terminal event), so a trailing error is
+  still emitted; an error terminal keeps the session failed, and a
+  completion followed by a non-zero exit becomes an error naming the
+  status. `inspect()` reports that real state, with `last_error`
+  key-redacted.
+- The PTY transport never blocks while holding the child handle: exit is
+  polled with `try_wait`, so `kill` and `wait` cannot wedge each other when
+  an agent lingers after finishing.
 - The child's stdin is closed. Codex blocks on an open stdin pipe until it
   sees end-of-input; every supported agent takes its prompt as an
   argument, and follow-up input is a new turn on the agent's own thread.
@@ -139,8 +158,9 @@ Version probes use `--version`; auth probes use `codex login status`,
 - A `claude --bare` probe ended with `terminal_reason: api_error`; the
   connector does not pass `--bare`.
 - Sessions created before a connector fails were listed as sessions that
-  never ran; the control plane now refuses an unavailable connector before
-  creating the row.
+  never ran. The control plane now probes the connector first and refuses
+  one that is not installed before creating the row, and removes a row it
+  created in the same call when opening the session fails.
 - Unknown wire messages become a streaming status event with the raw
   message in `diagnostic.unknown_event`; malformed lines become
   `diagnostic.malformed_line`. Neither is fatal.
@@ -154,9 +174,9 @@ All run from the worktree root on 2026-09-04:
 
 - `cargo fmt --all --check`: pass.
 - `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test -p gritt-connector`: pass, 24 tests (5 unit, 17 integration,
+- `cargo test -p gritt-connector`: pass, 30 tests (5 unit, 23 integration,
   2 live tests that skip without the gate).
-- `cargo test --workspace`: pass, 166 tests.
+- `cargo test --workspace`: pass, 178 tests.
 - `GRITT_LIVE_CONNECTOR_TESTS=1 cargo test -p gritt-connector --test live`:
   pass. Codex 0.153.2 authenticated, completed in 7.3 s with text `PONG`;
   Claude Code 2.1.260 authenticated, completed in 7.3 s with text `PONG`.
@@ -217,5 +237,17 @@ Benchmarks: none required. Test duration for the connector crate is about
 
 ## Updates
 
+- 2026-09-04 review fix round. Seven findings: credential values inherited
+  from Gritt's environment now join the connector redaction set,
+  credential-bearing `extra_args` are refused, and launch diagnostics omit
+  the prompt and argument values; the driver drains through process exit
+  so a trailing error or a non-zero exit after a terminal event is
+  surfaced and `inspect()` reports the real state; `last_error` is
+  key-redacted; native approval flags warn on an external connector; the
+  PTY waiter polls instead of blocking under the child mutex;
+  `ConnectorSettings` has a struct-level serde default so a partial
+  `[connectors]` section parses; and a connector that is not installed
+  leaves no session row. Twelve tests added across the connector, harness,
+  core, and binary crates. Validation rerun, all green.
 - 2026-09-04 PR #4 opened; the report records the PR, the commits, and
   both chain-check results.

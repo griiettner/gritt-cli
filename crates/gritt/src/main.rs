@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use clap::{Args, Parser, Subcommand};
-use gritt_connector::{default_connectors_with_secrets, parse_connector_id};
+use gritt_connector::{default_connectors_with_secrets, environment_secrets, parse_connector_id};
 use gritt_core::connector::{AuthState, ConnectorId};
 use gritt_core::event::{ApprovalDecision, EventKind};
 use gritt_core::session::{Phase, SessionStore};
@@ -195,17 +195,53 @@ async fn builder(
 }
 
 /// Wraps the builder in the control plane with every external connector
-/// configured from the settings; key values the resolver knows are
-/// redacted out of connector output.
-fn plane(builder: AgentBuilder) -> ControlPlane {
-    let secrets: Vec<gritt_core::secret::Secret> = builder
+/// configured from the settings. Key values the resolver knows and every
+/// credential-like variable in this process's environment are redacted
+/// out of connector output; the agents themselves keep their environment
+/// (ADR-010). A credential-bearing `extra_args` entry is refused here.
+fn plane(builder: AgentBuilder) -> Result<ControlPlane> {
+    let blocked: Vec<String> = builder
+        .config
+        .profiles
+        .values()
+        .map(|profile| profile.key.env_var_name.clone())
+        .collect();
+    let mut secrets: Vec<gritt_core::secret::Secret> = builder
         .config
         .profiles
         .iter()
         .filter_map(|(name, profile)| builder.keys.key(name, &profile.key).ok())
         .collect();
-    let external = default_connectors_with_secrets(&builder.config.connectors, secrets);
-    ControlPlane::new(Arc::new(builder), external)
+    secrets.extend(environment_secrets(&blocked));
+    let external = default_connectors_with_secrets(&builder.config.connectors, secrets)?;
+    Ok(ControlPlane::new(Arc::new(builder), external))
+}
+
+/// The native approval flags mean nothing on an external agent, which
+/// applies its own policy (ADR-010). Says so instead of silently
+/// accepting `--deny-all` next to externally authorized tool execution.
+fn approval_flag_warning(args: &SessionArgs, connector: Option<ConnectorId>) -> Option<String> {
+    let id = connector.filter(|id| *id != ConnectorId::Native)?;
+    let flag = if args.approve_all {
+        "--approve-all"
+    } else if args.deny_all {
+        "--deny-all"
+    } else if args.ask {
+        "--ask"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "warning: {flag} has no effect with --connector {}: that agent applies its own approval policy; \
+         pass its permission flags through `[connectors.extra_args]` in the Gritt config",
+        id.as_str()
+    ))
+}
+
+fn warn_approval_flags(args: &SessionArgs, connector: Option<ConnectorId>) {
+    if let Some(warning) = approval_flag_warning(args, connector) {
+        eprintln!("{warning}");
+    }
 }
 
 fn connector_flag(args: &SessionArgs) -> Result<Option<ConnectorId>> {
@@ -318,12 +354,13 @@ async fn run_print(
     verbose: bool,
 ) -> Result<ExitCode> {
     let connector = connector_flag(args)?;
+    warn_approval_flags(args, connector);
     let builder = builder(workspace, database, args).await?;
     if connector.is_none() {
         warm_catalog(&builder, args).await;
     }
     let approval = builder.approval;
-    let plane = plane(builder);
+    let plane = plane(builder)?;
     let mut agent = plane
         .open(
             selector(args),
@@ -381,12 +418,13 @@ async fn run_repl_mode(
     verbose: bool,
 ) -> Result<ExitCode> {
     let connector = connector_flag(args)?;
+    warn_approval_flags(args, connector);
     let builder = builder(workspace, database, args).await?;
     if connector.is_none() {
         warm_catalog(&builder, args).await;
     }
     let approval = builder.approval;
-    let plane = plane(builder);
+    let plane = plane(builder)?;
     let agent = plane
         .open(
             selector(args),
@@ -422,6 +460,7 @@ async fn run_tui_mode(
     args: &SessionArgs,
 ) -> Result<ExitCode> {
     let connector = connector_flag(args)?;
+    warn_approval_flags(args, connector);
     let mut builder = builder(workspace, database, args).await?;
     // The full-screen mode answers approvals itself.
     if builder.approval == ApprovalMode::DenyAll && !args.deny_all {
@@ -430,7 +469,7 @@ async fn run_tui_mode(
     if connector.is_none() {
         warm_catalog(&builder, args).await;
     }
-    let plane = plane(builder);
+    let plane = plane(builder)?;
     let agent = plane
         .open(
             selector(args),
@@ -544,7 +583,7 @@ async fn connectors_command(workspace: &Path, database: Option<&Path>) -> Result
         connector: None,
     };
     let builder = builder(workspace, database, &args).await?;
-    let plane = plane(builder);
+    let plane = plane(builder)?;
     println!("connector    state          version    transport        capabilities");
     for (id, info) in plane.infos().await {
         match info {
@@ -670,5 +709,59 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(approve_all: bool, deny_all: bool, ask: bool, connector: Option<&str>) -> SessionArgs {
+        SessionArgs {
+            session: None,
+            profile: None,
+            model: None,
+            plan: false,
+            code: false,
+            approve_all,
+            deny_all,
+            ask,
+            no_models: true,
+            connector: connector.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn native_approval_flags_warn_only_on_external_connectors() {
+        let warning = approval_flag_warning(
+            &args(false, true, false, Some("codex")),
+            Some(ConnectorId::Codex),
+        )
+        .unwrap();
+        assert!(warning.contains("--deny-all has no effect with --connector codex"));
+        assert!(warning.contains("own approval policy"));
+        assert!(warning.contains("[connectors.extra_args]"));
+        let warning = approval_flag_warning(
+            &args(true, false, false, Some("claude")),
+            Some(ConnectorId::ClaudeCode),
+        )
+        .unwrap();
+        assert!(warning.contains("--approve-all"));
+        assert!(approval_flag_warning(
+            &args(false, false, true, Some("opencode")),
+            Some(ConnectorId::OpenCode)
+        )
+        .is_some());
+        assert!(approval_flag_warning(
+            &args(false, false, false, Some("codex")),
+            Some(ConnectorId::Codex)
+        )
+        .is_none());
+        assert!(approval_flag_warning(&args(false, true, false, None), None).is_none());
+        assert!(approval_flag_warning(
+            &args(false, true, false, Some("native")),
+            Some(ConnectorId::Native)
+        )
+        .is_none());
     }
 }
