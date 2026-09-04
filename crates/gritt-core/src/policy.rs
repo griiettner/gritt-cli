@@ -33,7 +33,7 @@ pub struct PolicyConfig {
 
 impl PolicyConfig {
     /// Workspace-aware defaults: reads inside the workspace allow, writes
-    /// ask, shell asks, anything outside the workspace is denied.
+    /// ask, shell and network ask, anything outside the workspace is denied.
     pub fn workspace_defaults() -> Self {
         let rule = |tool: &str, resource: &str, outcome, reason: &str| PolicyRule {
             tool: tool.into(),
@@ -61,6 +61,7 @@ impl PolicyConfig {
                     PolicyOutcome::Ask,
                     "run a shell command",
                 ),
+                rule("network", "*", PolicyOutcome::Ask, "network access"),
                 rule("*", "*", PolicyOutcome::Deny, "outside the workspace"),
             ],
             fallback: PolicyOutcome::Deny,

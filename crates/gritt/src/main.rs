@@ -1,9 +1,24 @@
 //! The `gritt` binary: argument parsing, configuration, key loading, and
-//! mode selection. Modes and sessions land in TKT-0011.
+//! mode selection. The harness crate owns the modes themselves.
 
+use std::io::{BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use gritt_core::event::{ApprovalDecision, EventKind};
+use gritt_core::session::{Phase, SessionStore};
+use gritt_core::{Error, Result};
+use gritt_harness::agent::{AgentBuilder, ApprovalMode, SessionSelector, TurnStatus};
+use gritt_harness::modes::print::{read_yes_no, PrintUi, PrintUiOptions};
+use gritt_harness::modes::repl::{run_repl, CancelSlot};
+use gritt_harness::store::{resolve_location, Store};
+use gritt_harness::telemetry::Telemetry;
+use gritt_harness::tools::Workspace;
+use gritt_harness::tui::run_tui;
+use gritt_provider::models::{ModelCache, ModelCatalog};
+use gritt_provider::ReqwestTransport;
 
 mod config;
 mod keys;
@@ -14,7 +29,12 @@ mod keys;
 struct Cli {
     /// Workspace directory. Defaults to the current directory.
     #[arg(long, global = true, value_name = "PATH")]
-    workspace: Option<std::path::PathBuf>,
+    workspace: Option<PathBuf>,
+
+    /// Database file override. Defaults to the workspace's `.agents/brain`
+    /// database or the user data directory.
+    #[arg(long, global = true, value_name = "PATH")]
+    database: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -30,81 +50,492 @@ enum Command {
         /// Provider profile name.
         profile: String,
     },
+    /// Print mode: one prompt in, streamed text out.
+    Run {
+        /// The prompt.
+        prompt: String,
+        #[command(flatten)]
+        session: SessionArgs,
+        /// Print status changes, reasoning, and usage on stderr.
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// REPL mode: an interactive loop with history and continuation.
+    Repl {
+        #[command(flatten)]
+        session: SessionArgs,
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Full-screen mode.
+    Tui {
+        #[command(flatten)]
+        session: SessionArgs,
+    },
+    /// Manage sessions.
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
 }
 
-fn main() -> ExitCode {
+#[derive(Args, Clone)]
+struct SessionArgs {
+    /// Session name to create or resume.
+    #[arg(long)]
+    session: Option<String>,
+    /// Provider profile. Defaults to the configured default.
+    #[arg(long)]
+    profile: Option<String>,
+    /// Model id or alias. Defaults to the configured default.
+    #[arg(long)]
+    model: Option<String>,
+    /// Start in the planning phase (conversation only).
+    #[arg(long, conflicts_with = "code")]
+    plan: bool,
+    /// Start in the coding phase (tools available).
+    #[arg(long)]
+    code: bool,
+    /// Approve every tool request without asking.
+    #[arg(long, conflicts_with_all = ["deny_all", "ask"])]
+    approve_all: bool,
+    /// Deny every tool request that would ask.
+    #[arg(long, conflicts_with = "ask")]
+    deny_all: bool,
+    /// Ask on the terminal. The default when stdin is a terminal.
+    #[arg(long)]
+    ask: bool,
+    /// Skip the model list refresh.
+    #[arg(long)]
+    no_models: bool,
+}
+
+#[derive(Subcommand)]
+enum SessionCommand {
+    /// List sessions.
+    List,
+    /// Show a session's events.
+    Show { name: String },
+    /// Rename a session.
+    Rename { name: String, new_name: String },
+    /// Remove a session and its events.
+    Remove { name: String },
+}
+
+impl gritt_provider::adapter::KeyProvider
+    for keys::KeyResolver<keys::SystemKeychain, keys::ProcessEnv>
+{
+    fn key(
+        &self,
+        profile: &str,
+        reference: &gritt_core::secret::SecretRef,
+    ) -> Result<gritt_core::secret::Secret> {
+        self.resolve(profile, reference)
+    }
+}
+
+fn resolver() -> keys::KeyResolver<keys::SystemKeychain, keys::ProcessEnv> {
+    keys::KeyResolver {
+        keychain: keys::SystemKeychain,
+        env: keys::ProcessEnv,
+    }
+}
+
+async fn open_store(workspace: &Path, database: Option<&Path>) -> Result<Arc<Store>> {
+    let location = resolve_location(workspace, database)?;
+    Ok(Arc::new(Store::open(location).await?))
+}
+
+async fn builder(
+    workspace: &Path,
+    database: Option<&Path>,
+    args: &SessionArgs,
+) -> Result<AgentBuilder> {
+    let config = config::load(workspace, std::env::vars())?;
+    let store = open_store(workspace, database).await?;
+    let telemetry = Arc::new(Telemetry::new(Arc::clone(&store), config.logging.clone()));
+    if telemetry.content_logging() {
+        telemetry.purge_content(chrono::Utc::now()).await?;
+    }
+    let approval = if args.approve_all {
+        ApprovalMode::ApproveAll
+    } else if args.deny_all {
+        ApprovalMode::DenyAll
+    } else if args.ask || std::io::stdin().is_terminal() {
+        ApprovalMode::Ask
+    } else {
+        ApprovalMode::DenyAll
+    };
+    let cache = if args.no_models {
+        None
+    } else {
+        ModelCache::default_dir().map(ModelCache::new)
+    };
+    Ok(AgentBuilder {
+        config,
+        store,
+        telemetry,
+        keys: Arc::new(resolver()),
+        transport: Arc::new(ReqwestTransport::new()?),
+        catalog: ModelCatalog::new(),
+        cache,
+        workspace: Workspace::open(workspace)?,
+        approval,
+    })
+}
+
+fn phase_flag(args: &SessionArgs) -> Option<Phase> {
+    if args.plan {
+        Some(Phase::Planning)
+    } else if args.code {
+        Some(Phase::Coding)
+    } else {
+        None
+    }
+}
+
+fn selector(args: &SessionArgs) -> SessionSelector {
+    match &args.session {
+        Some(name) => SessionSelector::Named(name.clone()),
+        None => SessionSelector::New { name: None },
+    }
+}
+
+/// Loads the model list for the profile the session will use, reporting
+/// a stale or missing list on stderr without stopping.
+async fn warm_catalog(builder: &AgentBuilder, args: &SessionArgs) {
+    let profile = args
+        .profile
+        .clone()
+        .or_else(|| builder.config.default_profile.clone());
+    let Some(profile) = profile else {
+        return;
+    };
+    match builder.load_catalog(&profile).await {
+        Ok(None) => {
+            if let Some(gritt_core::provider::ModelListStatus::Stale { fetched_at }) =
+                builder.catalog.status(&profile)
+            {
+                eprintln!(
+                    "warning: using the stale model list for `{profile}` cached at {fetched_at}"
+                );
+            }
+        }
+        Ok(Some(error)) => eprintln!("warning: {error}; capabilities are unreported"),
+        Err(error) => eprintln!("warning: {error}"),
+    }
+}
+
+fn stdin_prompter() -> gritt_harness::modes::print::Prompter {
+    Arc::new(|_, _, _| {
+        eprint!("approve? [y/N] ");
+        let _ = std::io::stderr().flush();
+        let stdin = std::io::stdin();
+        let mut lock = stdin.lock();
+        read_yes_no(&mut lock)
+    })
+}
+
+fn print_options(verbose: bool, approval: ApprovalMode) -> PrintUiOptions {
+    match approval {
+        ApprovalMode::Ask => PrintUiOptions {
+            verbose,
+            prompter: stdin_prompter(),
+        },
+        ApprovalMode::ApproveAll => PrintUiOptions {
+            verbose,
+            prompter: Arc::new(|_, _, _| ApprovalDecision::Approved),
+        },
+        ApprovalMode::DenyAll => PrintUiOptions::deny_all(verbose),
+    }
+}
+
+/// Cancels the running turn on Ctrl-C; a Ctrl-C with nothing running
+/// exits.
+fn install_ctrl_c(slot: CancelSlot) {
+    tokio::spawn(async move {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            let handle = slot.lock().expect("cancel slot").clone();
+            match handle {
+                Some(handle) if !handle.is_cancelled() => {
+                    eprintln!("\ncancelling...");
+                    handle.cancel();
+                }
+                _ => std::process::exit(130),
+            }
+        }
+    });
+}
+
+async fn run_print(
+    workspace: &Path,
+    database: Option<&Path>,
+    prompt: &str,
+    args: &SessionArgs,
+    verbose: bool,
+) -> Result<ExitCode> {
+    let builder = builder(workspace, database, args).await?;
+    warm_catalog(&builder, args).await;
+    let mut agent = builder
+        .open(
+            selector(args),
+            args.profile.as_deref(),
+            args.model.as_deref(),
+            phase_flag(args),
+        )
+        .await?;
+    let slot: CancelSlot = Arc::new(Mutex::new(Some(agent.handle())));
+    install_ctrl_c(Arc::clone(&slot));
+    let mut ui = PrintUi::new(
+        std::io::stdout(),
+        std::io::stderr(),
+        print_options(verbose, builder.approval),
+    );
+    // The interface already showed a failed turn's error event.
+    let outcome = match agent.run_turn(prompt, &mut ui).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            ui.finish();
+            return Ok(if error.kind == gritt_core::ErrorKind::Cancelled {
+                ExitCode::from(130)
+            } else {
+                ExitCode::FAILURE
+            });
+        }
+    };
+    ui.finish();
+    if verbose {
+        eprintln!(
+            "session: {} ({})",
+            agent.session().name,
+            agent.session().id.0
+        );
+    }
+    Ok(match outcome.status {
+        TurnStatus::Completed => ExitCode::SUCCESS,
+        TurnStatus::Cancelled => ExitCode::from(130),
+        TurnStatus::Failed => ExitCode::FAILURE,
+    })
+}
+
+async fn run_repl_mode(
+    workspace: &Path,
+    database: Option<&Path>,
+    args: &SessionArgs,
+    verbose: bool,
+) -> Result<ExitCode> {
+    let builder = builder(workspace, database, args).await?;
+    warm_catalog(&builder, args).await;
+    let agent = builder
+        .open(
+            selector(args),
+            args.profile.as_deref(),
+            args.model.as_deref(),
+            phase_flag(args),
+        )
+        .await?;
+    let slot: CancelSlot = Arc::new(Mutex::new(None));
+    install_ctrl_c(Arc::clone(&slot));
+    println!("gritt repl: {} (/help for commands)", agent.session().name);
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    run_repl(
+        &builder,
+        agent,
+        &mut input,
+        std::io::stdout(),
+        std::io::stderr(),
+        print_options(verbose, builder.approval),
+        slot,
+    )
+    .await?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_tui_mode(
+    workspace: &Path,
+    database: Option<&Path>,
+    args: &SessionArgs,
+) -> Result<ExitCode> {
+    let mut builder = builder(workspace, database, args).await?;
+    // The full-screen mode answers approvals itself.
+    if builder.approval == ApprovalMode::DenyAll && !args.deny_all {
+        builder.approval = ApprovalMode::Ask;
+    }
+    warm_catalog(&builder, args).await;
+    let agent = builder
+        .open(
+            selector(args),
+            args.profile.as_deref(),
+            args.model.as_deref(),
+            phase_flag(args),
+        )
+        .await?;
+    run_tui(&builder, agent).await?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn session_command(
+    workspace: &Path,
+    database: Option<&Path>,
+    command: SessionCommand,
+) -> Result<ExitCode> {
+    let store = open_store(workspace, database).await?;
+    match command {
+        SessionCommand::List => {
+            for session in store.list().await? {
+                println!(
+                    "{:<24} {:<10} {:<40} {}",
+                    session.name,
+                    format!("{:?}", session.phase).to_lowercase(),
+                    match &session.kind {
+                        gritt_core::session::SessionKind::Native {
+                            provider_profile,
+                            model,
+                        } => format!("{provider_profile}/{model}"),
+                        gritt_core::session::SessionKind::Connector { id } => format!("{id:?}"),
+                    },
+                    session.updated_at.to_rfc3339()
+                );
+            }
+        }
+        SessionCommand::Show { name } => {
+            let session = store
+                .find_by_name(&name)
+                .await?
+                .ok_or_else(|| Error::config(format!("no session named `{name}`")))?;
+            println!(
+                "{} {} {:?} {}",
+                session.name,
+                session.id.0,
+                session.phase,
+                session.workspace.display()
+            );
+            for event in store.read_events(&session.id).await? {
+                let line = match &event.kind {
+                    EventKind::TextDelta { text } => format!("text {text:?}"),
+                    EventKind::ToolCall { call } => format!("tool_call {}", call.name),
+                    EventKind::ToolResult { result } => {
+                        format!("tool_result {} error={}", result.name, result.is_error)
+                    }
+                    EventKind::ApprovalRequested { request } => {
+                        format!("approval_requested {} {}", request.tool, request.resource)
+                    }
+                    EventKind::ApprovalDecided { decision, .. } => {
+                        format!("approval {decision:?}")
+                    }
+                    EventKind::StatusChanged { status } => format!("status {status:?}"),
+                    EventKind::Error { message, .. } => format!("error {message}"),
+                    other => format!("{other:?}"),
+                };
+                println!(
+                    "{:>5} {} {}",
+                    event.sequence,
+                    event.timestamp.format("%H:%M:%S"),
+                    line
+                );
+            }
+        }
+        SessionCommand::Rename { name, new_name } => {
+            let session = store
+                .find_by_name(&name)
+                .await?
+                .ok_or_else(|| Error::config(format!("no session named `{name}`")))?;
+            store.rename(&session.id, new_name.clone()).await?;
+            println!("renamed `{name}` to `{new_name}`");
+        }
+        SessionCommand::Remove { name } => {
+            let session = store
+                .find_by_name(&name)
+                .await?
+                .ok_or_else(|| Error::config(format!("no session named `{name}`")))?;
+            store.remove(&session.id).await?;
+            println!("removed `{name}`");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn show_config(workspace: &Path) -> Result<ExitCode> {
+    let config = config::load(workspace, std::env::vars())?;
+    println!("workspace: {}", workspace.display());
+    println!("profiles: {}", config.profiles.len());
+    println!(
+        "default: {}/{}",
+        config.default_profile.as_deref().unwrap_or("-"),
+        config.default_model.as_deref().unwrap_or("-")
+    );
+    println!(
+        "content logging: {} ({} day retention)",
+        config.logging.content_logging, config.logging.content_retention_days
+    );
+    let resolver = resolver();
+    for (name, profile) in &config.profiles {
+        // Only availability is reported. The value never leaves the
+        // resolver.
+        let state = match resolver.resolve(name, &profile.key) {
+            Ok(_) => "key available".to_string(),
+            Err(error) => error.message,
+        };
+        println!(
+            "profile {name}: {:?} {} ({state})",
+            profile.protocol, profile.base_url
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn key_set(workspace: &Path, profile: &str) -> Result<ExitCode> {
+    let config = config::load(workspace, std::env::vars())?;
+    let found = config
+        .profiles
+        .get(profile)
+        .ok_or_else(|| Error::config(format!("unknown profile `{profile}`")))?;
+    let mut value = String::new();
+    let stdin = std::io::stdin();
+    if stdin.lock().read_line(&mut value).is_err() || value.trim().is_empty() {
+        return Err(Error::config("read an empty key from stdin"));
+    }
+    let secret = gritt_core::secret::Secret::new(value.trim());
+    resolver().store(&found.key, &secret)?;
+    println!("stored key for profile `{profile}` in the keychain");
+    Ok(ExitCode::SUCCESS)
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
     let workspace = cli
         .workspace
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default();
-    match cli.command {
+    let database = cli.database.as_deref();
+    let result = match cli.command {
         Some(Command::KeySet { profile }) => key_set(&workspace, &profile),
-        Some(Command::Config) | None => match config::load(&workspace, std::env::vars()) {
-            Ok(config) => {
-                println!("workspace: {}", workspace.display());
-                println!("profiles: {}", config.profiles.len());
-                println!(
-                    "default: {}/{}",
-                    config.default_profile.as_deref().unwrap_or("-"),
-                    config.default_model.as_deref().unwrap_or("-")
-                );
-                let resolver = keys::KeyResolver {
-                    keychain: keys::SystemKeychain,
-                    env: keys::ProcessEnv,
-                };
-                for (name, profile) in &config.profiles {
-                    // Only availability is reported. The value never leaves
-                    // the resolver.
-                    let state = match resolver.resolve(name, &profile.key) {
-                        Ok(_) => "key available".to_string(),
-                        Err(error) => error.message,
-                    };
-                    println!(
-                        "profile {name}: {:?} {} ({state})",
-                        profile.protocol, profile.base_url
-                    );
-                }
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("error: {error}");
+        Some(Command::Config) | None => show_config(&workspace),
+        Some(Command::Run {
+            prompt,
+            session,
+            verbose,
+        }) => run_print(&workspace, database, &prompt, &session, verbose).await,
+        Some(Command::Repl { session, verbose }) => {
+            run_repl_mode(&workspace, database, &session, verbose).await
+        }
+        Some(Command::Tui { session }) => run_tui_mode(&workspace, database, &session).await,
+        Some(Command::Session { command }) => session_command(&workspace, database, command).await,
+    };
+    match result {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("error: {error}");
+            if error.kind == gritt_core::ErrorKind::Cancelled {
+                ExitCode::from(130)
+            } else {
                 ExitCode::FAILURE
             }
-        },
-    }
-}
-
-fn key_set(workspace: &std::path::Path, profile: &str) -> ExitCode {
-    let config = match config::load(workspace, std::env::vars()) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let Some(found) = config.profiles.get(profile) else {
-        eprintln!("error: unknown profile `{profile}`");
-        return ExitCode::FAILURE;
-    };
-    let mut value = String::new();
-    if std::io::stdin().read_line(&mut value).is_err() || value.trim().is_empty() {
-        eprintln!("error: read an empty key from stdin");
-        return ExitCode::FAILURE;
-    }
-    let secret = gritt_core::secret::Secret::new(value.trim());
-    let resolver = keys::KeyResolver {
-        keychain: keys::SystemKeychain,
-        env: keys::ProcessEnv,
-    };
-    match resolver.store(&found.key, &secret) {
-        Ok(()) => {
-            println!("stored key for profile `{profile}` in the keychain");
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("error: {error}");
-            ExitCode::FAILURE
         }
     }
 }
