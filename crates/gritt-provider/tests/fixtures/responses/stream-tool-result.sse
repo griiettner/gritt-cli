@@ -1,0 +1,9 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_fx4","status":"in_progress"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":1,"item_id":"msg_fx4","output_index":0,"content_index":0,"delta":"The README says hi."}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":2,"response":{"id":"resp_fx4","status":"completed","usage":{"input_tokens":40,"output_tokens":5}}}
+

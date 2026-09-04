@@ -1,0 +1,10 @@
+data: {"id":"chatcmpl-fx2","object":"chat.completion.chunk","model":"openai/gpt-5-nano","choices":[{"index":0,"delta":{"role":"assistant","reasoning":"Plan: answer briefly."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fx2","object":"chat.completion.chunk","model":"openai/gpt-5-nano","choices":[{"index":0,"delta":{"content":"Brief answer."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fx2","object":"chat.completion.chunk","model":"openai/gpt-5-nano","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-fx2","object":"chat.completion.chunk","model":"openai/gpt-5-nano","choices":[],"usage":{"prompt_tokens":8,"completion_tokens":6,"total_tokens":14,"completion_tokens_details":{"reasoning_tokens":4}}}
+
+data: [DONE]
+
