@@ -189,8 +189,6 @@ All from the worktree root on 2026-09-04:
   remain untested until the CI matrix runs; connector supervision tests are
   Unix-only.
 - The missing REPL arrow-key line editing stays as recorded in TKT-0011.
-  The cancelled-approval stale-answer defect is fixed there; only the
-  100 ms poll window after a cancel remains, as that report notes.
 - Claude Code approval relay through its control protocol, and Cursor
   recordings once its CLI is available, stay as recorded in TKT-0012.
 - Replace the hand-authored provider fixtures with redacted live
