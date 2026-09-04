@@ -182,3 +182,73 @@ pub fn assert_monotonic(events: &[Event]) {
         );
     }
 }
+
+/// The three Chat Completions profile shapes: OpenRouter, OpenAI in chat
+/// mode, and a generic self-hosted endpoint.
+pub fn chat_profiles() -> Vec<ProviderProfile> {
+    [
+        (
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+            "OPENROUTER_API_KEY",
+        ),
+        ("openai-chat", "https://api.openai.com/v1", "OPENAI_API_KEY"),
+        ("local", "http://localhost:8080/v1/", "LOCAL_LLM_API_KEY"),
+    ]
+    .into_iter()
+    .map(|(name, base_url, var)| ProviderProfile {
+        name: name.into(),
+        protocol: Protocol::ChatCompletions,
+        base_url: base_url.into(),
+        key: SecretRef::for_profile(name, var),
+        aliases: Default::default(),
+    })
+    .collect()
+}
+
+/// A context for an explicit profile instead of the protocol default.
+pub fn make_context_for(
+    profile: ProviderProfile,
+    responses: Vec<FixtureResponse>,
+    chunk_size: usize,
+) -> (AdapterContext, Arc<FixtureTransport>, CancellationToken) {
+    let transport = Arc::new(FixtureTransport::new(responses, chunk_size));
+    let cancel = CancellationToken::new();
+    let context = AdapterContext {
+        profile,
+        session_id: SessionId("session-test".into()),
+        transport: transport.clone(),
+        keys: Arc::new(StaticKey(Secret::new(TEST_KEY))),
+        capabilities: Arc::new(NoCapabilities),
+        cancel: cancel.clone(),
+    };
+    (context, transport, cancel)
+}
+
+/// A transport whose `send` never resolves, for cancellation during the
+/// connection phase. Records that a send was attempted.
+pub struct PendingTransport {
+    pub attempts: std::sync::atomic::AtomicUsize,
+}
+
+impl PendingTransport {
+    pub fn new() -> Self {
+        Self {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl gritt_provider::HttpTransport for PendingTransport {
+    fn send(
+        &self,
+        _request: gritt_provider::transport::HttpRequest,
+    ) -> gritt_core::session::BoxFuture<
+        '_,
+        gritt_core::Result<gritt_provider::transport::HttpResponse>,
+    > {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(futures::future::pending())
+    }
+}

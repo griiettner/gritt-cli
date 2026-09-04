@@ -15,7 +15,10 @@ use gritt_core::tool::{ToolCall, ToolCallId, ToolDefinition, ToolResult};
 use gritt_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::adapter::{normalized_stream, stream_error, AdapterContext, EventEmitter, Normalizer};
+use crate::adapter::{
+    cancelled_stream, is_cancelled, normalized_stream, stream_error, AdapterContext, EventEmitter,
+    Normalizer,
+};
 use crate::sse::SseEvent;
 use crate::transport::HttpRequest;
 
@@ -91,12 +94,16 @@ impl MessagesAdapter {
             }
             body
         };
-        let key = self.context.key()?;
+        let key = self.context.key_for(&self.emitter)?;
         let request = HttpRequest::post_json(self.endpoint(), &body)
             .secret_header("x-api-key", key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("accept", "text/event-stream");
-        let response = self.context.send_checked(request).await?;
+        let response = match self.context.send_checked(request, &self.emitter).await {
+            Ok(response) => response,
+            Err(error) if is_cancelled(&error) => return Ok(cancelled_stream(&self.emitter)),
+            Err(error) => return Err(error),
+        };
         let normalizer = MessagesNormalizer {
             state: Arc::clone(&self.state),
             ..MessagesNormalizer::default()
@@ -117,7 +124,7 @@ impl ProviderAdapter for MessagesAdapter {
 
     fn send(&self, request: PromptRequest) -> BoxFuture<'_, Result<EventStream<'_>>> {
         Box::pin(async move {
-            self.context.check_capabilities(&request)?;
+            self.context.check_capabilities(&request, &self.emitter)?;
             if request.options.structured_output.is_some() {
                 // Messages has no response-format field; the harness must
                 // use a tool for structured output instead.

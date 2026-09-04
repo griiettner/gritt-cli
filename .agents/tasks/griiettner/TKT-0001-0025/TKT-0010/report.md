@@ -85,10 +85,36 @@ seven files per protocol.
   `{base}/v1/models`.
 - Capability gate. A model whose list entry reports `tools`,
   `structured_output`, or `reasoning` as `false` makes a request that asks
-  for it fail with `UnsupportedCapability` before any HTTP call. A `None`
-  capability does not block the request, because OpenAI and Anthropic lists
-  report no capabilities at all. Messages refuses structured output outright
-  since the protocol has no response-format field.
+  for it fail with `UnsupportedCapability` before any HTTP call. Messages
+  refuses structured output outright since the protocol has no
+  response-format field.
+- Recorded exception to the dev/provider rule that only reported support is
+  advertised: a `None` capability does not block the request, because the
+  OpenAI and Anthropic model lists report no capability flags at all and a
+  strict `Some(true)` gate would refuse tools on every native profile. The
+  PM approved this during the TKT-0010 review. The gap is visible instead: a
+  `capability_warning` diagnostic naming the unreported features and the
+  model is attached to the first event of that stream.
+- Redaction. Every key resolved for a request is registered with the event
+  emitter. Provider error messages and bodies, stream error elements, and
+  event diagnostics are redacted against those keys before anything is
+  retained, and a retained body is capped at 4096 characters. An endpoint
+  that echoes a credential therefore cannot place it in an error,
+  transcript, or telemetry record.
+- Wire sequence. The Responses normalizer tracks `sequence_number` without
+  reordering events. A gap or regression attaches a `sequence_warning`
+  diagnostic to the events of that element, and the completion diagnostic
+  carries `last_wire_sequence` and every warning.
+- Cancellation covers the connection phase. `send_checked` selects the
+  transport send against the token, so a stalled connect is dropped and the
+  turn ends with the terminal `Cancelled` event. A turn started while the
+  token is already cancelled ends the same way without a request. The token
+  has a `reset` so a session can continue after a cancelled turn.
+- Refresh throttling. The cache file records `last_attempt_at`. After a
+  failed refresh the stale list is served without another fetch until the
+  interval passes; `force_refresh` bypasses the throttle.
+- Cache file names append an FNV-1a hash of the profile name, so `a/b` and
+  `a_b` no longer share a file.
 - Continuation state. Chat Completions and Messages store the wire-form
   conversation; Responses stores `previous_response_id` and the
   instructions. Every state carries the event sequence so a restored adapter
@@ -160,9 +186,10 @@ All run from the worktree root on 2026-09-04:
 
 - `cargo fmt --all --check`: pass.
 - `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test -p gritt-provider`: pass, 34 tests (16 unit, 11 contract, 3
-  cache, 1 TCP end to end, 3 live tests that skip without keys).
-- `cargo test --workspace`: pass, 60 tests.
+- `cargo test -p gritt-provider`: pass, 44 tests after the review fix round
+  (19 unit, 17 contract, 4 cache, 1 TCP end to end, 3 live tests that skip
+  without keys). Before the fix round: 34.
+- `cargo test --workspace`: pass, 70 tests after the fix round (60 before).
 - `cargo build --release`: pass, 1m 34s.
 - `gritt-agent ticket validate --repo-root .`: `tkt_validate ok (0
   warnings)`.
@@ -201,11 +228,25 @@ All run from the worktree root on 2026-09-04:
 
 - TKT-0011 wires `KeyResolver` from the binary into `KeyProvider`, loads the
   catalog at startup, and passes `RequestOptions` from the session.
+- TKT-0011 calls `CancellationToken::reset` after draining a cancelled
+  stream and before the next turn on the same adapter; without it every
+  later turn ends with `Cancelled` immediately.
+- TKT-0011 may persist event diagnostics as recorded; they are already
+  redacted and capped at the adapter.
 - TKT-0013 verifies the `aws-lc-rs` build on Windows and Linux.
 - Replace hand-authored fixtures with redacted live recordings when a key is
   available.
 
 ## Updates
 
+- 2026-09-04 review fix round. The PR #2 reviewer returned `needs-fix` with
+  seven findings: provider bodies could carry an echoed key into errors and
+  diagnostics; a failed refresh was retried on every load; unreported
+  capabilities passed silently; Responses `sequence_number` was ignored;
+  cancellation was not observed during connect; cache file names collided;
+  and only the OpenRouter chat profile had fixture coverage. All seven are
+  fixed in the second commit with tests for each, plus a resettable
+  cancellation token for TKT-0011. The validation set was rerun and is
+  recorded above.
 - 2026-09-04 report update. Added the commit, PR #2, and chain-check
   evidence after the PR was opened. No code changed.

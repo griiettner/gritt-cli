@@ -21,3 +21,6 @@ Layout: one folder per protocol, one file per case:
 - `stream-error.sse`: an error element inside the stream body.
 - `error.json`: a non-2xx error body.
 - `models.json`: the provider's model list response.
+
+The Responses folder also has `stream-sequence-gap.sse`: `stream-text.sse`
+with `sequence_number` jumping from 4 to 7, for the wire-sequence warning.

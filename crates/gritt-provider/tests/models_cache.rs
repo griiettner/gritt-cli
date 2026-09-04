@@ -155,3 +155,53 @@ async fn catalog_reports_capabilities_and_deprecations_from_the_list() {
     assert!(catalog.capabilities("openrouter", "unknown").is_none());
     assert!(catalog.capabilities("other", "openai/gpt-5-nano").is_none());
 }
+
+#[tokio::test]
+async fn a_failed_refresh_is_not_retried_until_the_interval_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ModelCache::new(dir.path());
+    let policy = ModelListPolicy::default();
+    let keys = keys();
+    let profile = profile(Protocol::ChatCompletions);
+    let now = Utc::now();
+    let transport = FixtureTransport::new(
+        [
+            FixtureResponse::json(200, fixture("chat-completions", "models.json")),
+            FixtureResponse::json(503, r#"{"error":{"message":"down"}}"#),
+        ],
+        64,
+    );
+    load_models(&cache, &transport, &*keys, &profile, &policy, now, false)
+        .await
+        .unwrap();
+    let next_day = now + Duration::hours(25);
+    let stale = load_models(
+        &cache, &transport, &*keys, &profile, &policy, next_day, false,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(stale.status, ModelListStatus::Stale { .. }));
+    assert_eq!(transport.request_count(), 2);
+
+    // An hour later the failed attempt is still within the interval: no fetch.
+    let soon = next_day + Duration::hours(1);
+    let throttled = load_models(&cache, &transport, &*keys, &profile, &policy, soon, false)
+        .await
+        .unwrap();
+    assert!(matches!(throttled.status, ModelListStatus::Stale { fetched_at } if fetched_at == now));
+    assert_eq!(transport.request_count(), 2);
+
+    // Forcing bypasses the throttle; with nothing queued it stays stale.
+    let forced = load_models(&cache, &transport, &*keys, &profile, &policy, soon, true)
+        .await
+        .unwrap();
+    assert!(matches!(forced.status, ModelListStatus::Stale { .. }));
+    assert_eq!(transport.request_count(), 3);
+
+    // After the interval the refresh is attempted again.
+    let later = next_day + Duration::hours(25);
+    load_models(&cache, &transport, &*keys, &profile, &policy, later, false)
+        .await
+        .unwrap();
+    assert_eq!(transport.request_count(), 4);
+}

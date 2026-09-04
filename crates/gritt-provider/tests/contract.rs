@@ -392,19 +392,31 @@ async fn unsupported_capabilities_are_refused_before_any_request() {
 #[tokio::test]
 async fn cancellation_ends_the_stream_with_a_cancelled_event() {
     for protocol in PROTOCOLS {
-        let (context, _, cancel) =
-            make_context(protocol, vec![sse(protocol, "stream-text.sse")], 4);
+        let (context, transport, cancel) = make_context(
+            protocol,
+            vec![
+                sse(protocol, "stream-text.sse"),
+                sse(protocol, "stream-text.sse"),
+            ],
+            4,
+        );
         let adapter = adapter_for(context);
         let stream = adapter.send(prompt(protocol, false)).await.unwrap();
         cancel.cancel();
         let events = collect(stream).await;
         assert_eq!(kinds(&events), vec!["cancelled"], "{protocol:?}");
-        let error = adapter
-            .send(prompt(protocol, false))
-            .await
-            .err()
-            .expect("expected an error");
-        assert_eq!(error.kind, ErrorKind::Cancelled);
+
+        // While the token stays cancelled, a new turn ends immediately with
+        // the terminal event and no request leaves the adapter.
+        let events = collect(adapter.send(prompt(protocol, false)).await.unwrap()).await;
+        assert_eq!(kinds(&events), vec!["cancelled"], "{protocol:?}");
+        assert_eq!(transport.request_count(), 1, "{protocol:?}");
+
+        // After a reset the same adapter serves the next turn.
+        cancel.reset();
+        let events = collect(adapter.send(prompt(protocol, false)).await.unwrap()).await;
+        assert_eq!(text_of(&events), "Hello, world", "{protocol:?}");
+        assert_eq!(transport.request_count(), 2, "{protocol:?}");
     }
 }
 
@@ -444,4 +456,236 @@ async fn messages_refuses_structured_output_before_sending() {
         .expect("expected an error");
     assert_eq!(error.kind, ErrorKind::UnsupportedCapability);
     assert_eq!(transport.request_count(), 0);
+}
+
+#[tokio::test]
+async fn every_chat_completions_profile_streams_and_only_openrouter_gets_attribution() {
+    for profile in chat_profiles() {
+        let name = profile.name.clone();
+        let expected_url = format!(
+            "{}/chat/completions",
+            profile.base_url.trim_end_matches('/')
+        );
+        let (context, transport, _) = make_context_for(
+            profile,
+            vec![sse(Protocol::ChatCompletions, "stream-text.sse")],
+            16,
+        );
+        let adapter = adapter_for(context);
+        let events = collect(
+            adapter
+                .send(prompt(Protocol::ChatCompletions, true))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(text_of(&events), "Hello, world", "{name}");
+        assert_eq!(
+            kinds(&events).last().unwrap(),
+            "completed:EndTurn",
+            "{name}"
+        );
+        let request = &transport.requests()[0];
+        assert_eq!(request.url, expected_url, "{name}");
+        let names: Vec<&str> = request.headers.iter().map(|(n, _)| n.as_str()).collect();
+        let attributed = names.contains(&"http-referer") || names.contains(&"x-title");
+        assert_eq!(attributed, name == "openrouter", "{name}");
+        assert!(!format!("{request:?}").contains(TEST_KEY), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn provider_bodies_that_echo_the_key_are_redacted_everywhere() {
+    for protocol in PROTOCOLS {
+        let body = format!(
+            r#"{{"error":{{"message":"invalid key {TEST_KEY}","type":"auth","echo":"Bearer {TEST_KEY}"}}}}"#
+        );
+        let (context, _, _) = make_context(protocol, vec![FixtureResponse::json(401, body)], 16);
+        let adapter = adapter_for(context);
+        let error = adapter
+            .send(prompt(protocol, false))
+            .await
+            .err()
+            .expect("expected an error");
+        assert_eq!(error.kind, ErrorKind::Provider, "{protocol:?}");
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        let diagnostic = serde_json::to_string(&error.diagnostic).unwrap();
+        for text in [&display, &debug, &diagnostic] {
+            assert!(!text.contains(TEST_KEY), "{protocol:?}: key leaked");
+            assert!(text.contains("[redacted]"), "{protocol:?}");
+        }
+        assert!(error.message.ends_with("invalid key [redacted]"));
+
+        // The same key inside a stream error element is redacted on the event.
+        let stream_body = format!(
+            "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"overloaded_error\",\"message\":\"rejected {TEST_KEY}\",\"code\":529}}}}\n\n"
+        );
+        let (context, _, _) = make_context(protocol, vec![FixtureResponse::sse(stream_body)], 8);
+        let adapter = adapter_for(context);
+        let events = collect(adapter.send(prompt(protocol, false)).await.unwrap()).await;
+        let serialized = serde_json::to_string(&events).unwrap();
+        assert!(
+            !serialized.contains(TEST_KEY),
+            "{protocol:?}: key leaked into events"
+        );
+    }
+}
+
+#[tokio::test]
+async fn oversized_provider_bodies_are_capped_in_the_diagnostic() {
+    let body = format!(r#"{{"error":{{"message":"{}"}}}}"#, "x".repeat(10_000));
+    let (context, _, _) = make_context(
+        Protocol::ChatCompletions,
+        vec![FixtureResponse::json(500, body)],
+        512,
+    );
+    let adapter = adapter_for(context);
+    let error = adapter
+        .send(prompt(Protocol::ChatCompletions, false))
+        .await
+        .err()
+        .expect("expected an error");
+    let diagnostic = error.diagnostic.unwrap();
+    assert_eq!(diagnostic["body"]["truncated"], true);
+    assert!(diagnostic["body"]["raw"].as_str().unwrap().chars().count() <= 4096);
+    assert!(error.message.chars().count() <= 500);
+}
+
+#[tokio::test]
+async fn unreported_capabilities_are_flagged_on_the_first_event() {
+    for protocol in PROTOCOLS {
+        let (context, _, _) = make_context(protocol, vec![sse(protocol, "stream-text.sse")], 32);
+        let adapter = adapter_for(context);
+        let mut request = prompt(protocol, true);
+        request.options.reasoning = Some(true);
+        let events = collect(adapter.send(request).await.unwrap()).await;
+        let first = events.first().unwrap();
+        let warning = &first.diagnostic.as_ref().expect("diagnostic")["capability_warning"];
+        assert_eq!(
+            warning["features"],
+            serde_json::json!(["tools", "reasoning"]),
+            "{protocol:?}"
+        );
+        assert_eq!(warning["model_list_entry"], false);
+        assert!(events[1..].iter().all(|event| event
+            .diagnostic
+            .as_ref()
+            .is_none_or(|d| d.get("capability_warning").is_none())));
+
+        let (context, _, _) = make_context_with(
+            protocol,
+            vec![sse(protocol, "stream-text.sse")],
+            32,
+            Arc::new(FixedCapabilities(ModelCapabilities {
+                tools: Some(true),
+                reasoning: Some(true),
+                ..Default::default()
+            })),
+        );
+        let adapter = adapter_for(context);
+        let mut request = prompt(protocol, true);
+        request.options.reasoning = Some(true);
+        let events = collect(adapter.send(request).await.unwrap()).await;
+        assert!(events.iter().all(|event| event
+            .diagnostic
+            .as_ref()
+            .is_none_or(|d| d.get("capability_warning").is_none())));
+    }
+}
+
+#[tokio::test]
+async fn responses_wire_sequence_gaps_are_warned_not_reordered() {
+    let (context, _, _) = make_context(
+        Protocol::Responses,
+        vec![sse(Protocol::Responses, "stream-sequence-gap.sse")],
+        16,
+    );
+    let adapter = adapter_for(context);
+    let events = collect(
+        adapter
+            .send(prompt(Protocol::Responses, false))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(text_of(&events), "Hello, world");
+    assert_monotonic(&events);
+    let flagged: Vec<&gritt_core::event::Event> = events
+        .iter()
+        .filter(|event| {
+            event
+                .diagnostic
+                .as_ref()
+                .is_some_and(|d| d.get("sequence_warning").is_some())
+        })
+        .collect();
+    assert_eq!(flagged.len(), 1);
+    let warning = &flagged[0].diagnostic.as_ref().unwrap()["sequence_warning"];
+    assert_eq!(warning["wire_sequence"], 7);
+    assert_eq!(warning["expected_wire_sequence"], 5);
+    assert!(matches!(flagged[0].kind, EventKind::TextDelta { .. }));
+    let completed = events.last().unwrap().diagnostic.as_ref().unwrap();
+    assert_eq!(completed["last_wire_sequence"], 10);
+    assert_eq!(completed["sequence_warnings"].as_array().unwrap().len(), 1);
+
+    let (context, _, _) = make_context(
+        Protocol::Responses,
+        vec![sse(Protocol::Responses, "stream-text.sse")],
+        16,
+    );
+    let adapter = adapter_for(context);
+    let events = collect(
+        adapter
+            .send(prompt(Protocol::Responses, false))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(events.iter().all(|event| event
+        .diagnostic
+        .as_ref()
+        .is_none_or(|d| d.get("sequence_warning").is_none())));
+    assert!(events.last().unwrap().diagnostic.as_ref().unwrap()["sequence_warnings"].is_null());
+}
+
+#[tokio::test]
+async fn cancellation_while_connecting_drops_the_send_and_yields_cancelled() {
+    for protocol in PROTOCOLS {
+        let transport = Arc::new(PendingTransport::new());
+        let cancel = gritt_provider::CancellationToken::new();
+        let context = gritt_provider::AdapterContext {
+            profile: profile(protocol),
+            session_id: gritt_core::session::SessionId("session-test".into()),
+            transport: transport.clone(),
+            keys: Arc::new(gritt_provider::adapter::StaticKey(
+                gritt_core::secret::Secret::new(TEST_KEY),
+            )),
+            capabilities: Arc::new(gritt_provider::NoCapabilities),
+            cancel: cancel.clone(),
+        };
+        let adapter = adapter_for(context);
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            canceller.cancel();
+        });
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            adapter.send(prompt(protocol, false)),
+        )
+        .await
+        .expect("send must return once cancelled")
+        .unwrap();
+        let events = collect(stream).await;
+        assert_eq!(kinds(&events), vec!["cancelled"], "{protocol:?}");
+        assert_eq!(
+            transport.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        // A reset token lets the same adapter serve the next turn.
+        cancel.reset();
+        assert!(!cancel.is_cancelled());
+    }
 }

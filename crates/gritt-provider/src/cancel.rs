@@ -31,6 +31,13 @@ impl CancellationToken {
         self.inner.cancelled.load(Ordering::SeqCst)
     }
 
+    /// Clears a previous cancellation so the same adapter can serve the
+    /// next turn. Call it after the cancelled stream has been drained;
+    /// an in-flight stream that already observed the cancel stays ended.
+    pub fn reset(&self) {
+        self.inner.cancelled.store(false, Ordering::SeqCst);
+    }
+
     /// Resolves once the token is cancelled. Safe to call after the fact.
     pub async fn cancelled(&self) {
         if self.is_cancelled() {
@@ -59,5 +66,18 @@ mod tests {
         handle.await.unwrap();
         assert!(token.is_cancelled());
         token.cancelled().await;
+    }
+
+    #[tokio::test]
+    async fn reset_clears_the_flag_for_the_next_turn() {
+        let token = CancellationToken::new();
+        token.cancel();
+        assert!(token.is_cancelled());
+        token.reset();
+        assert!(!token.is_cancelled());
+        let waiter = token.clone();
+        let handle = tokio::spawn(async move { waiter.cancelled().await });
+        token.cancel();
+        handle.await.unwrap();
     }
 }

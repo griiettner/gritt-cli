@@ -15,7 +15,8 @@ use gritt_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::adapter::{
-    normalized_stream, stream_error, AdapterContext, EventEmitter, Normalizer, PartialToolCall,
+    cancelled_stream, is_cancelled, normalized_stream, stream_error, AdapterContext, EventEmitter,
+    Normalizer, PartialToolCall,
 };
 use crate::sse::SseEvent;
 use crate::transport::HttpRequest;
@@ -97,14 +98,18 @@ impl ResponsesAdapter {
             }
             body
         };
-        let key = self.context.key()?;
+        let key = self.context.key_for(&self.emitter)?;
         let request = HttpRequest::post_json(self.endpoint(), &body)
             .secret_header(
                 "authorization",
                 gritt_core::secret::Secret::new(format!("Bearer {}", key.expose())),
             )
             .header("accept", "text/event-stream");
-        let response = self.context.send_checked(request).await?;
+        let response = match self.context.send_checked(request, &self.emitter).await {
+            Ok(response) => response,
+            Err(error) if is_cancelled(&error) => return Ok(cancelled_stream(&self.emitter)),
+            Err(error) => return Err(error),
+        };
         let normalizer = ResponsesNormalizer {
             state: Arc::clone(&self.state),
             ..ResponsesNormalizer::default()
@@ -125,7 +130,7 @@ impl ProviderAdapter for ResponsesAdapter {
 
     fn send(&self, request: PromptRequest) -> BoxFuture<'_, Result<EventStream<'_>>> {
         Box::pin(async move {
-            self.context.check_capabilities(&request)?;
+            self.context.check_capabilities(&request, &self.emitter)?;
             let mut input = Vec::new();
             {
                 let mut state = self.state.lock().expect("responses state");
@@ -222,9 +227,45 @@ struct ResponsesNormalizer {
     emitted_tool_call: bool,
     terminal: bool,
     skipped: Vec<String>,
+    /// The last `sequence_number` seen on the wire.
+    last_wire_sequence: Option<u64>,
+    /// Every gap or regression observed, for the completion diagnostic.
+    sequence_warnings: Vec<serde_json::Value>,
 }
 
 impl ResponsesNormalizer {
+    /// Tracks the wire `sequence_number` without reordering anything.
+    /// Returns a warning when the number gaps or regresses.
+    fn note_sequence(&mut self, value: &serde_json::Value) -> Option<serde_json::Value> {
+        let wire = value.get("sequence_number").and_then(|v| v.as_u64())?;
+        let previous = self.last_wire_sequence.replace(wire);
+        let expected = previous.map(|p| p + 1)?;
+        if wire == expected {
+            return None;
+        }
+        let warning = serde_json::json!({
+            "protocol": OWNER,
+            "warning": if wire > expected { "wire sequence gap" } else { "wire sequence regressed" },
+            "wire_sequence": wire,
+            "expected_wire_sequence": expected,
+        });
+        self.sequence_warnings.push(warning.clone());
+        Some(warning)
+    }
+
+    /// Attaches a sequence warning to every event one wire element produced.
+    fn attach_warning(events: &mut [Event], warning: &serde_json::Value) {
+        for event in events {
+            event.diagnostic = Some(match event.diagnostic.take() {
+                Some(serde_json::Value::Object(mut map)) => {
+                    map.insert("sequence_warning".into(), warning.clone());
+                    serde_json::Value::Object(map)
+                }
+                Some(other) => serde_json::json!({ "raw": other, "sequence_warning": warning }),
+                None => serde_json::json!({ "sequence_warning": warning }),
+            });
+        }
+    }
     fn remember_response_id(&self, value: &serde_json::Value) {
         if let Some(id) = value.pointer("/response/id").and_then(|v| v.as_str()) {
             self.state
@@ -271,9 +312,13 @@ impl ResponsesNormalizer {
             "response_id": value.pointer("/response/id"),
             "status": status,
             "incomplete_reason": incomplete,
+            "last_wire_sequence": self.last_wire_sequence,
         });
         if !self.skipped.is_empty() {
             diagnostic["skipped"] = serde_json::json!(self.skipped);
+        }
+        if !self.sequence_warnings.is_empty() {
+            diagnostic["sequence_warnings"] = serde_json::json!(self.sequence_warnings);
         }
         events.push(emitter.completed(stop_reason, Some(diagnostic)));
         events
@@ -289,6 +334,43 @@ impl Normalizer for ResponsesNormalizer {
             self.skipped.push(sse.data.chars().take(120).collect());
             return Vec::new();
         };
+        let warning = self.note_sequence(&value);
+        let mut events = self.handle_element(emitter, sse, &value);
+        if let Some(warning) = warning {
+            Self::attach_warning(&mut events, &warning);
+        }
+        events
+    }
+
+    fn finish(&mut self, emitter: &EventEmitter) -> Vec<Event> {
+        if self.terminal {
+            return Vec::new();
+        }
+        self.terminal = true;
+        vec![emitter.completed(
+            StopReason::Other,
+            Some(serde_json::json!({
+                "protocol": OWNER,
+                "warning": "stream ended without response.completed",
+                "skipped": self.skipped,
+                "last_wire_sequence": self.last_wire_sequence,
+                "sequence_warnings": self.sequence_warnings,
+            })),
+        )]
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+}
+
+impl ResponsesNormalizer {
+    fn handle_element(
+        &mut self,
+        emitter: &EventEmitter,
+        sse: &SseEvent,
+        value: &serde_json::Value,
+    ) -> Vec<Event> {
         let kind = value
             .get("type")
             .and_then(|v| v.as_str())
@@ -297,7 +379,7 @@ impl Normalizer for ResponsesNormalizer {
             .to_owned();
         match kind.as_str() {
             "response.created" | "response.in_progress" => {
-                self.remember_response_id(&value);
+                self.remember_response_id(value);
                 Vec::new()
             }
             "response.output_text.delta" => value
@@ -380,11 +462,11 @@ impl Normalizer for ResponsesNormalizer {
                     Some(serde_json::json!({ "protocol": OWNER, "item_id": item.get("id") })),
                 )]
             }
-            "response.completed" | "response.incomplete" => self.complete(emitter, &value),
+            "response.completed" | "response.incomplete" => self.complete(emitter, value),
             "response.failed" => {
                 self.terminal = true;
                 let error =
-                    stream_error(value.get("response").unwrap_or(&value)).unwrap_or_else(|| {
+                    stream_error(value.get("response").unwrap_or(value)).unwrap_or_else(|| {
                         Error::provider(None, "response failed")
                             .with_diagnostic(serde_json::json!({ "body": value }))
                     });
@@ -401,24 +483,5 @@ impl Normalizer for ResponsesNormalizer {
                 Vec::new()
             }
         }
-    }
-
-    fn finish(&mut self, emitter: &EventEmitter) -> Vec<Event> {
-        if self.terminal {
-            return Vec::new();
-        }
-        self.terminal = true;
-        vec![emitter.completed(
-            StopReason::Other,
-            Some(serde_json::json!({
-                "protocol": OWNER,
-                "warning": "stream ended without response.completed",
-                "skipped": self.skipped,
-            })),
-        )]
-    }
-
-    fn is_terminal(&self) -> bool {
-        self.terminal
     }
 }

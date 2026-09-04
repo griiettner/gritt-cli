@@ -4,7 +4,7 @@
 //! cancellation into a terminal event.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use futures::stream::{Stream, StreamExt};
@@ -67,72 +67,161 @@ impl AdapterContext {
         self.keys.key(&self.profile.name, &self.profile.key)
     }
 
+    /// Resolves the key and registers it with the emitter so every error
+    /// message and diagnostic produced for this request is redacted.
+    pub fn key_for(&self, emitter: &EventEmitter) -> Result<Secret> {
+        let key = self.key()?;
+        emitter.protect(key.clone());
+        Ok(key)
+    }
+
     /// Refuses a request that asks for a feature the model list reports as
-    /// unsupported. Unknown (`None`) capabilities do not block the request;
-    /// the gap is recorded in the adapter's diagnostics instead.
-    pub fn check_capabilities(&self, request: &PromptRequest) -> Result<Option<ModelCapabilities>> {
+    /// unsupported. Unknown (`None`) capabilities do not block the request,
+    /// because OpenAI and Anthropic lists report no capability flags at all
+    /// (recorded exception in TKT-0010). The gap is made visible instead: a
+    /// `capability_warning` diagnostic naming the unreported features is
+    /// attached to the first event of the stream.
+    pub fn check_capabilities(
+        &self,
+        request: &PromptRequest,
+        emitter: &EventEmitter,
+    ) -> Result<Option<ModelCapabilities>> {
         let capabilities = self
             .capabilities
             .capabilities(&self.profile.name, &request.model);
-        if let Some(capabilities) = &capabilities {
-            if !request.tools.is_empty() && capabilities.tools == Some(false) {
-                return Err(Error::unsupported_capability(&request.model, "tools"));
+        let mut requested: Vec<(&str, Option<bool>)> = Vec::new();
+        if !request.tools.is_empty() {
+            requested.push(("tools", capabilities.as_ref().and_then(|c| c.tools)));
+        }
+        if request.options.structured_output.is_some() {
+            requested.push((
+                "structured output",
+                capabilities.as_ref().and_then(|c| c.structured_output),
+            ));
+        }
+        if request.options.reasoning == Some(true) {
+            requested.push(("reasoning", capabilities.as_ref().and_then(|c| c.reasoning)));
+        }
+        let mut unreported = Vec::new();
+        for (feature, reported) in requested {
+            match reported {
+                Some(false) => {
+                    return Err(Error::unsupported_capability(&request.model, feature));
+                }
+                Some(true) => {}
+                None => unreported.push(feature),
             }
-            if request.options.structured_output.is_some()
-                && capabilities.structured_output == Some(false)
-            {
-                return Err(Error::unsupported_capability(
-                    &request.model,
-                    "structured output",
-                ));
-            }
-            if request.options.reasoning == Some(true) && capabilities.reasoning == Some(false) {
-                return Err(Error::unsupported_capability(&request.model, "reasoning"));
-            }
+        }
+        if !unreported.is_empty() {
+            emitter.set_pending_diagnostic(serde_json::json!({
+                "warning": "provider did not report support for requested features",
+                "model": request.model,
+                "features": unreported,
+                "model_list_entry": capabilities.is_some(),
+            }));
         }
         Ok(capabilities)
     }
 
     /// Sends the request and fails on a non-success status with the
-    /// provider body kept in the diagnostic.
-    pub async fn send_checked(&self, request: HttpRequest) -> Result<HttpResponse> {
+    /// redacted provider body kept in the diagnostic. Cancellation is
+    /// observed while the transport waits for the connection and headers;
+    /// the pending send is dropped and `Cancelled` is returned.
+    pub async fn send_checked(
+        &self,
+        request: HttpRequest,
+        emitter: &EventEmitter,
+    ) -> Result<HttpResponse> {
         if self.cancel.is_cancelled() {
             return Err(Error::cancelled());
         }
-        let response = self.transport.send(request).await?;
+        let response = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Err(Error::cancelled()),
+            response = self.transport.send(request) => response?,
+        };
         if response.is_success() {
             return Ok(response);
         }
         let status = response.status;
         let body = response.bytes().await.unwrap_or_default();
-        Err(provider_error(status, &body))
+        Err(provider_error(status, &body, &emitter.secrets()))
     }
 }
 
-/// Builds the provider error for a failed response. The one-line message
-/// comes from the body's `error.message` when present.
-pub fn provider_error(status: u16, body: &[u8]) -> Error {
-    let text = String::from_utf8_lossy(body);
-    let diagnostic: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(
-        |_| serde_json::json!({ "raw": text.chars().take(2000).collect::<String>() }),
-    );
+/// Longest provider body kept in a diagnostic, in characters.
+pub const MAX_DIAGNOSTIC_BODY_CHARS: usize = 4096;
+const REDACTED: &str = "[redacted]";
+
+/// Replaces every occurrence of each secret with `[redacted]`. Secrets
+/// shorter than four characters are skipped so a trivial value cannot
+/// mangle unrelated text.
+pub fn redact_text(text: &str, secrets: &[Secret]) -> String {
+    let mut out = text.to_owned();
+    for secret in secrets {
+        let value = secret.expose();
+        if value.len() >= 4 && out.contains(value) {
+            out = out.replace(value, REDACTED);
+        }
+    }
+    out
+}
+
+/// Redacts every string inside a JSON value, including object keys.
+pub fn redact_value(value: serde_json::Value, secrets: &[Secret]) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => serde_json::Value::String(redact_text(&text, secrets)),
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(|item| redact_value(item, secrets))
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, item)| (redact_text(&key, secrets), redact_value(item, secrets)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Builds the provider error for a failed response. The body is redacted
+/// against the request's secrets and capped before anything is retained;
+/// the one-line message comes from the body's `error.message` when present.
+pub fn provider_error(status: u16, body: &[u8], secrets: &[Secret]) -> Error {
+    let text = redact_text(&String::from_utf8_lossy(body), secrets);
+    let truncated = text.chars().count() > MAX_DIAGNOSTIC_BODY_CHARS;
+    let diagnostic: serde_json::Value = if truncated {
+        serde_json::json!({
+            "raw": text.chars().take(MAX_DIAGNOSTIC_BODY_CHARS).collect::<String>(),
+            "truncated": true,
+        })
+    } else {
+        serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({ "raw": text }))
+    };
     let message = diagnostic
         .pointer("/error/message")
         .and_then(|value| value.as_str())
         .or_else(|| diagnostic.get("message").and_then(|value| value.as_str()))
         .unwrap_or("request rejected")
-        .to_owned();
+        .chars()
+        .take(500)
+        .collect::<String>();
     Error::provider(Some(status), message).with_diagnostic(serde_json::json!({
         "status": status,
         "body": diagnostic,
     }))
 }
 
-/// Stamps events with the session, source, sequence, and timestamp.
+/// Stamps events with the session, source, sequence, and timestamp, and
+/// redacts every registered secret out of messages and diagnostics.
 pub struct EventEmitter {
     session_id: SessionId,
     protocol: Protocol,
     sequence: AtomicU64,
+    secrets: Mutex<Vec<Secret>>,
+    pending_diagnostic: Mutex<Option<serde_json::Value>>,
 }
 
 impl EventEmitter {
@@ -141,11 +230,56 @@ impl EventEmitter {
             session_id,
             protocol,
             sequence: AtomicU64::new(0),
+            secrets: Mutex::new(Vec::new()),
+            pending_diagnostic: Mutex::new(None),
         }
     }
 
     pub fn protocol(&self) -> Protocol {
         self.protocol
+    }
+
+    /// Registers a secret to redact from every later event.
+    pub fn protect(&self, secret: Secret) {
+        let mut secrets = self.secrets.lock().expect("emitter secrets");
+        if !secrets
+            .iter()
+            .any(|known| known.expose() == secret.expose())
+        {
+            secrets.push(secret);
+        }
+    }
+
+    /// The secrets registered so far, for redacting errors built outside
+    /// the emitter.
+    pub fn secrets(&self) -> Vec<Secret> {
+        self.secrets.lock().expect("emitter secrets").clone()
+    }
+
+    /// Queues a diagnostic that is merged into the next emitted event under
+    /// `capability_warning`.
+    pub fn set_pending_diagnostic(&self, diagnostic: serde_json::Value) {
+        *self.pending_diagnostic.lock().expect("pending diagnostic") = Some(diagnostic);
+    }
+
+    fn merge_pending(&self, diagnostic: Option<serde_json::Value>) -> Option<serde_json::Value> {
+        let pending = self
+            .pending_diagnostic
+            .lock()
+            .expect("pending diagnostic")
+            .take();
+        match (diagnostic, pending) {
+            (diagnostic, None) => diagnostic,
+            (None, Some(pending)) => Some(serde_json::json!({ "capability_warning": pending })),
+            (Some(serde_json::Value::Object(mut map)), Some(pending)) => {
+                map.insert("capability_warning".into(), pending);
+                Some(serde_json::Value::Object(map))
+            }
+            (Some(other), Some(pending)) => Some(serde_json::json!({
+                "raw": other,
+                "capability_warning": pending,
+            })),
+        }
     }
 
     /// Restores the sequence counter from stored continuation state.
@@ -158,6 +292,20 @@ impl EventEmitter {
     }
 
     pub fn emit(&self, kind: EventKind, diagnostic: Option<serde_json::Value>) -> Event {
+        let secrets = self.secrets();
+        let diagnostic = self
+            .merge_pending(diagnostic)
+            .map(|diagnostic| redact_value(diagnostic, &secrets));
+        let kind = match kind {
+            EventKind::Error {
+                error_kind,
+                message,
+            } => EventKind::Error {
+                error_kind,
+                message: redact_text(&message, &secrets),
+            },
+            other => other,
+        };
         Event {
             session_id: self.session_id.clone(),
             sequence: self.sequence.fetch_add(1, Ordering::SeqCst),
@@ -225,6 +373,12 @@ pub trait Normalizer: Send {
     fn finish(&mut self, emitter: &EventEmitter) -> Vec<Event>;
     /// Whether a terminal event (completed or error) has been emitted.
     fn is_terminal(&self) -> bool;
+}
+
+/// A stream holding only the terminal `Cancelled` event, for a request
+/// cancelled before the provider answered.
+pub fn cancelled_stream<'a>(emitter: &EventEmitter) -> EventStream<'a> {
+    Box::pin(futures::stream::iter([Ok(emitter.cancelled())]))
 }
 
 /// Runs the normalizer over a response body, honoring cancellation, and
@@ -345,5 +499,44 @@ impl KeyProvider for EnvKeys {
             .filter(|value| !value.is_empty())
             .map(Secret::new)
             .ok_or_else(|| Error::missing_key(profile, &reference.env_var_name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redaction_replaces_every_occurrence_and_skips_short_values() {
+        let secrets = vec![Secret::new("sk-live-1234"), Secret::new("ab")];
+        assert_eq!(
+            redact_text("key sk-live-1234 twice sk-live-1234 ab", &secrets),
+            "key [redacted] twice [redacted] ab"
+        );
+        let value = serde_json::json!({
+            "sk-live-1234": ["Bearer sk-live-1234", 7, { "nested": "sk-live-1234" }]
+        });
+        let redacted = serde_json::to_string(&redact_value(value, &secrets)).unwrap();
+        assert!(!redacted.contains("sk-live-1234"));
+        assert_eq!(redacted.matches("[redacted]").count(), 3);
+    }
+
+    #[test]
+    fn emitter_redacts_error_messages_and_merges_the_pending_warning_once() {
+        let emitter = EventEmitter::new(SessionId("s".into()), Protocol::ChatCompletions);
+        emitter.protect(Secret::new("sk-live-1234"));
+        emitter.set_pending_diagnostic(serde_json::json!({ "features": ["tools"] }));
+        let error = Error::provider(Some(401), "bad key sk-live-1234")
+            .with_diagnostic(serde_json::json!({ "body": "sk-live-1234" }));
+        let first = emitter.error(&error);
+        match &first.kind {
+            EventKind::Error { message, .. } => assert!(message.ends_with("bad key [redacted]")),
+            other => panic!("unexpected {other:?}"),
+        }
+        let diagnostic = first.diagnostic.unwrap();
+        assert_eq!(diagnostic["body"], "[redacted]");
+        assert_eq!(diagnostic["capability_warning"]["features"][0], "tools");
+        let second = emitter.text("hi".into(), None);
+        assert!(second.diagnostic.is_none());
     }
 }

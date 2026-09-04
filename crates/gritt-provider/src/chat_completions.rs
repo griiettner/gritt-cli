@@ -17,7 +17,8 @@ use gritt_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::adapter::{
-    normalized_stream, stream_error, AdapterContext, EventEmitter, Normalizer, PartialToolCall,
+    cancelled_stream, is_cancelled, normalized_stream, stream_error, AdapterContext, EventEmitter,
+    Normalizer, PartialToolCall,
 };
 use crate::sse::SseEvent;
 use crate::transport::HttpRequest;
@@ -126,7 +127,7 @@ impl ChatCompletionsAdapter {
                 .capabilities(&self.context.profile.name, &probe.model);
             (self.build_body(&state, capabilities.as_ref()), model)
         };
-        let key = self.context.key()?;
+        let key = self.context.key_for(&self.emitter)?;
         let mut request = HttpRequest::post_json(self.endpoint(), &body)
             .secret_header("authorization", key_bearer(&key))
             .header("accept", "text/event-stream");
@@ -135,7 +136,11 @@ impl ChatCompletionsAdapter {
                 .header("http-referer", ATTRIBUTION_REFERER)
                 .header("x-title", ATTRIBUTION_TITLE);
         }
-        let response = self.context.send_checked(request).await?;
+        let response = match self.context.send_checked(request, &self.emitter).await {
+            Ok(response) => response,
+            Err(error) if is_cancelled(&error) => return Ok(cancelled_stream(&self.emitter)),
+            Err(error) => return Err(error),
+        };
         let normalizer = ChatNormalizer {
             state: Arc::clone(&self.state),
             model,
@@ -169,7 +174,7 @@ impl ProviderAdapter for ChatCompletionsAdapter {
 
     fn send(&self, request: PromptRequest) -> BoxFuture<'_, Result<EventStream<'_>>> {
         Box::pin(async move {
-            self.context.check_capabilities(&request)?;
+            self.context.check_capabilities(&request, &self.emitter)?;
             {
                 let mut state = self.state.lock().expect("chat state");
                 state.model = Some(request.model.clone());

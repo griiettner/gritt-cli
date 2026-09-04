@@ -17,10 +17,14 @@ use serde::{Deserialize, Serialize};
 use crate::adapter::{provider_error, CapabilitySource, KeyProvider};
 use crate::transport::{HttpRequest, HttpTransport};
 
-/// The on-disk shape: one file per profile.
+/// The on-disk shape: one file per profile. `last_attempt_at` records the
+/// most recent refresh attempt, successful or not, so a failing provider is
+/// retried at most once per interval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedModelList {
     pub fetched_at: DateTime<Utc>,
+    #[serde(default)]
+    pub last_attempt_at: Option<DateTime<Utc>>,
     pub models: Vec<ModelInfo>,
 }
 
@@ -43,6 +47,8 @@ impl ModelCache {
         &self.dir
     }
 
+    /// `<dir>/<sanitized>-<fnv1a64 of the original name>.json`. The hash
+    /// keeps distinct profiles such as `a/b` and `a_b` in distinct files.
     pub fn path(&self, profile: &str) -> PathBuf {
         let safe: String = profile
             .chars()
@@ -54,7 +60,8 @@ impl ModelCache {
                 }
             })
             .collect();
-        self.dir.join(format!("{safe}.json"))
+        self.dir
+            .join(format!("{safe}-{:016x}.json", fnv1a64(profile.as_bytes())))
     }
 
     pub fn read(&self, profile: &str) -> Result<Option<CachedModelList>> {
@@ -81,6 +88,16 @@ impl ModelCache {
         std::fs::write(&path, text)
             .map_err(|error| Error::storage(format!("cannot write {}: {error}", path.display())))
     }
+}
+
+/// FNV-1a, 64 bit. Stable across platforms and builds; not a security hash.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Where a profile's list lives.
@@ -112,7 +129,7 @@ pub async fn fetch_models(
     profile: &ProviderProfile,
 ) -> Result<Vec<ModelInfo>> {
     let key = keys.key(&profile.name, &profile.key)?;
-    let (name, value) = header_secret(profile, key);
+    let (name, value) = header_secret(profile, key.clone());
     let mut request = HttpRequest::get(models_url(profile)).secret_header(name, value);
     if profile.protocol == Protocol::Messages {
         request = request.header("anthropic-version", crate::messages::ANTHROPIC_VERSION);
@@ -121,7 +138,7 @@ pub async fn fetch_models(
     let status = response.status;
     let body = response.bytes().await?;
     if !(200..300).contains(&status) {
-        return Err(provider_error(status, &body));
+        return Err(provider_error(status, &body, &[key]));
     }
     let value: serde_json::Value = serde_json::from_slice(&body).map_err(|error| {
         Error::provider(Some(status), format!("invalid model list JSON: {error}"))
@@ -131,7 +148,9 @@ pub async fn fetch_models(
 
 /// Loads the list, refreshing at most once per `policy.refresh_interval`.
 /// A failed refresh returns the cached list marked stale when the policy
-/// allows it; no cache plus a failed refresh is `MissingModelList`.
+/// allows it, records the attempt so the provider is not retried again
+/// until the interval passes, and no cache plus a failed refresh is
+/// `MissingModelList`. `force_refresh` bypasses both timers.
 pub async fn load_models(
     cache: &ModelCache,
     transport: &dyn HttpTransport,
@@ -154,11 +173,24 @@ pub async fn load_models(
                 models: cached.models.clone(),
             });
         }
+        let attempted_recently = cached
+            .last_attempt_at
+            .is_some_and(|attempt| now.signed_duration_since(attempt) < interval);
+        if !force_refresh && attempted_recently && policy.stale_fallback {
+            return Ok(ModelList {
+                profile: profile.name.clone(),
+                status: ModelListStatus::Stale {
+                    fetched_at: cached.fetched_at,
+                },
+                models: cached.models.clone(),
+            });
+        }
     }
     match fetch_models(transport, keys, profile).await {
         Ok(models) => {
             let fresh = CachedModelList {
                 fetched_at: now,
+                last_attempt_at: Some(now),
                 models,
             };
             cache.write(&profile.name, &fresh)?;
@@ -169,13 +201,17 @@ pub async fn load_models(
             })
         }
         Err(error) => match cached {
-            Some(cached) if policy.stale_fallback => Ok(ModelList {
-                profile: profile.name.clone(),
-                status: ModelListStatus::Stale {
-                    fetched_at: cached.fetched_at,
-                },
-                models: cached.models,
-            }),
+            Some(mut cached) if policy.stale_fallback => {
+                cached.last_attempt_at = Some(now);
+                cache.write(&profile.name, &cached)?;
+                Ok(ModelList {
+                    profile: profile.name.clone(),
+                    status: ModelListStatus::Stale {
+                        fetched_at: cached.fetched_at,
+                    },
+                    models: cached.models,
+                })
+            }
             Some(cached) => Err(Error::new(
                 ErrorKind::StaleModelList,
                 format!(
@@ -351,8 +387,13 @@ mod tests {
     }
 
     #[test]
-    fn cache_path_is_sanitized() {
+    fn cache_path_is_sanitized_and_injective() {
         let cache = ModelCache::new("/tmp/x");
-        assert!(cache.path("open/router").ends_with("open_router.json"));
+        let slashed = cache.path("open/router");
+        let name = slashed.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("open_router-"));
+        assert!(name.ends_with(".json"));
+        assert_ne!(slashed, cache.path("open_router"));
+        assert_eq!(slashed, cache.path("open/router"));
     }
 }

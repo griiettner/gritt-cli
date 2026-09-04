@@ -43,7 +43,7 @@ impl Gateway {
         let status = response.status;
         let bytes = response.bytes().await?;
         if !(200..300).contains(&status) {
-            return Err(provider_error(status, &bytes));
+            return Err(provider_error(status, &bytes, &[key]));
         }
         serde_json::from_slice(&bytes)
             .map_err(|error| Error::provider(Some(status), format!("invalid JSON: {error}")))
