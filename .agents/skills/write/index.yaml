@@ -61,3 +61,14 @@ subskills:
       - hedging
     read_when:
       - hedging, generic endings, signposting, or manufactured drama
+  - id: write-reports
+    title: Reports
+    file: reports/SKILL.md
+    tags:
+      - findings
+      - review
+      - report.md
+    read_when:
+      - writing a review finding or a PR comment
+      - writing or refreshing report.md
+      - sizing a finding's length to its severity

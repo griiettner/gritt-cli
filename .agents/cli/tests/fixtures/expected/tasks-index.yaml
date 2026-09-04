@@ -1,0 +1,20 @@
+- namespace: _shared
+  range: TKT-0001-0025
+  file: .agents/tasks/TKT-0001-0025/index.yaml
+  count: 1
+  updated: 2026-08-14
+  statuses:
+    - ready: 1
+  areas:
+    - .agents/tools
+- namespace: alice
+  range: TKT-0001-0025
+  file: .agents/tasks/alice/TKT-0001-0025/index.yaml
+  count: 2
+  updated: 2026-09-01
+  statuses:
+    - done: 1
+    - ready: 1
+  areas:
+    - crates/gritt
+    - crates/gritt-provider

@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { CliError, parseCli, runMain, runNx } from './lib/cli.mjs';
+import { CliError, parseCli, runAgentCli, runMain } from './lib/cli.mjs';
 import { exists, relativePosix, writeText } from './lib/fs-utils.mjs';
 
 const MAX_NAME_LENGTH = 64;
@@ -66,7 +66,7 @@ async function main() {
       );
     }
     if (!args['no-sync']) {
-      console.log('would run: nx run agent-tools:sync-skills');
+      console.log('would run: gritt-agent skill sync');
     }
     return 0;
   }
@@ -79,7 +79,7 @@ async function main() {
     );
   }
   if (!args['no-sync']) {
-    const result = runNx(repo, 'sync-skills', [], { inherit: true });
+    const result = runAgentCli(repo, ['skill', 'sync'], { inherit: true });
     if (result.status !== 0) return result.status;
   }
   console.log(`created skill: .agents/skills/${skillName}/SKILL.md`);

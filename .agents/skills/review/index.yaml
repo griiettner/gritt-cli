@@ -1,0 +1,37 @@
+subskills:
+  - id: review-pr
+    title: PR
+    file: pr/SKILL.md
+    tags:
+      - pull-request
+      - github
+      - ci
+      - line-anchored-comments
+    read_when:
+      - auditing a GitHub PR's own diff for concrete defects
+      - pinning the exact commits under review before diffing a multi-commit PR
+      - building and posting a line-anchored GitHub review
+      - checking CI status before approving or requesting changes
+  - id: review-impact
+    title: Impact
+    file: impact/SKILL.md
+    tags:
+      - diff
+      - regression
+      - blast-radius
+    read_when:
+      - reviewing a diff, branch, or working-tree change with no PR or ticket framing
+      - tracing a change to its callers, config, docs, and tests
+      - deciding whether a change runs by default or is gated off
+      - rating regression risk before a merge
+  - id: review-ticket
+    title: Ticket
+    file: ticket/SKILL.md
+    tags:
+      - tkt
+      - acceptance-criteria
+      - scope
+    read_when:
+      - closing a TKT-NNNN ticket
+      - checking a diff against task.md acceptance criteria and scope
+      - reviewing whether plan.md rules were honored

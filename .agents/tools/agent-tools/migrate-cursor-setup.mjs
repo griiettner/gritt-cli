@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { parseCli, runMain, runNx } from './lib/cli.mjs';
+import { parseCli, runAgentCli, runMain } from './lib/cli.mjs';
 import {
   exists,
   isDirectory,
@@ -56,7 +56,7 @@ options:
   --repo REPO      Target repository root (default: .)
   --dry-run        Plan and print a summary without writing files
   --force          Overwrite files not created by this migrator
-  --no-sync        Do not run Nx agent-tool maintenance targets`;
+  --no-sync        Do not run gritt-agent maintenance commands`;
 }
 
 async function main() {
@@ -528,20 +528,15 @@ async function applyWrites(writes, report, force) {
 }
 
 async function runMaintenance(repo, source, report) {
-  const targets = [
-    ['sync-skills', []],
-    ['tkt-sync', []],
-    ['tkt-validate', ['.agents/tasks']],
+  const subcommands = [
+    ['skill', 'sync'],
+    ['ticket', 'sync'],
+    ['ticket', 'validate'],
   ];
-  for (const [target, args] of targets) {
-    const result = runNx(repo, target, args);
+  for (const subcommand of subcommands) {
+    const result = runAgentCli(repo, subcommand);
     report.commands.push({
-      argv: [
-        'nx',
-        'run',
-        `agent-tools:${target}`,
-        ...(args.length ? ['--', ...args] : []),
-      ],
+      argv: ['gritt-agent', ...subcommand],
       returncode: result.status,
       stdout: result.stdout.trim(),
       stderr: result.stderr.trim(),

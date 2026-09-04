@@ -25,13 +25,13 @@ The sync script is safe by default:
 Regenerate them with:
 
 ```bash
-node .agents/tools/agent-tools/sync-skills.mjs
+.agents/cli/target/release/gritt-agent skill sync
 ```
 
 If you want a stricter mirror of canonical `.agents/skills/`, you can run:
 
 ```bash
-node .agents/tools/agent-tools/sync-skills.mjs --prune
+.agents/cli/target/release/gritt-agent skill sync --prune
 ```
 
 Or, from Claude Code, run:

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Custom Display"
+  short_description: "Hand-written summary."
+  default_prompt: "Use $custom here."
+policy:
+  allow_implicit_invocation: false

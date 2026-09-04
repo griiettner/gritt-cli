@@ -23,6 +23,6 @@ Do not create placeholder artifacts just to fill the structure.
 Validate ticket structure with:
 
 ```bash
-node .agents/tools/agent-tools/tkt-sync.mjs
-node .agents/tools/agent-tools/tkt-validate.mjs .agents/tasks
+.agents/cli/target/release/gritt-agent ticket sync
+.agents/cli/target/release/gritt-agent ticket validate
 ```

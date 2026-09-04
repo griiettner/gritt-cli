@@ -1,0 +1,17 @@
+tickets:
+  - id: TKT-0001
+    namespace: griiettner
+    title: Build project-local agent CLI
+    status: done
+    owner: griiettner
+    priority: normal
+    created: 2026-09-03
+    updated: 2026-09-03
+    artifacts:
+      concept: .agents/tasks/griiettner/TKT-0001-0025/TKT-0001/concept.md
+      plan: .agents/tasks/griiettner/TKT-0001-0025/TKT-0001/plan.md
+      task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0001/task.md
+      report: .agents/tasks/griiettner/TKT-0001-0025/TKT-0001/report.md
+    dependencies: []
+    areas: []
+    skills: []

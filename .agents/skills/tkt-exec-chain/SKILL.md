@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # /tkt-exec-chain
 
-Read [tkt](../tkt/SKILL.md) first, then [tkt/autonomy](../tkt/autonomy/SKILL.md). Load [`write`](../write/SKILL.md) on ticket artifacts.
+Read [tkt](../tkt/SKILL.md) first, then [tkt/autonomy](../tkt/autonomy/SKILL.md). Review: [review/ticket](../review/ticket/SKILL.md) and [review/impact](../review/impact/SKILL.md). Load [`write`](../write/SKILL.md) on ticket artifacts.
 
 This skill extends `tkt` for tickets that must run as a controlled PM -> worker -> reviewer sequence.
 
@@ -90,8 +90,7 @@ The reviewer runs after every worker handoff, not only at the end.
 Reviewer responsibilities:
 
 - run the deterministic chain validator first;
-- review the worker PR for scope drift, regressions, missing validation, and
-  branch hygiene;
+- load [review/ticket](../review/ticket/SKILL.md) against the worker ticket's `task.md` for scope drift and contract compliance, and [review/impact](../review/impact/SKILL.md) over the worker's diff for regressions;
 - run ticket-specific verification and benchmark steps when required;
 - report findings back to the PM as pass / needs-fix;
 - after the final subtask, perform one last cross-step pass for conflicts,
@@ -156,13 +155,11 @@ Add `--require-benchmark` when benchmark evidence is mandatory for that step.
 
 Use the tool output as the deterministic gate before semantic review.
 
-For each worker PR, the reviewer then checks:
+Then run the semantic review: [review/ticket](../review/ticket/SKILL.md) against the worker ticket's `task.md` covers scope drift, unrelated files, and acceptance criteria; [review/impact](../review/impact/SKILL.md) over the worker's diff covers regressions. On top of both, check what neither one knows about the chain:
 
 - branch was created from the correct base branch;
-- scope matches the assigned subtask;
 - validation was run or honestly reported as not run;
 - benchmarks were executed when the task required them;
-- no unrelated files were changed without explanation;
 - no obvious conflict was introduced for later chain steps.
 
 Reviewer output to PM should be short and typed:
@@ -175,12 +172,10 @@ Include concrete reasons and the next action.
 
 ## Final Reviewer Pass
 
-After the last worker PR is merged, run one final reviewer pass for:
+After the last worker PR is merged, run one final reviewer pass. Load [review/ticket](../review/ticket/SKILL.md) against the orchestrator's own `task.md` for completion readiness, and [review/impact](../review/impact/SKILL.md) across the full merged diff for integration conflicts. Add:
 
-- integration conflicts across merged steps;
 - missing follow-up validation;
-- benchmark summary completeness;
-- ticket completion readiness.
+- benchmark summary completeness.
 
 This final pass does not replace the per-step reviews.
 

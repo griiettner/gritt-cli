@@ -64,6 +64,6 @@ Invocable on their own. Each one **starts by reading this file**. Load **one**:
 After ticket or memory files change:
 
 ```bash
-node .agents/tools/agent-tools/tkt-sync.mjs
-node .agents/tools/agent-tools/tkt-validate.mjs
+.agents/cli/target/release/gritt-agent ticket sync
+.agents/cli/target/release/gritt-agent ticket validate
 ```

@@ -49,7 +49,7 @@ Do not load all pattern files for a one-word edit. Do load all of them when the 
 | Situation | Load |
 | --- | --- |
 | `/write` or a first draft | process, voice, then all five pattern files |
-| Ticket, skill, or review prose written in place | process, voice, then the pattern files that still apply after a scan |
+| Ticket, skill, or review prose written in place | process, voice, reports, then the pattern files that still apply after a scan |
 | Technical or encyclopedic register | process, voice (technical gate), then the pattern files |
 
 ## Sub-skills
@@ -65,6 +65,7 @@ Nested under `write/`. Not separately invocable.
 | [style](style/SKILL.md) | Dashes, colons, bold, lists, headings, emoji, quotes |
 | [communication](communication/SKILL.md) | Chatbot leftovers, cutoff disclaimers, sycophancy |
 | [filler](filler/SKILL.md) | Hedging, slogans, hyphen compounds, signposting, punchlines |
+| [reports](reports/SKILL.md) | A review finding, PR comment, or `report.md`: evidence-first, sized to severity |
 
 Routing metadata: [`index.yaml`](index.yaml).
 

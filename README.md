@@ -81,8 +81,10 @@ crates/
 ```
 
 Dependency versions will be shared from the workspace `Cargo.toml`. Product
-code is Rust and the installed binary has no runtime dependency. Node is used
-only by repository maintenance scripts under `.agents/tools/`.
+code is Rust and the installed binary has no runtime dependency. Repository
+maintenance runs through the separate `gritt-agent` crate at `.agents/cli/`.
+Node remains only for the chain, skill scaffold, migration, and Codex trust
+scripts under `.agents/tools/agent-tools/`.
 
 ## Terminal modes
 
@@ -171,7 +173,8 @@ skills, and ticket history:
     ├── skills/               canonical reusable procedures
     ├── tasks/                ticket history and backlog
     ├── brain/                agent infrastructure and local RAG
-    └── tools/agent-tools/    sync and validation scripts
+    ├── cli/                  gritt-agent maintenance CLI (Rust)
+    └── tools/agent-tools/    remaining Node scaffolding scripts
 ```
 
 `AGENTS.md` is intentionally short. Agents query `gritt-local-memory` first,
@@ -223,23 +226,39 @@ required for a normal pass.
 
 ## Agent workspace maintenance
 
+Build the maintenance CLI once per checkout. It needs only the Rust toolchain:
+
+```bash
+cargo build --release --manifest-path .agents/cli/Cargo.toml
+```
+
+The binary lands at `.agents/cli/target/release/gritt-agent` and is also
+the `gritt-local-memory` MCP server declared in `.mcp.json`.
+
 After changing a canonical skill:
 
 ```bash
-node .agents/tools/agent-tools/sync-skills.mjs
+.agents/cli/target/release/gritt-agent skill sync
 ```
 
 After changing memory or ticket files:
 
 ```bash
-node .agents/tools/agent-tools/tkt-sync.mjs
+.agents/cli/target/release/gritt-agent ticket sync
 ```
 
 To validate without rewriting generated skill adapters:
 
 ```bash
-node .agents/tools/agent-tools/sync-skills.mjs --check
-node .agents/tools/agent-tools/tkt-validate.mjs .agents/tasks
+.agents/cli/target/release/gritt-agent skill sync --check
+.agents/cli/target/release/gritt-agent ticket validate
+```
+
+To refresh or query local memory from the terminal:
+
+```bash
+.agents/cli/target/release/gritt-agent memory index
+.agents/cli/target/release/gritt-agent memory search "query terms"
 ```
 
 Do not edit generated `.claude/skills/` stubs or generated memory and ticket

@@ -23,11 +23,11 @@ Workspace files
 Local indexer
       |
       v
-Turso/libSQL file database
+SQLite file database
       |
       +--> SQLite FTS5 lexical search
       |
-      +--> optional F32_BLOB vector search
+      +--> reserved F32_BLOB vector column (unused)
       |
       v
 Local MCP server
@@ -40,12 +40,14 @@ Local MCP server
 
 - `.agents/brain/` documents agent infrastructure.
 - `.agents/memory/` stores project knowledge and architectural decisions.
-- `.agents/tools/` contains executable workflow tools.
+- `.agents/cli/` contains the `gritt-agent` binary that indexes, searches, and serves memory.
+- `.agents/tools/` contains the remaining Node scaffolding scripts.
 - `.agents/brain/data/` contains developer-local generated state and is
   ignored by Git.
 
 ## Retrieval policy
 
-FTS5 is the required baseline. Optional optional providers may embed chunks and
-rerank candidates, but vector search must never be required to index or
-retrieve workspace knowledge. Any provider failure falls back to FTS5.
+FTS5 is the required baseline and the only retrieval path the CLI implements.
+If embeddings or reranking are added later, vector search must never be
+required to index or retrieve workspace knowledge, and any provider failure
+must fall back to FTS5.

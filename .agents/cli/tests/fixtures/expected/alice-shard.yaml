@@ -1,0 +1,33 @@
+tickets:
+  - id: TKT-0001
+    namespace: alice
+    title: Catalog cache fallback
+    status: done
+    owner: alice
+    priority: normal
+    created: 2026-08-20
+    updated: 2026-08-30
+    artifacts:
+      concept: .agents/tasks/alice/TKT-0001-0025/TKT-0001/concept.md
+      task: .agents/tasks/alice/TKT-0001-0025/TKT-0001/task.md
+      report: .agents/tasks/alice/TKT-0001-0025/TKT-0001/report.md
+      updates: .agents/tasks/alice/TKT-0001-0025/TKT-0001/updates/
+    dependencies: []
+    areas:
+      - crates/gritt-provider
+    skills:
+      - dev
+  - id: TKT-0002
+    namespace: alice
+    title: Print mode exit codes
+    status: ready
+    owner: alice
+    priority: normal
+    created: 2026-09-01
+    updated: 2026-09-01
+    artifacts:
+      task: .agents/tasks/alice/TKT-0001-0025/TKT-0002/task.md
+    dependencies: []
+    areas:
+      - crates/gritt
+    skills: []

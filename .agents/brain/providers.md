@@ -27,9 +27,10 @@ There is no separate `*_MODEL` key.
 | `AGENT_EMBEDDING_PROVIDER` | Semantic retrieval vectors    | off     |
 | `AGENT_RERANK_PROVIDER`    | Retrieved candidate reranking | off     |
 
-A missing key, an empty value, and `none` are equivalent: `config.mjs` resolves
-all three to `null`, so the capability stays off. Nothing needs to be set to
-`none` explicitly, and `.agents/.env` itself is optional.
+A missing key, an empty value, and `none` are equivalent, so the capability
+stays off. Nothing needs to be set to `none` explicitly, and `.agents/.env`
+itself is optional. The current `gritt-agent` CLI reads none of these keys; the
+contract is recorded here for the phase that adds providers.
 
 ## Default configuration
 
@@ -46,8 +47,8 @@ AGENT_EMBEDDING_PROVIDER=text-embedding-3-small
 AGENT_RERANK_PROVIDER=rerank-3.5
 ```
 
-Provider initialization must check `providers.ai`, `providers.embedding`, and
-`providers.rerank` from `config.mjs` before making a request. No provider may
+Provider initialization must resolve each capability from the environment
+before making a request. No provider may
 make a network request when its resolved value is `null` or when the gateway
 credentials are absent. Indexing and search always succeed offline: missing
 providers leave FTS5 as the only retrieval path, and any gateway failure falls

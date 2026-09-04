@@ -24,7 +24,7 @@ Ticket creation and index synchronization are treated as one operation. If
 synchronization fails, creation is rolled back, so do not retry blindly:
 
 ```bash
-node .agents/tools/agent-tools/tkt-new.mjs --title "Short title"
+.agents/cli/target/release/gritt-agent ticket new --title "Short title"
 ```
 
 Add `--create-concept` and `--create-plan` when those artifacts are needed. Refresh identity alone with `node .agents/tools/agent-tools/tkt-identity.mjs`. After an ambiguous failure, check the ticket directory and indexes before running the allocator again.

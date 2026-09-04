@@ -1,0 +1,6 @@
+interface:
+  display_name: "Review"
+  short_description: "Routes to the pr, impact, or ticket review sub-skill."
+  default_prompt: "Use $review in this repository."
+policy:
+  allow_implicit_invocation: false

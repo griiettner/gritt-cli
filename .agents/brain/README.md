@@ -2,7 +2,7 @@
 id: brain-index
 title: gritt-cli repository agent brain
 status: active
-date: 2026-08-14
+date: 2026-09-03
 tags:
   - agent-brain
   - local-first
@@ -27,8 +27,7 @@ The brain is intentionally small, local, and provider-independent:
 - It works without an API key.
 - It works without network access.
 - It works on Windows, macOS, and Linux.
-- Optional models improve retrieval later; they are not required for the
-  baseline.
+- It needs only the Rust toolchain to build.
 
 This document is written for both human developers and AI agents. It explains
 what the brain is, how it operates, how to use it, and why it exists.
@@ -42,10 +41,9 @@ every agent to read everything is slow, expensive, and unreliable.
 The brain provides:
 
 1. A local searchable copy of relevant workspace knowledge.
-2. A standard MCP interface for Cursor and Claude Code.
+2. A standard MCP interface for Claude Code and other MCP clients.
 3. Source-aware results with file paths and line ranges.
-4. A dashboard showing whether memory is being populated.
-5. A clean fallback when optional AI services are unavailable.
+4. A terminal search command for humans and scripted checks.
 
 The intended session pattern is:
 
@@ -67,34 +65,33 @@ pattern, ticket, or known limitation.
 Workspace files
       |
       v
-Local indexer
+gritt-agent memory index
       |
       v
-Turso/libSQL-compatible SQLite file
+SQLite file (.agents/brain/data/agent-memory.db)
       |
       +--> document metadata
       +--> line-addressable chunks
       +--> SQLite FTS5 indexes
-      +--> optional vector column
+      +--> reserved vector column (unused)
       |
       v
-gritt-local-memory MCP
+gritt-agent memory serve  (gritt-local-memory MCP)
       |
-      +--> Cursor
       +--> Claude Code
+      +--> any stdio MCP client
 ```
 
-The implementation lives in:
+The implementation lives in the `gritt-agent` crate:
 
 ```text
-.agents/tools/agent-memory/
-├── chunk.mjs       Document chunking
-├── db.mjs          Local libSQL connection and schema initialization
-├── dashboard.mjs   Local monitoring dashboard
-├── index.mjs       Workspace indexer
-├── schema.sql      Database schema
-├── search.mjs      FTS5 retrieval
-└── server.mjs      Stdio MCP server
+.agents/cli/src/memory/
+├── chunk.rs      Document chunking
+├── db.rs         SQLite connection and schema initialization
+├── index.rs      Workspace indexer
+├── mcp.rs        Stdio MCP server
+├── schema.sql    Database schema
+└── search.rs     FTS5 retrieval
 ```
 
 Generated state is stored at:
@@ -104,8 +101,8 @@ Generated state is stored at:
 ```
 
 `.agents/brain/data/` is ignored by Git. Each developer has an independent
-local index. The database is not synchronized with Turso Cloud and does not
-communicate with any remote service by default.
+local index. The database never leaves the machine and the CLI makes no
+network requests.
 
 ## What gets indexed
 
@@ -130,6 +127,7 @@ node_modules/
 dist/
 coverage/
 .output/
+target/
 ```
 
 The index is rebuilt incrementally by path and content hash. Removed source
@@ -140,7 +138,7 @@ files are removed from the local index on the next run.
 Documents are split into line-addressable chunks:
 
 - Markdown headings begin logical sections.
-- Large sections are split into bounded chunks.
+- Sections longer than 80 lines are split into windows that overlap by 10 lines.
 - Non-Markdown documents are split by line count.
 - Chunks retain heading, start-line, and end-line metadata.
 - Chunk searches return citations such as:
@@ -149,57 +147,27 @@ Documents are split into line-addressable chunks:
 .agents/brain/README.md:67-82
 ```
 
-The current offline retriever uses FTS5 over these chunks. It does not use
-query expansion or a generative model.
+Retrieval uses FTS5 over these chunks. Every query term must match. There is
+no query expansion and no generative model.
 
 ## Quick start
 
 From the repository root:
 
 ```bash
-npm install
-npm run agent-memory:index
-npm run agent-memory:mcp
+cargo build --release --manifest-path .agents/cli/Cargo.toml
+.agents/cli/target/release/gritt-agent memory index
+.agents/cli/target/release/gritt-agent memory search "provider adapter"
 ```
 
-The index command is safe to run repeatedly.
-
-To use optional configuration:
-
-```text
-.agents/.env-template → .agents/.env
-```
-
-The Node tools load `.agents/.env` automatically. Existing process
-environment variables take precedence. No shell-specific `source` command
-is required.
-
-### Windows PowerShell
-
-```powershell
-Copy-Item .agents/.env-template .agents/.env
-npm install
-npm run agent-memory:index
-npm run agent-memory:mcp
-```
-
-### macOS or Linux
-
-```bash
-cp .agents/.env-template .agents/.env
-npm install
-npm run agent-memory:index
-npm run agent-memory:mcp
-```
-
-The same npm commands work on all three platforms.
+The index command is safe to run repeatedly. The same commands work in
+PowerShell on Windows with the `.exe` suffix on the binary.
 
 ## MCP integration
 
-The MCP server is already configured in:
+The MCP server is configured in:
 
 ```text
-.cursor/mcp.json
 .mcp.json
 ```
 
@@ -209,8 +177,11 @@ Its name is:
 gritt-local-memory
 ```
 
-The transport is stdio. It is started by Cursor or Claude Code when the
-workspace MCP configuration is loaded; it is not a TCP server.
+The transport is stdio. Claude Code starts
+`.agents/cli/target/release/gritt-agent memory serve` when the project
+configuration loads. The server reindexes before it accepts requests. It is
+not a TCP server. Build the binary before the first client start, otherwise
+the client reports that the command does not exist.
 
 ### Available MCP tools
 
@@ -219,9 +190,10 @@ workspace MCP configuration is loaded; it is not a TCP server.
 | `search_local_memory` | Search indexed chunks with source citations |
 | `read_local_memory`   | Read one indexed document by relative path  |
 
-`search_local_memory` returns the matching document title, heading, path,
-line range, and relevant chunk content. `read_local_memory` is useful after a
-search identifies the authoritative file.
+`search_local_memory` takes `query` and an optional `limit` from 1 to 50. It
+returns the matching document title, heading, path, line range, and chunk
+content. `read_local_memory` is useful after a search identifies the
+authoritative file.
 
 ### Agent usage rule
 
@@ -235,88 +207,22 @@ Before inspecting code for a task:
 
 This avoids repeatedly rediscovering project knowledge from source files.
 
-## Dashboard
-
-The local dashboard shows how the brain is populated:
-
-```text
-http://127.0.0.1:8282
-```
-
-Start it directly with:
-
-```bash
-npm run agent-memory:dashboard
-```
-
-Starting the MCP server also starts the dashboard automatically if it is not
-already running. The engine fixes this behavior and the loopback port at
-`8282`; neither requires environment configuration.
-
-The dashboard displays:
-
-- Index size
-- Indexed document count
-- Chunk count
-- Embedding coverage
-- Collection-like top-level path groups
-- Top file types
-- Recently modified documents
-- Recent index runs
-- Local retrieval and network status
-
-The dashboard is bound to `127.0.0.1`, so it is local to the developer
-machine.
-
 ## Environment and providers
 
-`.agents/.env` is optional and holds provider configuration only. Every
-provider key ships commented out in `.env-template`, so the default is:
+The current CLI reads no provider configuration. Indexing and search are
+local SQLite operations, so the default and only mode is:
 
 ```text
-No .agents/.env, or no provider key set
-```
-
-Each capability has one key whose value is the model identifier to use —
-generation for `AGENT_AI_PROVIDER`, vectors for `AGENT_EMBEDDING_PROVIDER`,
-candidate reordering for `AGENT_RERANK_PROVIDER`. A missing key, an empty
-value, and `none` all resolve to off, so nothing has to be set to `none`.
-
-The default means:
-
-```text
-Local libSQL + FTS5 + MCP
+Local SQLite + FTS5 + MCP
 No embeddings
 No reranking
 No query expansion
 No external requests
 ```
 
-The schema reserves an `F32_BLOB(1536)` column for
-`text-embedding-3-small`. The optional provider configuration
-uses:
-
-```env
-AGENT_MEMORY_API_KEY=
-AGENT_MEMORY_BASE_URL=https://openrouter.ai/api
-AGENT_EMBEDDING_PROVIDER=text-embedding-3-small
-AGENT_RERANK_PROVIDER=rerank-3.5
-```
-
-Those providers are configuration contracts for the next phase. The current
-working retrieval path is FTS5; the embedding and reranking
-adapters are not required by, or used by, the offline baseline.
-
-When providers are added, the intended pipeline is:
-
-```text
-Original query
-  → FTS/vector candidate retrieval
-  → optional Cohere reranking
-  → cited results
-```
-
-There will be no automatic query expansion.
+The schema reserves an `F32_BLOB(1536)` column on documents and chunks for a
+future embedding phase. `providers.md` records the configuration contract that
+phase must follow. Nothing in this repository sends data to a provider today.
 
 ## Database model
 
@@ -326,13 +232,12 @@ The local schema contains:
 | --------------------- | ----------------------------------- |
 | `documents`           | One row per indexed source file     |
 | `document_chunks`     | Line-addressable content chunks     |
-| `documents_fts`       | File-level FTS5 compatibility index |
-| `document_chunks_fts` | Offline retrieval index             |
+| `documents_fts`       | File-level FTS5 index               |
+| `document_chunks_fts` | Chunk retrieval index               |
 | `index_runs`          | Index execution history             |
 
-The database is Turso/libSQL-compatible through `@libsql/client`, but local
-development uses a `file:` URL. No auth token, `syncUrl`, or cloud database is
-configured.
+SQLite is compiled into the binary through the `rusqlite` bundled build with
+FTS5 enabled. No system SQLite is required.
 
 ## Troubleshooting
 
@@ -341,21 +246,11 @@ configured.
 Rebuild the index:
 
 ```bash
-npm run agent-memory:index
+.agents/cli/target/release/gritt-agent memory index
 ```
 
-Then retry the MCP search.
-
-### Dashboard does not open
-
-Start it directly:
-
-```bash
-npm run agent-memory:dashboard
-```
-
-The dashboard uses fixed loopback port `8282`. If that port is occupied, stop
-the conflicting process before restarting the dashboard.
+Then retry the search. Remember that every query term must match; drop terms
+that may not appear in the document.
 
 ### Stale results
 
@@ -367,8 +262,8 @@ command manually after changing source documents.
 The database is generated state and can be recreated:
 
 ```text
-Delete `.agents/brain/data/agent-memory.db`
-Run npm run agent-memory:index
+Delete .agents/brain/data/agent-memory.db
+Run the index command again
 ```
 
 Do not delete committed source files or `.agents/memory/` files.
@@ -377,32 +272,27 @@ Do not delete committed source files or `.agents/memory/` files.
 
 Check that:
 
-1. Dependencies are installed with `npm install`.
+1. The binary exists at `.agents/cli/target/release/gritt-agent`.
 2. The workspace is opened at the repository root.
 3. The MCP configuration contains `gritt-local-memory`.
-4. `node` is available on `PATH`.
-5. The MCP client has reloaded the workspace configuration.
+4. The MCP client has reloaded the workspace configuration.
 
 ## Security and privacy
 
-- The default path is local-only.
+- The only mode is local.
 - The database is ignored and should not be committed.
-- API keys belong only in `.agents/.env` or the developer environment.
-- Never place credentials in `.env-template`, MCP JSON, or documentation.
-- External providers must be explicitly enabled before future adapters make
-  requests.
+- The CLI reads no API keys and stores none in the database.
+- Never place credentials in MCP JSON or documentation.
 - Do not index confidential material unless the team has agreed that it
   belongs in the local developer index.
-- The dashboard listens only on loopback.
 
 ## Related documentation
 
-| Topic                               | Document                                                        |
-| ----------------------------------- | --------------------------------------------------------------- |
-| Storage and component relationships | `architecture.md`                                               |
-| Required and optional capabilities  | `capabilities.md`                                               |
-| Provider and network policy         | `providers.md`                                                  |
-| Processes and persistence           | `services.md`                                                   |
-| Commands and MCP tools              | `tools.md`                                                      |
-| Durable agent context boundaries    | `../memory/architecture/agent-context-boundaries.md`            |
-| Local libSQL decision               | `../memory/decisions/ADR-013-local-agent-memory-with-libsql.md` |
+| Topic                               | Document          |
+| ----------------------------------- | ----------------- |
+| Storage and component relationships | `architecture.md` |
+| Required and optional capabilities  | `capabilities.md` |
+| Provider and network policy         | `providers.md`    |
+| Processes and persistence           | `services.md`     |
+| Commands and MCP tools              | `tools.md`        |
+| The CLI crate                       | `../cli/README.md` |

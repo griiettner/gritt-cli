@@ -1,0 +1,6 @@
+interface:
+  display_name: "Example"
+  short_description: "Demonstrates a generated skill adapter."
+  default_prompt: "Use $example in this repository."
+policy:
+  allow_implicit_invocation: false

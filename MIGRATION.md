@@ -75,9 +75,12 @@ Expected immediate outcomes:
 
 Default behavior includes maintenance commands:
 
-1. `node .agents/tools/agent-tools/sync-skills.mjs`
-2. `node .agents/tools/agent-tools/tkt-sync.mjs`
-3. `node .agents/tools/agent-tools/tkt-validate.mjs .agents/tasks`
+1. `.agents/cli/target/release/gritt-agent skill sync`
+2. `.agents/cli/target/release/gritt-agent ticket sync`
+3. `.agents/cli/target/release/gritt-agent ticket validate`
+
+The migrator finds the binary through `GRITT_AGENT_BIN`, then the release or
+debug build under `.agents/cli/target/`, then `cargo run`.
 
 To skip maintenance (not recommended except debugging):
 
@@ -90,16 +93,16 @@ node .agents/tools/agent-tools/migrate-cursor-setup.mjs --source /absolute/path/
 Run explicitly even if maintenance was enabled:
 
 ```bash
-node .agents/tools/agent-tools/sync-skills.mjs
-node .agents/tools/agent-tools/tkt-sync.mjs
-node .agents/tools/agent-tools/tkt-validate.mjs .agents/tasks
+.agents/cli/target/release/gritt-agent skill sync
+.agents/cli/target/release/gritt-agent ticket sync
+.agents/cli/target/release/gritt-agent ticket validate
 ```
 
 Expected result:
 
-- `sync_skills.py`: "synced skill adapters (N file(s) updated)"
-- `tkt_sync.py`: "synced .agents task and memory indexes"
-- `tkt_validate.py`: "tkt_validate ok"
+- `skill sync`: "synced skill adapters (N file(s) updated)"
+- `ticket sync`: "synced .agents task and memory indexes"
+- `ticket validate`: "tkt_validate ok"
 
 ## 5) Review Artifacts
 
@@ -137,7 +140,7 @@ Memory extraction rule from routing docs:
 
 - Move durable, cross-task knowledge out of `AGENTS.md`/`CLAUDE.md` into `.agents/memory/<category>/...`.
 - Keep only boot routing and operating rules in `AGENTS.md`/`CLAUDE.md`.
-- Ensure extracted durable knowledge uses YAML frontmatter and appears in relevant memory indexes after `tkt_sync.py`.
+- Ensure extracted durable knowledge uses YAML frontmatter and appears in relevant memory indexes after `gritt-agent ticket sync`.
 
 Definition of what to preserve in merge:
 
@@ -195,7 +198,7 @@ Review that changes are scoped to migration outputs and expected indexes/docs.
 - Ambiguous memory too high:
   - Manually curate category and digest content in `.agents/memory/*`.
 - Validation warnings/errors:
-  - Fix frontmatter fields and rerun `tkt_sync.py` + `tkt_validate.py`.
+  - Fix frontmatter fields and rerun `gritt-agent ticket sync` and `gritt-agent ticket validate`.
 
 ## 10) Safety Rules
 

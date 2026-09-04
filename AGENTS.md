@@ -24,11 +24,13 @@ decisions are accepted in ADRs or ticket artifacts.
 - `.agents/memory/` holds durable architecture, principles, and accepted decisions.
 - `.agents/tasks/` holds canonical ticket history.
 - `.agents/skills/` holds reusable procedures.
-- `.agents/brain/` documents and implements local memory.
+- `.agents/brain/` documents local memory and holds its generated database.
+- `.agents/cli/` is the `gritt-agent` Rust CLI for memory, ticket, and skill maintenance.
 - `.agents/plans/` holds proposals and planning inputs.
 
 Indexes route to canonical files. Generated indexes and `.claude/skills/`
-stubs must not be edited directly.
+stubs must not be edited directly. Regenerate them with `gritt-agent`, built
+once per checkout with `cargo build --release --manifest-path .agents/cli/Cargo.toml`.
 
 ## Rules
 

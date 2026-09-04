@@ -10,14 +10,16 @@ Tooling launcher. It does not need the `tkt` hub.
 Run all three, in order:
 
 ```bash
-node .agents/tools/agent-tools/sync-skills.mjs
-node .agents/tools/agent-tools/tkt-sync.mjs
-node .agents/tools/agent-tools/tkt-validate.mjs .agents/tasks
+.agents/cli/target/release/gritt-agent skill sync
+.agents/cli/target/release/gritt-agent ticket sync
+.agents/cli/target/release/gritt-agent ticket validate
 ```
 
-- `sync-skills` rewrites `.claude/skills/` stubs and each skill's `agents/openai.yaml` policy block from `.agents/skills/*/SKILL.md`.
-- `tkt-sync` rewrites `.agents/tasks/**/index.yaml` and `.agents/memory/*/index.yaml` from frontmatter.
-- `tkt-validate` checks ticket folders, frontmatter, and chain links.
+Build the binary first when it is missing: `cargo build --release --manifest-path .agents/cli/Cargo.toml`.
+
+- `skill sync` rewrites `.claude/skills/` stubs and each skill's `agents/openai.yaml` policy block from `.agents/skills/*/SKILL.md`.
+- `ticket sync` rewrites `.agents/tasks/**/index.yaml` and `.agents/memory/*/index.yaml` from frontmatter.
+- `ticket validate` checks ticket folders, frontmatter, and chain links.
 
 Add `--check` to the first two to report drift without writing.
 

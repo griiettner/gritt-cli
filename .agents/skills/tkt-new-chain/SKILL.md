@@ -29,7 +29,7 @@ node .agents/tools/agent-tools/tkt-new-chain.mjs \
   --create-concept --create-plan
 ```
 
-The tool allocates consecutive `TKT-NNNN` ids in the current GitHub-login namespace: orchestrator first, then one worker per `--step`, then the reviewer. It refuses to allocate if that namespace already contains a gap, rather than creating a later id that obscures the missing ticket. It wires `chain_role`, `chain_parent`, `chain_children`, and per-worker `dependencies`, writes the child chain table into the orchestrator, and runs `agent-tools:tkt-sync` unless `--no-sync` is passed.
+The tool allocates consecutive `TKT-NNNN` ids in the current GitHub-login namespace: orchestrator first, then one worker per `--step`, then the reviewer. It refuses to allocate if that namespace already contains a gap, rather than creating a later id that obscures the missing ticket. It wires `chain_role`, `chain_parent`, `chain_children`, and per-worker `dependencies`, writes the child chain table into the orchestrator, and runs `gritt-agent ticket sync` unless `--no-sync` is passed.
 
 Flags worth knowing:
 
@@ -39,7 +39,7 @@ Flags worth knowing:
 
 ## Fill every scaffolded section
 
-Every generated `TODO(tkt):` line is unfinished work, not a template you may leave in place. `agent-tools:tkt-validate` **errors** while any remains, so a chain that stops at the scaffold fails validation instead of looking done.
+Every generated `TODO(tkt):` line is unfinished work, not a template you may leave in place. `gritt-agent ticket validate` **errors** while any remains, so a chain that stops at the scaffold fails validation instead of looking done.
 
 Replace them with real content in the same session that created the chain:
 
@@ -67,7 +67,7 @@ The tool writes the structural ones. You still own the judgement ones:
 ## Verify before reporting
 
 ```bash
-node .agents/tools/agent-tools/tkt-validate.mjs
+.agents/cli/target/release/gritt-agent ticket validate
 ```
 
 A clean run means every chain ticket exists, the parent and child links agree, and no scaffold marker is left. Do not report the chain as created until this passes.

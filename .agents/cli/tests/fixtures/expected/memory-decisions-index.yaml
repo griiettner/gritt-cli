@@ -1,0 +1,6 @@
+memories:
+  - id: ADR-900
+    title: Fixture decision
+    file: ADR-900-fixture-decision.md
+    tags: []
+    read_when: []

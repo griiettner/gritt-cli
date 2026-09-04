@@ -23,12 +23,12 @@ A bare `TKT-NNNN` prefers the current identity namespace, then a unique match ac
 Do not pick or skip ids manually. Create tickets with:
 
 ```bash
-node .agents/tools/agent-tools/tkt-new.mjs --title "Short title"
+.agents/cli/target/release/gritt-agent ticket new --title "Short title"
 ```
 
-Use `agent-tools:tkt-new-chain` for chain-managed work. The tool resolves GitHub identity, allocates the next number in that login's contiguous sequence, and writes the folder. If an earlier id is missing, allocation fails until the gap is restored or explicitly accounted for.
+Use `node .agents/tools/agent-tools/tkt-new-chain.mjs` for chain-managed work. The tool resolves GitHub identity, allocates the next number in that login's contiguous sequence, and writes the folder. If an earlier id is missing, allocation fails until the gap is restored or explicitly accounted for.
 
-Identity resolution order: `--namespace`, `GRITT_TKT_NAMESPACE`, `.agents/state/identity.local.yaml`, then `gh api user --jq .login`. Persist it with `node .agents/tools/agent-tools/tkt-identity.mjs`.
+Identity resolution order: `--namespace`, `GRITT_TKT_NAMESPACE`, `.agents/state/identity.local.yaml`, then `gh api user --jq .login`. `ticket new` stores the resolved login in that file. Refresh it alone with `node .agents/tools/agent-tools/tkt-identity.mjs`.
 
 ## Chunk resolution
 
@@ -44,7 +44,7 @@ Shared tickets omit `<namespace>/`. So `griiettner/TKT-0001` lives at `.agents/t
 
 ## Indexes
 
-Each chunk folder carries its own shard index. The top-level `.agents/tasks/index.yaml` lists namespaces and chunks. Neither index is canonical. Both regenerate through `agent-tools:tkt-sync`.
+Each chunk folder carries its own shard index. The top-level `.agents/tasks/index.yaml` lists namespaces and chunks. Neither index is canonical. Both regenerate through `gritt-agent ticket sync`.
 
 ## Legacy paths
 

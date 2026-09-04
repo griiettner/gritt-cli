@@ -1,3 +1,8 @@
-# Generated chunk router for .agents/tasks/.
-# No tickets yet. Create one with the tkt-new skill, then rerun:
-#   nx run agent-tools:tkt-sync
+- namespace: griiettner
+  range: TKT-0001-0025
+  file: .agents/tasks/griiettner/TKT-0001-0025/index.yaml
+  count: 1
+  updated: 2026-09-03
+  statuses:
+    - done: 1
+  areas: []

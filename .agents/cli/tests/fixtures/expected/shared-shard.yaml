@@ -1,0 +1,15 @@
+tickets:
+  - id: TKT-0001
+    namespace: _shared
+    title: Shared bootstrap ticket
+    status: ready
+    owner: team
+    priority: normal
+    created: 2026-08-14
+    updated: 2026-08-14
+    artifacts:
+      task: .agents/tasks/TKT-0001-0025/TKT-0001/task.md
+    dependencies: []
+    areas:
+      - .agents/tools
+    skills: []

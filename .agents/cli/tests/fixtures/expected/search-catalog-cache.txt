@@ -1,0 +1,37 @@
+[1] concept — TKT-0001 concept: Catalog cache fallback
+Source: .agents/tasks/alice/TKT-0001-0025/TKT-0001/concept.md:12-13
+
+# TKT-0001 concept: Catalog cache fallback
+
+---
+
+[2] report — TKT-0001 Report: Catalog cache fallback
+Source: .agents/tasks/alice/TKT-0001-0025/TKT-0001/report.md:12-13
+
+# TKT-0001 Report: Catalog cache fallback
+
+---
+
+[3] task — TKT-0001 task: Catalog cache fallback
+Source: .agents/tasks/alice/TKT-0001-0025/TKT-0001/task.md:17-18
+
+# TKT-0001 task: Catalog cache fallback
+
+---
+
+[4] guide — Catalog cache
+Source: docs/guide.md:9-13
+
+## Catalog cache
+
+The catalog cache stores the provider model list with a timestamp.
+A failed refresh may use the last cached list, marked stale.
+
+---
+
+[5] concept — Problem
+Source: .agents/tasks/alice/TKT-0001-0025/TKT-0001/concept.md:14-17
+
+## Problem
+
+The catalog cache has no fallback when the refresh fails.

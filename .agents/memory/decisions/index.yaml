@@ -18,3 +18,14 @@ memories:
     read_when:
       - Creating, locating, or migrating a ticket folder
       - Changing ticket routing or index generation
+  - id: ADR-004
+    title: Project-local agent CLI
+    file: ADR-004-project-local-agent-cli.md
+    tags:
+      - tooling
+      - memory
+      - mcp
+    read_when:
+      - changing local memory indexing, search, or the MCP server
+      - adding or replacing a repository maintenance command
+      - deciding where repository tooling code lives

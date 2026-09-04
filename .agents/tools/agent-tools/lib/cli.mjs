@@ -119,28 +119,44 @@ export function runProcess(command, args, options = {}) {
   };
 }
 
-export function runNx(repo, target, args = [], options = {}) {
-  const legacyEntry = path.join(repo, 'node_modules', 'nx', 'bin', 'nx.js');
-  const currentEntry = path.join(repo, 'node_modules', 'nx', 'dist', 'bin', 'nx.js');
-  const nxEntry = pathExistsSync(legacyEntry) ? legacyEntry : currentEntry;
-  if (!pathExistsSync(nxEntry)) {
-    // No Nx workspace: run the sibling tool script directly.
-    const direct = path.join(repo, '.agents', 'tools', 'agent-tools', `${target}.mjs`);
-    return runProcess(process.execPath, [direct, ...args], {
-      cwd: repo,
-      inherit: options.inherit,
-    });
+function resolveAgentCli(repo) {
+  const fromEnv = process.env.GRITT_AGENT_BIN?.trim();
+  if (fromEnv) return { command: fromEnv, prefix: [] };
+  const binary = process.platform === 'win32' ? 'gritt-agent.exe' : 'gritt-agent';
+  for (const profile of ['release', 'debug']) {
+    const candidate = path.join(repo, '.agents', 'cli', 'target', profile, binary);
+    if (pathExistsSync(candidate)) return { command: candidate, prefix: [] };
   }
-  return runProcess(
-    process.execPath,
-    [
-      nxEntry,
+  return {
+    command: 'cargo',
+    prefix: [
       'run',
-      `agent-tools:${target}`,
-      ...(args.length ? ['--', ...args] : []),
+      '--quiet',
+      '--release',
+      '--manifest-path',
+      path.join(repo, '.agents', 'cli', 'Cargo.toml'),
+      '--',
     ],
+  };
+}
+
+/**
+ * Runs a `gritt-agent` subcommand such as `['ticket', 'sync']`.
+ * Binary resolution order: GRITT_AGENT_BIN, the release build, the debug
+ * build, then `cargo run` against `.agents/cli/Cargo.toml`.
+ */
+export function runAgentCli(repo, subcommand, options = {}) {
+  const { command, prefix } = resolveAgentCli(repo);
+  const result = runProcess(
+    command,
+    [...prefix, '--repo-root', repo, ...subcommand],
     { cwd: repo, inherit: options.inherit },
   );
+  if (result.status !== 0 && options.inherit && result.stderr) {
+    // With inherited stdio only a spawn failure lands here; do not lose it.
+    console.error(`error: could not run ${command}: ${result.stderr.trim()}`);
+  }
+  return result;
 }
 
 function pathExistsSync(target) {

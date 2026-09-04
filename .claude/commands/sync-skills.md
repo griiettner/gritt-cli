@@ -5,7 +5,7 @@ Regenerate the per-tool skill adapters from the canonical `.agents/skills/` tree
 Run:
 
 ```bash
-node .agents/tools/agent-tools/sync-skills.mjs
+.agents/cli/target/release/gritt-agent skill sync
 ```
 
 This regenerates both adapters:
@@ -23,7 +23,7 @@ Use this command when:
 To verify without writing (useful in CI or a pre-commit hook):
 
 ```bash
-node .agents/tools/agent-tools/sync-skills.mjs --check
+.agents/cli/target/release/gritt-agent skill sync --check
 ```
 
 Do not edit `.claude/skills/` files manually. They are generated compatibility stubs.

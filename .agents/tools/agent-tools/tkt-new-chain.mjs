@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { CliError, parseCli, runMain, runNx } from './lib/cli.mjs';
+import { CliError, parseCli, runAgentCli, runMain } from './lib/cli.mjs';
 import {
   isDirectory,
   localDate,
@@ -33,7 +33,7 @@ GitHub-login namespace under .agents/tasks/.
 
 The chain is always more than one ticket: one orchestrator, one worker ticket
 per --step, and a final reviewer ticket unless --no-reviewer is passed. Use
-tkt-new.mjs when the work is a single one-shot ticket.
+gritt-agent ticket new when the work is a single one-shot ticket.
 
 options:
   -h, --help            show this help message and exit
@@ -112,7 +112,7 @@ async function main() {
 
   if (args['dry-run']) {
     printChain(repoRoot, namespace, chain, args);
-    if (!args['no-sync']) console.log('would run: nx run agent-tools:tkt-sync');
+    if (!args['no-sync']) console.log('would run: gritt-agent ticket sync');
     return 0;
   }
 
@@ -162,7 +162,7 @@ async function main() {
   }
 
   if (!args['no-sync']) {
-    const result = runNx(repoRoot, 'tkt-sync', [], { inherit: true });
+    const result = runAgentCli(repoRoot, ['ticket', 'sync'], { inherit: true });
     if (result.status !== 0) return result.status;
   }
   printChain(repoRoot, namespace, chain, args);
@@ -172,7 +172,7 @@ async function main() {
 function parseSteps(rawSteps) {
   if (rawSteps.length < 2) {
     throw new CliError(
-      'a chain needs at least two --step values; use tkt-new.mjs for a single one-shot ticket',
+      'a chain needs at least two --step values; use `gritt-agent ticket new` for a single one-shot ticket',
     );
   }
   return rawSteps.map((raw, index) => {
@@ -345,7 +345,7 @@ function renderOrchestratorTask(values) {
       '## Verification',
       '',
       `- ${TODO} name the checks every worker and reviewer pass must respect.`,
-      `- Run \`nx run agent-tools:tkt-chain-check -- --ticket ${chain.orchestrator.ticketId} --base ${values.baseBranch}\` before semantic review.`,
+      `- Run \`node .agents/tools/agent-tools/tkt-chain-check.mjs --ticket ${chain.orchestrator.ticketId} --base ${values.baseBranch}\` before semantic review.`,
       '',
     ].join('\n')
   );
@@ -396,8 +396,8 @@ function renderWorkerTask(values) {
       '',
       '## Verification',
       '',
-      `- ${TODO} name the Nx targets and manual checks for this step.`,
-      `- Run \`nx run agent-tools:tkt-chain-check -- --ticket ${worker.ticketId} --base ${values.baseBranch}\` before semantic review.`,
+      `- ${TODO} name the commands and manual checks for this step.`,
+      `- Run \`node .agents/tools/agent-tools/tkt-chain-check.mjs --ticket ${worker.ticketId} --base ${values.baseBranch}\` before semantic review.`,
       '',
       '## Handoff',
       '',
@@ -440,6 +440,7 @@ function renderReviewerTask(values) {
       '',
       '- Re-run deterministic ticket and chain validation.',
       `- Review the full diff across ${chain.workers[0].ticketId} through ${chain.workers[chain.workers.length - 1].ticketId}.`,
+      `- Load \`review/ticket\` against ${chain.orchestrator.ticketId}'s task.md for completion readiness, and \`review/impact\` across the merged diff for integration conflicts.`,
       `- ${TODO} name the architecture and behavior checks specific to this chain.`,
       '',
       '## Acceptance Criteria',
@@ -451,8 +452,8 @@ function renderReviewerTask(values) {
       '',
       '## Verification',
       '',
-      '- Run `nx run agent-tools:tkt-validate`.',
-      `- Run \`nx run agent-tools:tkt-chain-check -- --ticket ${chain.reviewer.ticketId} --base ${values.baseBranch}\`.`,
+      '- Run `gritt-agent ticket validate`.',
+      `- Run \`node .agents/tools/agent-tools/tkt-chain-check.mjs --ticket ${chain.reviewer.ticketId} --base ${values.baseBranch}\`.`,
       '- Re-run the scoped command set recorded by the parent and worker tickets.',
       '- Produce a typed verdict: `pass`, `needs-fix`, or `blocked`, with findings',
       '  and next actions.',

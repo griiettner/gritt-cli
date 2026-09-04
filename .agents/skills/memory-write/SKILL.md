@@ -66,7 +66,7 @@ read_when:
 Category `index.yaml` files are **generated** from the frontmatter above — the sync tool reads each memory file's `id`, `title`, `tags`, and `read_when` and rewrites the index. Never hand-edit an `index.yaml`; a hand-edit is overwritten on the next sync. Regenerate instead:
 
 ```bash
-node .agents/tools/agent-tools/tkt-sync.mjs
+.agents/cli/target/release/gritt-agent ticket sync
 ```
 
 ## Output

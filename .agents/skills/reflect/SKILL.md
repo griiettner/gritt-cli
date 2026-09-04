@@ -35,10 +35,10 @@ Aim for 1–3 items. Do not stage vague or session-specific claims.
 
 Every durable memory `.md` file needs YAML frontmatter. Match the fields already used in that category (e.g. `id`, `title`, `status`, `date`, `related_ticket` for decisions). For a new ADR, pick the next `ADR-NNN` id in sequence.
 
-Category `index.yaml` files are **generated** from that frontmatter — the `agent-tools:tkt-sync` Nx target reads each memory file's `id`, `title`, `tags`, and `read_when` and rewrites the index. Never hand-edit an `index.yaml`; a hand-edit is overwritten on the next sync. To get a good index entry, put `tags` and `read_when` in the memory file's frontmatter, then regenerate:
+Category `index.yaml` files are **generated** from that frontmatter — `gritt-agent ticket sync` reads each memory file's `id`, `title`, `tags`, and `read_when` and rewrites the index. Never hand-edit an `index.yaml`; a hand-edit is overwritten on the next sync. To get a good index entry, put `tags` and `read_when` in the memory file's frontmatter, then regenerate:
 
 ```bash
-node .agents/tools/agent-tools/tkt-sync.mjs
+.agents/cli/target/release/gritt-agent ticket sync
 ```
 
 ## Step 3 — Write the reflection file
@@ -62,5 +62,5 @@ tags: [reflection]
 ## Output
 
 - State which memory files were added or updated.
-- Confirm the reflection file was written and that the `agent-tools:tkt-sync` Nx target regenerated the indexes.
+- Confirm the reflection file was written and that `gritt-agent ticket sync` regenerated the indexes.
 - Call out anything skipped as session-specific or unconfirmed.

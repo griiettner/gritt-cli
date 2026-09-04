@@ -19,7 +19,7 @@ Routing metadata: [`index.yaml`](index.yaml).
 
 ## Frontmatter
 
-One line. Action, then trigger. No filler ("helps", "allows", "designed to").
+One line. Action, then trigger. No filler ("helps", "allows", "designed to"). State each once: do not restate the trigger inside the action, and do not list near-synonyms where one word covers it.
 
 ```yaml
 ---
@@ -58,7 +58,7 @@ Two different things. Do not convert one into the other without being asked.
 | | Skill | Sub-skill |
 | --- | --- | --- |
 | Path | `.agents/skills/<name>/SKILL.md` | `.agents/skills/<skill>/<topic>/SKILL.md` |
-| Registered by `sync-skills` | Yes — Claude stub + Codex `openai.yaml` | No |
+| Registered by `skill sync` | Yes — Claude stub + Codex `openai.yaml` | No |
 | Invocable | Yes, `/<name>` | No — its parent loads it |
 | `name:` | matches the folder | parent prefix, e.g. `dev-cli` |
 
@@ -96,7 +96,7 @@ Promote a sub-skill to a top-level skill only when the user asks for it to be in
 After any skill change:
 
 ```bash
-node .agents/tools/agent-tools/sync-skills.mjs
+.agents/cli/target/release/gritt-agent skill sync
 ```
 
 ## Rules

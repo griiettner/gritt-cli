@@ -63,8 +63,8 @@ Do not create placeholder artifacts just to satisfy structure.
 After adding, removing, or renaming task or memory files, run:
 
 ```bash
-node .agents/tools/agent-tools/tkt-sync.mjs
-node .agents/tools/agent-tools/tkt-validate.mjs .agents/tasks
+.agents/cli/target/release/gritt-agent ticket sync
+.agents/cli/target/release/gritt-agent ticket validate
 ```
 
 ## Practical rule

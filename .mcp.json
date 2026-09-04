@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "gritt-local-memory": {
+      "command": ".agents/cli/target/release/gritt-agent",
+      "args": ["memory", "serve"]
+    }
+  }
+}
