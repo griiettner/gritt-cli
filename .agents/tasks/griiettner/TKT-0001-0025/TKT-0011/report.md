@@ -32,7 +32,9 @@ Chain facts:
 - Worktree: `/Users/griiettner/Projects/grittflow/gritt-cli-tkt-0011`
 - Branch: `tkt-0011-03-harness`
 - Base: `feature/tkt-0008-gritt-cli` at `aa31c47` (PR #2 merge)
-- Commits and PR: see Updates below.
+- Commit: `111da5e` (implementation), plus the report update commit
+- PR: https://github.com/griiettner/gritt-cli/pull/3 into
+  `feature/tkt-0008-gritt-cli`
 
 What landed, by module in `crates/gritt-harness/src`:
 
@@ -155,8 +157,13 @@ All run from the worktree root on 2026-09-04:
   the state reducer and renderer are covered by unit tests through
   ratatui's `TestBackend`, and the manual TTY pass is a follow-up for
   TKT-0013's end-to-end run.
-- `gritt-agent ticket validate --repo-root .` and both chain-check
-  commands: see Updates.
+- `gritt-agent ticket validate --repo-root .`: ok, 0 warnings.
+- `gritt-agent ticket chain-check --ticket TKT-0011 --base feature/tkt-0008-gritt-cli`:
+  ok, 0 warnings, 26 changed files, merge-base equals the base tip
+  `aa31c47`.
+- `gritt-agent ticket chain-check --ticket TKT-0011 --base main`: ok, 5
+  warnings, all expected: the merged TKT-0009 and TKT-0010 ticket files
+  and the merge-base gap between `main` and the chain branch.
 
 Dependency checks with `cargo info`: ratatui 0.30.2 (MIT, MSRV 1.88),
 crossterm 0.29.0 (MIT), diffy 0.5.2 (MIT OR Apache-2.0), uuid 1.26.0
@@ -196,4 +203,5 @@ crossterm 0.29.0 (MIT), diffy 0.5.2 (MIT OR Apache-2.0), uuid 1.26.0
 
 ## Updates
 
-- None yet.
+- 2026-09-04 report update. Added the commit, PR #3, and chain-check
+  evidence after the PR was opened. No code changed.
