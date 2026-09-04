@@ -3,7 +3,7 @@ id: TKT-0013
 namespace: griiettner
 title: Complete cross-platform reproducible builds, diagnostics, documentation, end-to-end verification, and integrated hardening
 artifact: task
-status: planning
+status: done
 owner: griiettner
 created: 2026-09-04
 updated: 2026-09-04

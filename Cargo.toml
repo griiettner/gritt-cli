@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/gritt-core",
+  "crates/gritt-provider",
+  "crates/gritt-harness",
+  "crates/gritt-connector",
+  "crates/gritt",
+]
+# The repository tooling crate is its own workspace root.
+exclude = [".agents/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# keyring 4.2.0 declares an MSRV of 1.88, so the workspace cannot honestly
+# claim an older one.
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/griiettner/gritt-cli"
+publish = false
+
+# Single source of dependency versions. Member crates use `workspace = true`.
+[workspace.dependencies]
+gritt-core = { path = "crates/gritt-core" }
+gritt-provider = { path = "crates/gritt-provider" }
+gritt-harness = { path = "crates/gritt-harness" }
+gritt-connector = { path = "crates/gritt-connector" }
+
+# `clock` stays out of the workspace default so `gritt-core` keeps its no-I/O
+# boundary (ADR-006); the I/O crates enable it where they read the clock.
+chrono = { version = "0.4.45", default-features = false, features = ["std", "serde"] }
+clap = { version = "4.6.6", features = ["derive"] }
+dirs = "6.0.0"
+bytes = "1.12.1"
+futures = "0.3.34"
+futures-core = "0.3.34"
+keyring = "4.2.0"
+# TLS is rustls with `ring` as the selected crypto provider so every platform
+# builds with only the Rust toolchain; `aws-lc-rs` needs CMake on Windows builders.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider", "http2", "json", "stream"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util", "io-std", "fs", "signal"] }
+toml = "1.1.5"
+# ADR-009 pins the full-screen stack.
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = "0.29.0"
+diffy = "0.5.2"
+uuid = { version = "1.26.0", features = ["v4"] }
+portable-pty = "0.9.0"
+turso = { version = "0.7.2", default-features = false, features = ["fts"] }
+
+tempfile = "3.27.0"

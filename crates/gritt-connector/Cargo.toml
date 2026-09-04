@@ -1,0 +1,21 @@
+[package]
+name = "gritt-connector"
+description = "External agent process supervision and connectors for Gritt."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+gritt-core = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
+futures = { workspace = true }
+portable-pty = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

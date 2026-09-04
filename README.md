@@ -9,12 +9,27 @@ built.
 
 ## Status
 
-Gritt is in its design stage. The agent workspace exists, but the Cargo
-workspace and runtime have not been created. The architecture is still being
-worked through and requires ADRs before its major choices become canonical.
+The first terminal release is implemented. The Cargo workspace at the
+repository root builds one `gritt` binary for macOS, Windows, and Linux
+with the native provider path (OpenRouter, OpenAI, Anthropic, and generic
+OpenAI-compatible profiles), sessions with planning and coding phases, the
+permission engine and workspace-bounded tools, print, REPL, and full-screen
+modes, supervised Codex, Claude Code, Cursor, and OpenCode connectors, one
+embedded local database shared with `gritt-agent`, content-free telemetry,
+and reproducible checksummed builds.
 
-[`.agents/plans/plan1.md`](.agents/plans/plan1.md) is the current working
-proposal. It is input to those decisions, not the source of truth.
+User documentation starts at [`docs/README.md`](docs/README.md). The
+accepted decisions are ADR-006 through ADR-011 under
+`.agents/memory/decisions/`; [`.agents/plans/plan1.md`](.agents/plans/plan1.md)
+remains the plan they were drawn from.
+
+Quick start:
+
+```bash
+cargo build --release --locked
+./target/release/gritt doctor
+./target/release/gritt run --plan "hello"
+```
 
 ## How Gritt runs agents
 
@@ -50,7 +65,7 @@ The connector order for this machine is:
 1. Native connector
 2. Codex
 3. Claude Code
-4. Grok CLI
+4. Cursor and OpenCode
 
 Connectors are optional. A missing or incompatible external CLI must not break
 the native path.
@@ -152,7 +167,7 @@ transcripts must not expose them.
 
 - Promote the native path to the connector contract.
 - Add process supervision, health checks, approvals, timeouts, and cancellation.
-- Connect Codex, Claude Code, and Grok CLI through structured interfaces where available.
+- Connect Codex, Claude Code, Cursor, and OpenCode through structured interfaces where available.
 - Keep capability differences visible instead of faking parity.
 
 ## Agent workspace
@@ -209,7 +224,7 @@ Before implementing product code:
 4. Read `.agents/plans/plan1.md` when the task concerns the proposed product direction.
 5. Load the smallest applicable skill before editing.
 
-Once the Cargo workspace exists, the full verification set is:
+The full verification set is:
 
 ```bash
 cargo fmt --all --check

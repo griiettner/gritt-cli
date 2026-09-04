@@ -3,7 +3,7 @@ id: TKT-0010
 namespace: griiettner
 title: Implement provider adapters, streaming normalizers, model caching, capability checks, opt-in embeddings and reranking
 artifact: task
-status: planning
+status: done
 owner: griiettner
 created: 2026-09-04
 updated: 2026-09-04

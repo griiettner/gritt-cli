@@ -1,0 +1,4 @@
+data: {"id":"chatcmpl-fx5","object":"chat.completion.chunk","model":"openai/gpt-5-nano","choices":[{"index":0,"delta":{"content":"Part"},"finish_reason":null}]}
+
+data: {"error":{"message":"Rate limit exceeded","code":429,"metadata":{"provider_name":"placeholder"}}}
+

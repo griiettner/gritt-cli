@@ -1,0 +1,12 @@
+data: {"id":"chatcmpl-fx3","object":"chat.completion.chunk","model":"openai/gpt-5-nano","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_fx_1","type":"function","function":{"name":"file_read","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fx3","object":"chat.completion.chunk","model":"openai/gpt-5-nano","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fx3","object":"chat.completion.chunk","model":"openai/gpt-5-nano","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":" \"README.md\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fx3","object":"chat.completion.chunk","model":"openai/gpt-5-nano","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl-fx3","object":"chat.completion.chunk","model":"openai/gpt-5-nano","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":9,"total_tokens":29}}
+
+data: [DONE]
+

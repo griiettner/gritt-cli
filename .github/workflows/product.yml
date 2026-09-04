@@ -1,0 +1,119 @@
+# Verifies the Gritt product workspace on all three release platforms and
+# produces reproducible, checksummed binaries. The gritt-agent tooling crate
+# has its own workflow (agent-cli.yml).
+name: product
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - ".agents/**"
+      - ".claude/**"
+      - "docs/**"
+      - "*.md"
+  pull_request:
+    paths-ignore:
+      - ".agents/**"
+      - ".claude/**"
+      - "docs/**"
+      - "*.md"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Keep LF line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the exact compiler; install that one.
+      - name: Install the pinned toolchain
+        shell: bash
+        run: |
+          TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy
+          rustup default "$TOOLCHAIN"
+          rustc -vV
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-product-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-product-
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace --locked
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+  release:
+    name: release (${{ matrix.target }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      # The same pinned toolchain as verify; a rebuild must use it too.
+      - name: Install the pinned toolchain
+        shell: bash
+        run: |
+          TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$TOOLCHAIN" --profile minimal
+          rustup default "$TOOLCHAIN"
+          rustup target add --toolchain "$TOOLCHAIN" ${{ matrix.target }}
+          rustc -vV
+      # Two builds from clean target directories must produce the same
+      # bytes. The scripts fix SOURCE_DATE_EPOCH and remap paths.
+      - name: First build
+        shell: bash
+        run: |
+          scripts/release/build.sh ${{ matrix.target }} dist/first
+          rm -rf target
+      - name: Second build
+        shell: bash
+        run: scripts/release/build.sh ${{ matrix.target }} dist/second
+      - name: Compare checksums and build info
+        shell: bash
+        run: |
+          cat dist/first/SHA256SUMS dist/second/SHA256SUMS dist/first/BUILD-INFO
+          cmp dist/first/SHA256SUMS dist/second/SHA256SUMS
+          cmp dist/first/BUILD-INFO dist/second/BUILD-INFO
+      - name: Name the artifact
+        shell: bash
+        run: |
+          mkdir -p artifact
+          cp dist/first/* artifact/
+          cd artifact && for f in gritt gritt.exe; do [ -f "$f" ] && mv "$f" "gritt-${{ matrix.target }}${f#gritt}"; done; true
+          sed -i.bak 's#  gritt#  gritt-${{ matrix.target }}#' SHA256SUMS && rm -f SHA256SUMS.bak
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gritt-${{ matrix.target }}
+          path: artifact/*
+          if-no-files-found: error

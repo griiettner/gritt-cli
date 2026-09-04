@@ -3,7 +3,7 @@ id: TKT-0009
 namespace: griiettner
 title: Establish the Rust workspace, MIT licensing, domain contracts, unified events, configuration, and single embedded Turso database schema
 artifact: task
-status: ready
+status: done
 owner: griiettner
 created: 2026-09-04
 updated: 2026-09-04

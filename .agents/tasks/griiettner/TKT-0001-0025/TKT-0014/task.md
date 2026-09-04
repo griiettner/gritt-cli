@@ -3,7 +3,7 @@ id: TKT-0014
 namespace: griiettner
 title: Review integrated Build the complete Gritt local AI coding agent CLI chain
 artifact: task
-status: planning
+status: done
 owner: griiettner
 created: 2026-09-04
 updated: 2026-09-04

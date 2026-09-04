@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"thread-codex-0004"}
+{"type":"turn.started"}
+this is not json at all
+{"type":"something.new","payload":{"unexpected":true}}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"still fine"}}
+{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0}}

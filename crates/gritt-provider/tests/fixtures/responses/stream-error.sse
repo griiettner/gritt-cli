@@ -1,0 +1,6 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_fx5","status":"in_progress"}}
+
+event: error
+data: {"type":"error","sequence_number":1,"code":"server_error","message":"The server had an error while processing your request","param":null}
+

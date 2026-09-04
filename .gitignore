@@ -4,3 +4,5 @@ __pycache__/
 .agents/.env
 .agents/brain/data/
 .agents/cli/target/
+/target/
+/dist/

@@ -1,0 +1,8 @@
+{"type":"thread.started","thread_id":"thread-codex-0002"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I will run that exact command now."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'echo hello-from-tool'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'echo hello-from-tool'","aggregated_output":"hello-from-tool\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"reasoning","text":"The command succeeded."}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"DONE"}}
+{"type":"turn.completed","usage":{"input_tokens":32727,"cached_input_tokens":23168,"cache_write_input_tokens":0,"output_tokens":121,"reasoning_output_tokens":0}}
