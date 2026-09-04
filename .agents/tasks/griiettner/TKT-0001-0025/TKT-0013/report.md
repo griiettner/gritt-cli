@@ -31,8 +31,10 @@ Chain facts:
 - Worktree: `/Users/griiettner/Projects/grittflow/gritt-cli-tkt-0013`
 - Branch: `tkt-0013-05-release`
 - Base: `feature/tkt-0008-gritt-cli` at `bf6439d` (PR #4 merge)
-- Commits: `afa73fe` (implementation, docs, tests, ticket artifacts) and
-  the report update commit that follows it
+- Commits: `afa73fe` (implementation, docs, tests, ticket artifacts),
+  `0ed0bb3` (report evidence), `bbd8409` (review fix round), and the
+  second fix round commit that corrects the e2e path encoding and this
+  ledger
 - PR: https://github.com/griiettner/gritt-cli/pull/5 into
   `feature/tkt-0008-gritt-cli`
 
@@ -60,7 +62,7 @@ What landed:
   embeddings, privacy, reproducible builds, upgrading). README Status
   rewritten with a pointer to the docs; stale Grok connector lines
   replaced; `.agents/brain/README.md` names the `gritt_` namespace.
-- `crates/gritt/tests/e2e.rs`: eight tests through the built binary
+- `crates/gritt/tests/e2e.rs`: nine tests through the built binary
   against a local HTTP provider stand-in: planning turn, coding turn with
   an approved write and diff, denied write, resume after exit,
   Ctrl-C cancellation with exit 130, missing connector leaving native
@@ -211,3 +213,7 @@ All from the worktree root on 2026-09-04:
   drives approval, diff, palette, sessions, and `NO_COLOR`, and a live
   Codex resume smoke was added and run; the follow-up ledger names every
   carried-forward item with its ticket; both docs corrected.
+- 2026-09-04 second fix round. The Cursor path in the e2e config is now
+  rendered as a TOML string, so backslashes parse on Windows, with a
+  round-trip test; the commit ledger and the e2e test count were
+  corrected.

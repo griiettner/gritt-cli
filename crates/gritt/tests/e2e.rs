@@ -328,6 +328,24 @@ fn ctrl_c_cancels_a_running_turn_with_exit_130() {
     assert!(stdout(&shown).contains("Cancelled"), "{}", stdout(&shown));
 }
 
+/// Renders a `[connectors.executables]` section with the path encoded as a
+/// TOML string, so Windows backslashes survive parsing.
+fn executables_section(connector: &str, path: &Path) -> String {
+    let value = toml::Value::from(path.to_string_lossy().into_owned());
+    format!("[connectors.executables]\n{connector} = {value}\n")
+}
+
+#[test]
+fn executable_paths_with_backslashes_round_trip_through_the_config() {
+    let raw = r"C:\tools\no-such-agent.exe";
+    let section = executables_section("cursor", Path::new(raw));
+    let parsed: toml::Value = toml::from_str(&section).unwrap();
+    assert_eq!(
+        parsed["connectors"]["executables"]["cursor"].as_str(),
+        Some(raw)
+    );
+}
+
 #[test]
 fn a_missing_connector_fails_alone_and_native_keeps_working() {
     let provider = serve(vec![text_sse("Native is fine.")], false);
@@ -337,10 +355,7 @@ fn a_missing_connector_fails_alone_and_native_keeps_working() {
     let missing = space.path().join("no-such-cursor-agent");
     let config = space.path().join(".gritt/config.toml");
     let mut text = std::fs::read_to_string(&config).unwrap();
-    text.push_str(&format!(
-        "[connectors.executables]\ncursor = \"{}\"\n",
-        missing.display()
-    ));
+    text.push_str(&executables_section("cursor", &missing));
     std::fs::write(&config, text).unwrap();
     let failed = space.run(&[
         "run",
