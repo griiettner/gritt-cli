@@ -112,6 +112,11 @@ impl Store {
         &self.connection
     }
 
+    /// Applies every pending migration. Each migration's statements and its
+    /// ledger row commit in one transaction, so an interruption leaves the
+    /// file either fully before or fully after that migration. A column
+    /// that an earlier interrupted run already added is detected and the
+    /// `ALTER TABLE` skipped, so the ledger can still catch up.
     async fn migrate(&self) -> Result<()> {
         self.connection
             .execute_batch(MIGRATIONS_TABLE)
@@ -122,10 +127,24 @@ impl Store {
             if applied.iter().any(|done| done == name) {
                 continue;
             }
-            self.connection
-                .execute_batch(sql)
-                .await
-                .map_err(storage_error)?;
+            self.apply_migration(name, sql).await?;
+        }
+        Ok(())
+    }
+
+    async fn apply_migration(&self, name: &str, sql: &str) -> Result<()> {
+        let statements = self.recoverable_statements(sql).await?;
+        self.connection
+            .execute_batch("BEGIN")
+            .await
+            .map_err(storage_error)?;
+        let result = async {
+            for statement in &statements {
+                self.connection
+                    .execute_batch(statement)
+                    .await
+                    .map_err(storage_error)?;
+            }
             self.connection
                 .execute(
                     "INSERT INTO gritt_schema_migrations (name) VALUES (?1)",
@@ -133,8 +152,62 @@ impl Store {
                 )
                 .await
                 .map_err(storage_error)?;
+            Ok::<(), Error>(())
         }
-        Ok(())
+        .await;
+        match result {
+            Ok(()) => self
+                .connection
+                .execute_batch("COMMIT")
+                .await
+                .map_err(storage_error),
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK").await;
+                Err(Error::storage(format!(
+                    "migration {name} failed and was rolled back: {}",
+                    error.message
+                )))
+            }
+        }
+    }
+
+    /// Splits a migration into statements, dropping any `ALTER TABLE ...
+    /// ADD COLUMN` whose column already exists. Comment lines are removed
+    /// before the split so a semicolon inside a comment is not a boundary.
+    async fn recoverable_statements(&self, sql: &str) -> Result<Vec<String>> {
+        let without_comments: String = sql
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut statements = Vec::new();
+        for raw in without_comments.split(';') {
+            let statement = raw.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            if let Some((table, column)) = added_column(statement) {
+                if self.column_exists(&table, &column).await? {
+                    continue;
+                }
+            }
+            statements.push(statement.to_owned());
+        }
+        Ok(statements)
+    }
+
+    async fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
+        let mut rows = self
+            .connection
+            .query(&format!("PRAGMA table_info({table})"), ())
+            .await
+            .map_err(storage_error)?;
+        while let Some(row) = rows.next().await.map_err(storage_error)? {
+            if row.get::<String>(1).map_err(storage_error)? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub async fn applied_migrations(&self) -> Result<Vec<String>> {
@@ -172,6 +245,22 @@ pub fn storage_error(error: impl std::fmt::Display) -> Error {
     Error::storage(error.to_string())
 }
 
+/// `(table, column)` when `statement` is `ALTER TABLE <t> ADD COLUMN <c> ...`.
+fn added_column(statement: &str) -> Option<(String, String)> {
+    let words: Vec<&str> = statement.split_whitespace().collect();
+    match words.as_slice() {
+        [alter, table_kw, table, add, column_kw, column, ..]
+            if alter.eq_ignore_ascii_case("ALTER")
+                && table_kw.eq_ignore_ascii_case("TABLE")
+                && add.eq_ignore_ascii_case("ADD")
+                && column_kw.eq_ignore_ascii_case("COLUMN") =>
+        {
+            Some((table.to_string(), column.to_string()))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +289,67 @@ mod tests {
         drop(first);
         let second = Store::open(temp_location(&dir)).await.unwrap();
         assert_eq!(second.applied_migrations().await.unwrap(), applied);
+    }
+
+    #[tokio::test]
+    async fn a_half_applied_column_migration_is_recovered_on_the_next_open() {
+        // Simulate a crash after `ALTER TABLE` ran but before the ledger row
+        // was written: the column exists, the ledger does not know it.
+        let dir = tempfile::tempdir().unwrap();
+        let location = temp_location(&dir);
+        {
+            let store = Store::open(location.clone()).await.unwrap();
+            store
+                .connection()
+                .execute(
+                    "DELETE FROM gritt_schema_migrations WHERE name = ?1",
+                    turso::params!["0003_session_told_phase"],
+                )
+                .await
+                .unwrap();
+            assert!(store
+                .column_exists("gritt_sessions", "told_phase")
+                .await
+                .unwrap());
+        }
+        let store = Store::open(location).await.unwrap();
+        assert_eq!(
+            store.applied_migrations().await.unwrap(),
+            vec![
+                "0001_product_tables".to_string(),
+                "0002_content_log".to_string(),
+                "0003_session_told_phase".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_migration_leaves_no_ledger_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(temp_location(&dir)).await.unwrap();
+        let error = store
+            .apply_migration(
+                "9999_broken",
+                "CREATE TABLE gritt_x (id TEXT); SELECT * FROM no_such_table;",
+            )
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("9999_broken"));
+        assert!(!store
+            .applied_migrations()
+            .await
+            .unwrap()
+            .iter()
+            .any(|name| name == "9999_broken"));
+    }
+
+    #[test]
+    fn added_column_parses_alter_statements_only() {
+        assert_eq!(
+            added_column("ALTER TABLE gritt_sessions ADD COLUMN told_phase TEXT"),
+            Some(("gritt_sessions".into(), "told_phase".into()))
+        );
+        assert_eq!(added_column("CREATE TABLE x (id TEXT)"), None);
     }
 
     #[tokio::test]

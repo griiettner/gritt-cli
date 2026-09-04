@@ -235,6 +235,16 @@ Benchmarks: none required. Test duration for the connector crate is about
 - Claude Code approval relay through its control protocol is a candidate
   for a later ticket.
 
+## Reviewer Verdict
+
+Final typed verdict: pass. PR #4 received an initial verdict of needs-fix with seven findings. The fix commits c7cfb95, ff4dee9, and 6661df4 resolved them and the final re-review returned pass. The PR was merged into `feature/tkt-0008-gritt-cli` as bf6439d.
+
+The reviewer was Codex `gpt-5.6-sol` at medium effort, the documented
+fallback after the account rejected `gpt-6-astra`, running in a read-only
+sandbox. Before every verdict the PM independently reran `cargo fmt`,
+`cargo clippy`, the workspace tests, `gritt-agent ticket validate`, and
+`gritt-agent ticket chain-check`.
+
 ## Updates
 
 - 2026-09-04 third review fix. A known secret that begins with a dash was

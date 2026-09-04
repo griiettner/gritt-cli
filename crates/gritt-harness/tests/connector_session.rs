@@ -672,3 +672,64 @@ async fn a_connector_that_is_not_installed_leaves_no_session_row() {
     assert!(error.message.contains("not installed"), "{}", error.message);
     assert!(fx.plane.builder.store.list().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_slow_consumer_receives_every_native_event_in_order() {
+    // Well over the old 256-event channel capacity, consumed only after
+    // the producer has had time to emit everything.
+    const DELTAS: usize = 400;
+    let mut sse = String::new();
+    for index in 0..DELTAS {
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-many", "object": "chat.completion.chunk", "model": "openai/gpt-5-nano",
+            "choices": [{"index": 0, "delta": {"content": format!("t{index} ")}, "finish_reason": null}]
+        });
+        sse.push_str(&format!("data: {chunk}\n\n"));
+    }
+    let last = serde_json::json!({
+        "id": "chatcmpl-many", "object": "chat.completion.chunk", "model": "openai/gpt-5-nano",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    });
+    sse.push_str(&format!("data: {last}\n\ndata: [DONE]\n\n"));
+    let fx = fixture(
+        vec![FixtureResponse::sse(sse.into_bytes())],
+        ApprovalMode::DenyAll,
+        Vec::new(),
+    )
+    .await;
+    let native = fx.plane.connector(ConnectorId::Native).unwrap();
+    let mut stream = native
+        .start(TaskRequest {
+            session_id: SessionId("many-events".into()),
+            prompt: "count".into(),
+            workspace: fx.dir.path().to_path_buf(),
+            continuation: None,
+        })
+        .await
+        .unwrap();
+    // Let the whole turn run before reading a single event.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut deltas = Vec::new();
+    let mut completed = false;
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .expect("stream ends")
+    {
+        let event = item.unwrap();
+        match &event.kind {
+            EventKind::TextDelta { text } => deltas.push(text.clone()),
+            EventKind::Completed { .. } => completed = true,
+            _ => {}
+        }
+    }
+    assert!(completed, "completion event was dropped");
+    assert_eq!(
+        deltas.len(),
+        DELTAS,
+        "events were dropped: {}",
+        deltas.len()
+    );
+    for (index, delta) in deltas.iter().enumerate() {
+        assert_eq!(delta, &format!("t{index} "), "out of order at {index}");
+    }
+}

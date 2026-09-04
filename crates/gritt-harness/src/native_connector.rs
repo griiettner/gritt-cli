@@ -35,7 +35,7 @@ pub struct NativeConnector {
 }
 
 struct ChannelUi {
-    tx: mpsc::Sender<Result<Event>>,
+    tx: mpsc::UnboundedSender<Result<Event>>,
     session_id: SessionId,
     slots: Slots,
     closed: bool,
@@ -43,7 +43,10 @@ struct ChannelUi {
 
 impl Ui for ChannelUi {
     fn event(&mut self, event: &Event) {
-        if self.tx.try_send(Ok(event.clone())).is_err() && self.tx.is_closed() {
+        // Delivery is lossless: the channel is unbounded, so a slow
+        // consumer never costs an event (an approval request in
+        // particular). A send only fails once the receiver is gone.
+        if self.tx.send(Ok(event.clone())).is_err() {
             self.closed = true;
         }
     }
@@ -71,7 +74,7 @@ impl Ui for ChannelUi {
     }
 }
 
-struct Receiver(mpsc::Receiver<Result<Event>>);
+struct Receiver(mpsc::UnboundedReceiver<Result<Event>>);
 
 impl futures::Stream for Receiver {
     type Item = Result<Event>;
@@ -168,7 +171,7 @@ impl NativeConnector {
             slot.state = TaskState::Running;
             slot.last_error = None;
         }
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::unbounded_channel();
         let slots = Arc::clone(&self.slots);
         let mut ui = ChannelUi {
             tx,
