@@ -1,0 +1,6 @@
+interface:
+  display_name: "Dev"
+  short_description: "Route Gritt implementation to the cli, provider, or harness sub-skill."
+  default_prompt: "Use $dev in this repository."
+policy:
+  allow_implicit_invocation: false

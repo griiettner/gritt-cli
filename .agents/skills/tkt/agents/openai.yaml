@@ -1,0 +1,6 @@
+interface:
+  display_name: "TKT"
+  short_description: "Shared rules and routing for the .agents/tasks/ ticket lifecycle."
+  default_prompt: "Use $tkt in this repository."
+policy:
+  allow_implicit_invocation: false

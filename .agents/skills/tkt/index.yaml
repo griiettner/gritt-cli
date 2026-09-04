@@ -1,0 +1,54 @@
+subskills:
+  - id: tkt-store
+    title: Store
+    file: store/SKILL.md
+    tags:
+      - namespace
+      - id
+      - path
+    read_when:
+      - resolving a ticket id, namespace, or chunk path
+      - allocating a new ticket id
+      - deciding where a ticket folder belongs
+  - id: tkt-artifacts
+    title: Artifacts
+    file: artifacts/SKILL.md
+    tags:
+      - format
+      - frontmatter
+      - lifecycle
+    read_when:
+      - choosing slim or full ticket mode
+      - writing ticket frontmatter or status
+      - deciding which ticket files to create
+  - id: tkt-autonomy
+    title: Autonomy
+    file: autonomy/SKILL.md
+    tags:
+      - goal
+      - execution
+      - judgement
+    read_when:
+      - executing a ticket or chain step
+      - deciding whether to ask the user or decide alone
+      - tracking a goal to completion
+  - id: tkt-completion
+    title: Completion
+    file: completion/SKILL.md
+    tags:
+      - gate
+      - report
+      - update
+    read_when:
+      - closing a ticket
+      - writing report.md
+      - recording post-completion work as an update file
+  - id: tkt-backlog
+    title: Backlog
+    file: backlog/SKILL.md
+    tags:
+      - backlog
+      - deferred
+    read_when:
+      - parking deferred work
+      - activating or rejecting a BKL-XXX item

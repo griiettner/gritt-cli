@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>template check: every component</title>
+<link rel="stylesheet" href="assets/doc-theme.css">
+</head>
+
+<body>
+
+<header class="masthead">
+  <div class="masthead-inner">
+    <h1>template check</h1>
+    <span class="chip warning status-chip"><span class="dot"></span>Reference &middot; not a real doc</span>
+    <button class="theme" id="themeBtn" type="button">Dark</button>
+  </div>
+  <nav class="toc">
+    <a href="#numbers">Numbers</a>
+    <a href="#charts">Charts</a>
+    <a href="#structure">Structure</a>
+    <a href="#plans">Plans</a>
+    <a href="#text">Text</a>
+  </nav>
+</header>
+
+<div class="wrap">
+
+  <section id="numbers">
+    <h2 style="margin-top:40px">Numbers</h2>
+    <p class="lede">Every component in components.html, rendered once, with
+    placeholder data.</p>
+
+    <p>This page exists to check the extraction. Open it, toggle the theme, hover
+    a chart. If a block here looks wrong, the template is wrong. The figures are
+    the ones from the source proposal so the shapes match what was designed
+    against; they are not claims about anything.</p>
+
+    <div class="hero">
+      <p class="hero-label">Content, translation, menu, label and routing surface</p>
+      <div class="hero-row">
+        <span class="hero-figure" style="color:var(--text-muted)">~250</span>
+        <span class="hero-arrow">&rarr;</span>
+        <span class="hero-figure">12</span>
+        <span class="hero-unit">core tables</span>
+      </div>
+      <p class="hero-note">Why the number moves: the shape stops repeating, one
+      table per concept instead of one entity table plus a translation shadow per
+      content type.</p>
+    </div>
+
+    <div class="kpi-row">
+      <div class="tile">
+        <p class="t-label">Base tables in <code>public</code></p>
+        <div class="t-value">241</div>
+        <div class="t-sub">plus 144 in <code>drupal</code></div>
+      </div>
+      <div class="tile">
+        <p class="t-label">Are translation shadows</p>
+        <div class="t-value">107</div>
+        <div class="t-sub">44% of <code>public</code></div>
+      </div>
+      <div class="tile">
+        <p class="t-label">Actual translations stored</p>
+        <div class="t-value">0</div>
+        <div class="t-sub">across 640 translation rows</div>
+      </div>
+      <div class="tile">
+        <p class="t-label">Migrations ever applied</p>
+        <div class="t-value">0</div>
+        <div class="t-sub">against 294 files on disk</div>
+      </div>
+    </div>
+
+    <div class="callout">
+      <div class="ctitle">One consequence worth keeping</div>
+      <p>The default callout. Use it for the point a skimming reader must not
+      miss.</p>
+    </div>
+
+    <div class="callout warn">
+      <div class="ctitle">Technical note</div>
+      <p>The amber variant, for supporting detail that would break the flow of
+      the main argument.</p>
+    </div>
+
+    <div class="callout crit">
+      <div class="ctitle">Blocker</div>
+      <p>The red variant, for something that stops the work.</p>
+    </div>
+
+    <p>Chips, inline:
+      <span class="chip good"><span class="dot"></span>Low risk</span>
+      <span class="chip warning"><span class="dot"></span>Pain expected</span>
+      <span class="chip serious"><span class="dot"></span>Two catalogs</span>
+      <span class="chip critical"><span class="dot"></span>Blocked</span>
+      <span class="chip neutral"><span class="dot"></span>Repeatable</span>
+    </p>
+  </section>
+
+  <section id="charts">
+    <h2>Charts</h2>
+    <p class="lede">Six chart types, each in a card with its data table.</p>
+
+    <h3>Horizontal bars</h3>
+    <figure class="card">
+      <figcaption>
+        <h4>640 "translation" rows, four English copies of 160 offerings</h4>
+        <p class="sub">Every row is English. Global holds zero rows. Hover a bar,
+        including the empty ones.</p>
+      </figcaption>
+      <div id="chart-i18n"></div>
+      <details class="tableview">
+        <summary>Data table</summary>
+        <table>
+          <thead><tr><th>Territory</th><th class="num">Rows</th><th>Language</th></tr></thead>
+          <tbody>
+            <tr><td>Japan</td><td class="num">160</td><td>English</td></tr>
+            <tr><td>United Kingdom</td><td class="num">160</td><td>English</td></tr>
+            <tr><td>Canada</td><td class="num">160</td><td>English</td></tr>
+            <tr><td>Germany</td><td class="num">160</td><td>English</td></tr>
+            <tr><td>Global (<code>xx</code>)</td><td class="num">0</td><td>no rows exist</td></tr>
+            <tr><td>United States</td><td class="num">0</td><td>base table</td></tr>
+          </tbody>
+        </table>
+      </details>
+    </figure>
+
+    <h3>Stacked bar</h3>
+    <figure class="card">
+      <figcaption>
+        <h4>Nearly half of the <code>public</code> schema is duplication</h4>
+        <p class="sub">241 base tables, split by whether the table is a
+        translation shadow.</p>
+      </figcaption>
+      <div class="stack" id="stack-shape"></div>
+      <div class="legend" id="legend-shape"></div>
+      <details class="tableview">
+        <summary>Data table</summary>
+        <table>
+          <thead><tr><th>Table class</th><th class="num">Tables</th><th class="num">Share</th></tr></thead>
+          <tbody>
+            <tr><td>Translation shadow tables</td><td class="num">107</td><td class="num">44.4%</td></tr>
+            <tr><td>All other base tables</td><td class="num">134</td><td class="num">55.6%</td></tr>
+            <tr><td><strong>Total</strong></td><td class="num"><strong>241</strong></td><td class="num">100%</td></tr>
+          </tbody>
+        </table>
+      </details>
+    </figure>
+
+    <h3>Donut</h3>
+    <figure class="card">
+      <figcaption>
+        <h4>Where the 627 MB sits</h4>
+        <p class="sub">Thirteen projection tables. Hover a slice to isolate it.</p>
+      </figcaption>
+      <div id="donut-proj"></div>
+      <details class="tableview">
+        <summary>Data table</summary>
+        <table>
+          <thead><tr><th>Table</th><th class="num">Size</th></tr></thead>
+          <tbody>
+            <tr><td><code>capabilities</code></td><td class="num">214 MB</td></tr>
+            <tr><td><code>sector</code></td><td class="num">126 MB</td></tr>
+            <tr><td><code>analyst_report</code></td><td class="num">69 MB</td></tr>
+            <tr><td><code>platform</code></td><td class="num">58 MB</td></tr>
+            <tr><td><code>offering</code></td><td class="num">56 MB</td></tr>
+          </tbody>
+        </table>
+      </details>
+    </figure>
+
+    <h3>Donut, severity mix</h3>
+    <figure class="card">
+      <figcaption>
+        <h4>Twelve risks, one critical</h4>
+        <p class="sub">The one case where slice colour is semantic rather than
+        categorical.</p>
+      </figcaption>
+      <div id="donut-risk"></div>
+    </figure>
+
+    <h3>Line chart</h3>
+    <figure class="card">
+      <figcaption>
+        <h4>Seventy days of nothing, and five bulk syncs</h4>
+        <p class="sub">Rows written per day. Five non-zero days out of
+        seventy-five. Hover any day, including the empty ones.</p>
+      </figcaption>
+      <div id="line-writes"></div>
+    </figure>
+
+    <h3>Ratio</h3>
+    <figure class="card">
+      <figcaption>
+        <h4>Source rows against projected rows</h4>
+        <p class="sub">Drawn as area, because at this gap bars would clip.</p>
+      </figcaption>
+      <div id="ratio-size"></div>
+    </figure>
+
+    <h3>Meters</h3>
+    <figure class="card">
+      <figcaption>
+        <h4>What was built and never switched on</h4>
+        <p class="sub">Progress against target, where the shortfall is the
+        finding. A zero still draws a sliver.</p>
+      </figcaption>
+      <div id="meters-dead"></div>
+    </figure>
+  </section>
+
+  <section id="structure">
+    <h2>Structure</h2>
+    <p class="lede">Diagram blocks: chain, split with cell grids, and flow.</p>
+
+    <div class="diagram">
+      <h4>The fallback chain</h4>
+      <p class="sub">Resolution walks left to right and takes the first value
+      present, field by field.</p>
+      <div class="chain">
+        <div class="chain-node">
+          <div class="tier">Tier 1 &middot; most specific</div>
+          <div class="code">fr-FR</div>
+          <div class="desc">French, in France. What this territory overrode.</div>
+        </div>
+        <div class="chain-arrow">&rarr;</div>
+        <div class="chain-node">
+          <div class="tier">Tier 2</div>
+          <div class="code">fr-XX</div>
+          <div class="desc">Global French. Translated once, reused everywhere.</div>
+        </div>
+        <div class="chain-arrow">&rarr;</div>
+        <div class="chain-node">
+          <div class="tier">Tier 3</div>
+          <div class="code">en-FR</div>
+          <div class="desc">English, tailored for France.</div>
+        </div>
+        <div class="chain-arrow">&rarr;</div>
+        <div class="chain-node">
+          <div class="tier">Tier 4 &middot; baseline</div>
+          <div class="code">en-XX</div>
+          <div class="desc">Global English. Complete, so resolution terminates.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="diagram">
+      <h4>What creating a new territory costs, before and after</h4>
+      <p class="sub">The same grid drawn twice, so the difference is structural
+      rather than described.</p>
+      <div class="split">
+        <div class="panel">
+          <h5>Today: row cloning</h5>
+          <p class="pnote">Adding <code>fr</code> writes a complete duplicate row
+          per entity. Four locales, four full copies, all English.</p>
+          <div class="cellhead">
+            <div>locale</div><div>title</div><div>body</div><div>summary</div><div>cta</div>
+          </div>
+          <div class="cellrow">
+            <span class="rk">en-XX</span>
+            <span class="cell filled">set</span>
+            <span class="cell filled">set</span>
+            <span class="cell filled">set</span>
+            <span class="cell filled">set</span>
+          </div>
+          <div class="cellrow">
+            <span class="rk">fr-FR</span>
+            <span class="cell clone">copy</span>
+            <span class="cell clone">copy</span>
+            <span class="cell clone">copy</span>
+            <span class="cell clone">copy</span>
+          </div>
+          <div class="cellrow">
+            <span class="rk">ja-JP</span>
+            <span class="cell clone">copy</span>
+            <span class="cell clone">copy</span>
+            <span class="cell clone">copy</span>
+            <span class="cell clone">copy</span>
+          </div>
+        </div>
+        <div class="panel">
+          <h5>Proposed: per-field inheritance</h5>
+          <p class="pnote">The baseline is complete. Everything else stores only
+          what it overrides; a dashed cell inherits.</p>
+          <div class="cellhead">
+            <div>locale</div><div>title</div><div>body</div><div>summary</div><div>cta</div>
+          </div>
+          <div class="cellrow">
+            <span class="rk">en-XX</span>
+            <span class="cell filled">set</span>
+            <span class="cell filled">set</span>
+            <span class="cell filled">set</span>
+            <span class="cell filled">set</span>
+          </div>
+          <div class="cellrow">
+            <span class="rk">fr-FR</span>
+            <span class="cell filled">set</span>
+            <span class="cell inherit">&mdash;</span>
+            <span class="cell inherit">&mdash;</span>
+            <span class="cell inherit">&mdash;</span>
+          </div>
+          <div class="cellrow">
+            <span class="rk">ja-JP</span>
+            <span class="cell inherit">&mdash;</span>
+            <span class="cell inherit">&mdash;</span>
+            <span class="cell inherit">&mdash;</span>
+            <span class="cell inherit">&mdash;</span>
+          </div>
+        </div>
+      </div>
+      <div class="legend" style="margin-top:16px">
+        <span class="legend-item"><span class="legend-swatch" style="background:var(--series-1)"></span>Authored value</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:var(--series-2)"></span>Duplicated copy of the baseline</span>
+        <span class="legend-item"><span class="legend-swatch" style="border:1px dashed var(--axis);background:transparent"></span>Inherited, nothing stored</span>
+      </div>
+    </div>
+
+    <div class="diagram">
+      <h4>Who writes, who reads</h4>
+      <p class="sub">The orange box owns the data. The greyed row is what is
+      being retired.</p>
+      <div class="flow">
+        <div class="flow-box">
+          <div class="fb-title">Admin app</div>
+          <div class="fb-desc">Editors author here.</div>
+        </div>
+        <div class="flow-arrow">&rarr;<small>writes</small></div>
+        <div class="flow-box store">
+          <div class="fb-title"><code>app</code></div>
+          <div class="fb-desc">The single store. Same database, new schema.</div>
+        </div>
+        <div class="flow-arrow">&larr;<small>reads</small></div>
+        <div class="flow-box">
+          <div class="fb-title">V2 API &rarr; storefront</div>
+          <div class="fb-desc">One call per page render.</div>
+        </div>
+      </div>
+      <div class="flow" style="margin-top:12px">
+        <div class="flow-box dead" style="flex:1 1 100%">
+          <div class="fb-title">Drupal's own content tables: never a source of truth</div>
+          <div class="fb-desc">No dual-write, no sync job.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="plans">
+    <h2>Plans</h2>
+    <p class="lede">Phases and blockers.</p>
+
+    <div class="diagram">
+      <h4>Migration order</h4>
+      <p class="sub">One content type per phase, cheapest first.</p>
+      <div class="phases">
+        <div class="phase">
+          <span class="pname">Phase 0</span>
+          <span class="pscope">Foundation. Create the schema, seed the locale
+          tree with Global <code>xx</code>.</span>
+          <span class="chip critical"><span class="dot"></span>Blocked on 5 items</span>
+        </div>
+        <div class="phase">
+          <span class="pname">Phase 1</span>
+          <span class="pscope">Labels. <code>ui_content</code> (1,019 rows)
+          migrates into <code>label</code>.</span>
+          <span class="chip good"><span class="dot"></span>Low risk, high learning</span>
+        </div>
+        <div class="phase">
+          <span class="pname">Phase 2</span>
+          <span class="pscope">Menu and route. Three menu models consolidate
+          into one.</span>
+          <span class="chip warning"><span class="dot"></span>Reconciliation pain expected</span>
+        </div>
+        <div class="phase">
+          <span class="pname">Phase 3</span>
+          <span class="pscope">Offerings. The first content type migrates
+          read-through.</span>
+          <span class="chip serious"><span class="dot"></span>The proof</span>
+        </div>
+        <div class="phase">
+          <span class="pname">Phase n+1</span>
+          <span class="pscope">Retirement. Drop superseded tables.</span>
+          <span class="chip neutral"><span class="dot"></span>Mostly deleting unrun code</span>
+        </div>
+      </div>
+    </div>
+
+    <h3>Phase 0 is blocked on two items</h3>
+    <ol class="blockers">
+      <li>
+        <span class="bid">1</span>
+        <div>
+          <div class="btitle">DDL ledger and apply service (milestone M0)</div>
+          <div class="bdesc">Named as a gate by the design itself. Nothing
+          applies its first <code>CREATE TABLE</code> until this exists.</div>
+        </div>
+      </li>
+      <li>
+        <span class="bid">2</span>
+        <div>
+          <div class="btitle">Schema parameterisation (milestone M1)</div>
+          <div class="bdesc">Removes the three hard-codes so the engine can
+          target the new schema.</div>
+        </div>
+      </li>
+    </ol>
+  </section>
+
+  <section id="text">
+    <h2>Text</h2>
+    <p class="lede">Prose tables and code blocks.</p>
+
+    <p>Inline <code>code</code> sits in a tinted pill, so a table or column name
+    reads as an identifier rather than emphasis. A <a href="#numbers">link</a>
+    takes the orange.</p>
+
+    <div class="tscroll">
+      <table class="prose">
+        <thead><tr><th>Open item</th><th>Why it is open</th></tr></thead>
+        <tbody>
+          <tr><td>Build a locale-aware editing surface</td><td>Required before editors can use inheritance.</td></tr>
+          <tr><td>Decide how the render endpoint handles the menu tree</td><td>An API shape question, not a schema one.</td></tr>
+          <tr><td>Populate the Global-language content tier</td><td>Editorial work, not engineering.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <pre class="sql">CREATE TABLE app.content_locale (
+  id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  content_id    bigint NOT NULL REFERENCES app.content(id),
+  locale_code   text   NOT NULL REFERENCES app.content_locale_ref(code),
+  title         text,
+  body          text,
+  attributes    jsonb  NOT NULL DEFAULT '{}'::jsonb,
+  UNIQUE (content_id, locale_code)
+);</pre>
+  </section>
+
+  <footer class="pagefoot">
+    <p>Placeholder data throughout. Figures are carried over from the source
+    proposal so the component shapes match what they were designed against; this
+    page makes no claim about any database.</p>
+  </footer>
+</div>
+
+<script src="assets/doc-charts.js"></script>
+<script>
+  docCharts.hbar("chart-i18n", {
+    data: [
+      { label: "Japan", value: 160, note: "All English" },
+      { label: "United Kingdom", value: 160, note: "All English" },
+      { label: "Canada", value: 160, note: "All English" },
+      { label: "Germany", value: 160, note: "All English" },
+      { label: "Global (<code>xx</code>)", value: 0, note: "The baseline holds nothing" },
+      { label: "United States", value: 0, note: "US content is the base table itself" },
+      { label: "French, German or<br>Japanese content", value: 0, note: "Not one row exists" }
+    ],
+    max: 160, unit: "rows", ticks: [0, 80, 160]
+  });
+
+  docCharts.stacked("stack-shape", "legend-shape", [
+    { label: "Translation shadow tables", value: 107, color: "var(--series-2)" },
+    { label: "All other base tables", value: 134, color: "var(--series-1)" }
+  ]);
+
+  var PALETTE = [
+    "var(--series-1)", "var(--series-2)", "var(--series-3)",
+    "#8065bf", "#d93954", "#0089eb", "#4eb523", "#eb8c00",
+    "#7d7d7d", "#26776d", "#c52a1a", "#ffbf1f", "#afafaf"
+  ];
+  var PROJ = [
+    ["capabilities", 224395264, "214 MB", "18,059 rows"],
+    ["sector", 132120576, "126 MB", "109,897 rows"],
+    ["analyst_report", 72704000, "69 MB", "3,945 rows"],
+    ["platform", 61186048, "58 MB", "3,640 rows"],
+    ["offering", 58253312, "56 MB", "2,241 rows"],
+    ["casestudy", 47243264, "45 MB", "30,583 rows"],
+    ["practice", 33603584, "32 MB", "12,506 rows"],
+    ["corematerial", 12214272, "12 MB", "39 rows"],
+    ["contact", 6766592, "6.6 MB", "0 rows, and still 6.6 MB of empty structure"],
+    ["metric", 6389760, "6.2 MB", "10,680 rows"],
+    ["solution", 1925120, "1.9 MB", "210 rows"],
+    ["campaign", 1007616, "1.0 MB", "40 rows"],
+    ["translation", 180224, "176 kB", "199 rows"]
+  ];
+  docCharts.donut("donut-proj", {
+    data: PROJ.map(function (p, i) {
+      return { label: "<code>" + p[0] + "</code>", value: p[1], color: PALETTE[i],
+               display: p[2], note: p[3] };
+    }),
+    valueLabel: function (d) { return d.display; },
+    centerValue: "627 MB", centerLabel: "across 13 projection tables",
+    aria: "Donut chart of projection table sizes, totalling 627 MB"
+  });
+
+  docCharts.donut("donut-risk", {
+    data: [
+      { label: "Critical", value: 1, color: "var(--critical)",
+        note: "Locale-code canonical form is not enforced" },
+      { label: "Serious", value: 1, color: "var(--serious)",
+        note: "Two locale catalogs running at once" },
+      { label: "Warning", value: 10, color: "var(--warning)",
+        note: "Accepted trades and unfunded content work" }
+    ],
+    valueLabel: function (d) { return docCharts.fmt(d.value); },
+    centerValue: "12", centerLabel: "identified risks",
+    aria: "Donut chart of 12 risks by severity: 1 critical, 1 serious, 10 warning"
+  });
+
+  var WRITE_SPIKES = { 12: 4, 47: 10, 56: 212, 61: 2, 73: 15 };
+  var MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  var writeSeries = [];
+  for (var wi = 0; wi < 75; wi++) {
+    var wd = new Date(2026, 4, 22 + wi);
+    writeSeries.push({
+      x: wd.getDate() + " " + MON[wd.getMonth()] + " 2026",
+      y: WRITE_SPIKES[wi] || 0
+    });
+  }
+  docCharts.lineChart("line-writes", {
+    data: writeSeries,
+    max: 240, yTicks: [0, 60, 120, 180, 240],
+    xTicks: [
+      { i: 0, label: "22 May", anchor: "start" },
+      { i: 10, label: "1 Jun" },
+      { i: 40, label: "1 Jul" },
+      { i: 71, label: "1 Aug" }
+    ],
+    unit: "rows",
+    aria: "Line chart of rows written per day, five non-zero days in 75"
+  });
+
+  docCharts.ratio("ratio-size", {
+    data: [
+      { label: "Source rows in <code>offering</code>", value: 243,
+        display: "243", note: "What actually exists" },
+      { label: "Projected rows materialised", value: 48000,
+        display: "48,000", note: "entity x territory x locale" }
+    ]
+  });
+
+  docCharts.meters("meters-dead", [
+    { label: "<code>refresh_content_mapping_*</code> functions deployed",
+      value: 0, max: 40, color: "var(--critical)", track: "var(--track-critical)" },
+    { label: "<code>content_mapping_*</code> tables present (both empty)",
+      value: 2, max: 12, color: "var(--critical)", track: "var(--track-critical)" },
+    { label: "Migration files ever applied by the runner",
+      value: 0, max: 294, color: "var(--critical)", track: "var(--track-critical)" },
+    { label: "V2 content types that resolve",
+      value: 2, max: 12, color: "var(--critical)", track: "var(--track-critical)" },
+    { label: "Phase 0 blockers still open",
+      value: 2, max: 3, color: "var(--warning)", track: "var(--track-warning)" }
+  ]);
+</script>
+
+</body>
+</html>

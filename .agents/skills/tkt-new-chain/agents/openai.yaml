@@ -1,0 +1,6 @@
+interface:
+  display_name: "TKT New Chain"
+  short_description: "Create a ticket scoped for tkt-exec-chain sequencing."
+  default_prompt: "Use $tkt-new-chain in this repository."
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls *)",
+      "Bash(rg *)",
+      "Bash(find *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git add *)",
+      "Bash(node .agents/tools/agent-tools/create-skill.mjs *)",
+      "Bash(node .agents/tools/agent-tools/trust-codex-project.mjs *)",
+      "Bash(node .agents/tools/agent-tools/sync-skills.mjs *)",
+      "Bash(node .agents/tools/agent-tools/tkt-sync.mjs)",
+      "Bash(node .agents/tools/agent-tools/tkt-validate.mjs *)",
+      "Read(.agents/**)",
+      "Read(.claude/**)",
+      "Edit(.agents/tasks/**)",
+      "Write(.agents/tasks/**)",
+      "Edit(.agents/memory/**)",
+      "Write(.agents/memory/**)",
+      "Edit(.agents/skills/**)",
+      "Write(.agents/skills/**)",
+      "Edit(.claude/**)",
+      "Write(.claude/**)",
+      "Edit(AGENTS.md)",
+      "Edit(CLAUDE.md)",
+      "Edit(README.md)"
+    ]
+  }
+}

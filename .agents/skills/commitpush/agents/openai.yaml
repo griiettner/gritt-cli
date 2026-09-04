@@ -1,0 +1,6 @@
+interface:
+  display_name: "Commit Push"
+  short_description: "Commit staged changes, push, and open a GitHub PR."
+  default_prompt: "Use $commitpush in this repository."
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,19 @@
+schema_version: 1
+slug: gritt-cli
+display_name: gritt-cli
+collection: projects_grittflow_gritt-cli
+aliases: []
+allow:
+- .agents/memory
+- .agents/plans
+- .agents/tasks
+extensions:
+- md
+- mdx
+- markdown
+- txt
+- yml
+- yaml
+ignore:
+- .agents/plans/archive
+respect_gitignore: true

@@ -1,0 +1,6 @@
+interface:
+  display_name: "TKT Exec Chain"
+  short_description: "Run a ticket as a PM -> worker -> reviewer branch/PR chain."
+  default_prompt: "Use $tkt-exec-chain in this repository."
+policy:
+  allow_implicit_invocation: false

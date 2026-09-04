@@ -1,0 +1,6 @@
+interface:
+  display_name: "TKT Plan"
+  short_description: "Write a decision-complete plan.md for a ticket."
+  default_prompt: "Use $tkt-plan in this repository."
+policy:
+  allow_implicit_invocation: true

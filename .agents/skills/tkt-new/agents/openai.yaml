@@ -1,0 +1,6 @@
+interface:
+  display_name: "TKT New"
+  short_description: "Create a new ticket under .agents/tasks/."
+  default_prompt: "Use $tkt-new in this repository."
+policy:
+  allow_implicit_invocation: true

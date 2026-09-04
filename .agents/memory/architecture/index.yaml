@@ -1,0 +1,25 @@
+memories:
+  - id: architecture-model-routing
+    title: Agent model and CLI routing
+    file: model-routing.md
+    tags:
+      - agents
+      - models
+      - cli
+      - workflow
+    read_when:
+      - changing subagent routing
+      - adding a model or CLI backend
+      - diagnosing delegation or model-slug failures
+  - id: architecture-overview
+    title: Architecture overview
+    file: overview.md
+    tags:
+      - architecture
+      - routing
+      - scaffolding
+    read_when:
+      - changing folder structure
+      - deciding where project knowledge should live
+      - creating new agent workflows
+      - evaluating whether a file belongs in skills, memory, or tasks

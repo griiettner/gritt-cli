@@ -1,0 +1,6 @@
+interface:
+  display_name: "Write"
+  short_description: "Cut AI tells and humanize prose."
+  default_prompt: "Use $write in this repository."
+policy:
+  allow_implicit_invocation: true

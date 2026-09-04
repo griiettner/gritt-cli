@@ -1,0 +1,6 @@
+interface:
+  display_name: "TKT Sync"
+  short_description: "Regenerate helper ticket and memory indexes."
+  default_prompt: "Use $tkt-sync in this repository."
+policy:
+  allow_implicit_invocation: true

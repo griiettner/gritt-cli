@@ -1,0 +1,6 @@
+interface:
+  display_name: "TKT Update"
+  short_description: "Record a later fix, comment, or regression on a ticket."
+  default_prompt: "Use $tkt-update in this repository."
+policy:
+  allow_implicit_invocation: true

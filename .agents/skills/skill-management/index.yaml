@@ -1,0 +1,11 @@
+subskills:
+  - id: skill-management-audit
+    title: Audit
+    file: audit/SKILL.md
+    tags:
+      - audit
+      - review
+    read_when:
+      - reviewing or tightening a skill
+      - checking a skill against skill-management rules
+      - before handing off a new or edited skill

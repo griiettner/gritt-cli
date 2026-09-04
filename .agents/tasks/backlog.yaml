@@ -1,0 +1,19 @@
+# yaml-language-server: $schema=../schemas/backlog.schema.json
+# Parked backlog: items deliberately deferred, not scheduled as tickets.
+# This is a parking lot, not a source of truth for decisions — accepted
+# decisions live under .agents/memory/decisions/. When an item activates,
+# create a TKT and remove it from this file.
+#
+# Example entry (delete when adding real items):
+#
+#   - id: BKL-001
+#     title: Short parked idea
+#     summary: >-
+#       One or two lines on what the idea is.
+#     parked_reason: Why it is not a ticket right now.
+#     revisit_when: >-
+#       The concrete trigger that should reactivate this item.
+#     references:
+#       - .agents/memory/decisions/ADR-002-memory-routing.md
+
+items: []

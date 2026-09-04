@@ -1,0 +1,6 @@
+interface:
+  display_name: "TKT Exec"
+  short_description: "Execute a ticket from its task.md and preserve completion context."
+  default_prompt: "Use $tkt-exec in this repository."
+policy:
+  allow_implicit_invocation: false

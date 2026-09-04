@@ -1,0 +1,63 @@
+subskills:
+  - id: write-process
+    title: Process
+    file: process/SKILL.md
+    tags:
+      - process
+      - rewrite
+    read_when:
+      - starting any write pass
+      - delivering a draft, audit, and final rewrite
+  - id: write-voice
+    title: Voice
+    file: voice/SKILL.md
+    tags:
+      - voice
+      - soul
+      - sample
+    read_when:
+      - matching a writing sample
+      - deciding whether to add personality
+      - checking false positives before rewriting
+  - id: write-content
+    title: Content
+    file: content/SKILL.md
+    tags:
+      - puffery
+      - promotional
+    read_when:
+      - significance inflation, name-dropping, or promo tone
+      - -ing padding, weasel words, or formulaic challenge sections
+  - id: write-language
+    title: Language
+    file: language/SKILL.md
+    tags:
+      - vocabulary
+      - grammar
+    read_when:
+      - AI vocabulary, copula avoidance, or synonym cycling
+      - jargon, passive voice, or vague feeling-talk
+  - id: write-style
+    title: Style
+    file: style/SKILL.md
+    tags:
+      - dashes
+      - formatting
+    read_when:
+      - em dashes, colons, bold, lists, headings, emoji, or curly quotes
+  - id: write-communication
+    title: Communication
+    file: communication/SKILL.md
+    tags:
+      - chatbot
+      - tone
+    read_when:
+      - chatbot leftovers, cutoff disclaimers, or sycophancy
+  - id: write-filler
+    title: Filler
+    file: filler/SKILL.md
+    tags:
+      - filler
+      - hedging
+    read_when:
+      - hedging, generic endings, signposting, or manufactured drama

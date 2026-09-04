@@ -1,0 +1,20 @@
+memories:
+  - id: ADR-001
+    title: Agent ticket lifecycle
+    file: ADR-001-agent-ticket-lifecycle.md
+    tags: []
+    read_when: []
+  - id: ADR-002
+    title: Memory routing
+    file: ADR-002-memory-routing.md
+    tags: []
+    read_when: []
+  - id: ADR-003
+    title: Ticket id format and chunked task folders
+    file: ADR-003-ticket-id-and-chunking.md
+    tags:
+      - tasks
+      - routing
+    read_when:
+      - Creating, locating, or migrating a ticket folder
+      - Changing ticket routing or index generation

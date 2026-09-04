@@ -1,0 +1,19 @@
+brain:
+  - id: brain-index
+    file: README.md
+    purpose: Entry point and routing
+  - id: brain-architecture
+    file: architecture.md
+    purpose: Storage, indexing, and MCP relationships
+  - id: brain-capabilities
+    file: capabilities.md
+    purpose: Required and optional capabilities
+  - id: brain-providers
+    file: providers.md
+    purpose: Provider and network policy
+  - id: brain-services
+    file: services.md
+    purpose: Local service behavior
+  - id: brain-tools
+    file: tools.md
+    purpose: Commands and MCP tools

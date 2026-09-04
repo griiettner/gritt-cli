@@ -1,0 +1,6 @@
+interface:
+  display_name: "Skill Management"
+  short_description: "Manages project skills."
+  default_prompt: "Use $skill-management in this repository."
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,37 @@
+subskills:
+  - id: dev-cli
+    title: CLI
+    file: cli/SKILL.md
+    tags:
+      - rust
+      - cargo
+      - config
+      - keys
+    read_when:
+      - adding a crate, command, config option, or key source
+      - choosing print, REPL, or full-screen mode
+      - verifying a change before handoff
+  - id: dev-provider
+    title: Provider
+    file: provider/SKILL.md
+    tags:
+      - openrouter
+      - openai
+      - anthropic
+      - sse
+    read_when:
+      - editing an adapter, the model list cache, or a normalizer
+      - parsing streamed events or generating tool schemas
+      - recording or replaying provider fixtures
+  - id: dev-harness
+    title: Harness
+    file: harness/SKILL.md
+    tags:
+      - tui
+      - permissions
+      - sessions
+      - connectors
+    read_when:
+      - editing the terminal UI, approvals, or cancellation
+      - changing session storage or built-in tools
+      - adding or supervising an external agent connector

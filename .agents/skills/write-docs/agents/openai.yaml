@@ -1,0 +1,6 @@
+interface:
+  display_name: "Write Docs"
+  short_description: "Writes paired Markdown and HTML docs for documentation, proposals, comparisons, and findings."
+  default_prompt: "Use $write-docs in this repository."
+policy:
+  allow_implicit_invocation: false

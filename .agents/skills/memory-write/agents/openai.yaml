@@ -1,0 +1,6 @@
+interface:
+  display_name: "Memory Write"
+  short_description: "Write durable project knowledge into .agents/memory/."
+  default_prompt: "Use $memory-write in this repository."
+policy:
+  allow_implicit_invocation: true
