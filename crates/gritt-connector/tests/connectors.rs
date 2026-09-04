@@ -790,6 +790,22 @@ async fn credential_bearing_extra_args_are_refused() {
     };
     assert!(validate_extra_args(&settings, &[]).is_err());
 
+    // A known secret that begins with a dash parses as an option; the error
+    // must still never carry it, in Display or Debug.
+    let settings = ConnectorSettings {
+        extra_args: BTreeMap::from([("codex".to_owned(), vec!["-sk-abc".to_owned()])]),
+        ..ConnectorSettings::default()
+    };
+    let error = validate_extra_args(&settings, &[Secret::new("-sk-abc")]).unwrap_err();
+    assert_eq!(error.kind, gritt_core::ErrorKind::Config);
+    assert!(
+        error.message.contains("[redacted argument]"),
+        "{}",
+        error.message
+    );
+    assert!(!error.to_string().contains("sk-abc"), "{error}");
+    assert!(!format!("{error:?}").contains("sk-abc"), "{error:?}");
+
     let settings = ConnectorSettings {
         extra_args: BTreeMap::from([(
             "codex".to_owned(),

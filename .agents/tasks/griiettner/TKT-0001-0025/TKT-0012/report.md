@@ -237,6 +237,10 @@ Benchmarks: none required. Test duration for the connector crate is about
 
 ## Updates
 
+- 2026-09-04 third review fix. A known secret that begins with a dash was
+  parsed as an option and formatted into the `extra_args` refusal message;
+  the leak branch now always shows `[redacted argument]`, with a regression
+  test covering Display and Debug.
 - 2026-09-04 second review fix round. Two findings: a credential-like option
   in `extra_args` is now refused whether its value is attached or split
   into the next token, and launch diagnostics keep option names only, with

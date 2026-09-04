@@ -85,9 +85,13 @@ pub fn validate_extra_args(settings: &ConnectorSettings, secrets: &[Secret]) -> 
                 .iter()
                 .any(|secret| !secret.is_empty() && arg.contains(secret.expose()));
             if is_credential_option(arg) || leaks {
-                // Only the flag name is worth showing; a bare value is a
-                // secret by construction.
-                let shown = if is_option(arg) {
+                // Only a flag name is worth showing, and only when the
+                // argument does not carry a known secret: a secret that
+                // begins with `-` parses as an option, so the `leaks`
+                // branch always uses a fixed placeholder.
+                let shown = if leaks {
+                    "[redacted argument]".to_owned()
+                } else if is_option(arg) {
                     format!("`{} ...`", option_name(arg))
                 } else {
                     "a bare value".to_owned()
