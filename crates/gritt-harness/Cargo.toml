@@ -1,0 +1,19 @@
+[package]
+name = "gritt-harness"
+description = "Terminal interface, policy engine, session store, and built-in tools for Gritt."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+gritt-core = { workspace = true }
+gritt-provider = { workspace = true }
+dirs = { workspace = true }
+tokio = { workspace = true }
+turso = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
