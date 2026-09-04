@@ -277,25 +277,25 @@ struct CursorArgs {
     no_sync: bool,
 }
 
-fn run(cli: Cli) -> Result<i32> {
+async fn run(cli: Cli) -> Result<i32> {
     let resolve = || repo::resolve_root(cli.repo_root.as_deref());
     match cli.command {
         Command::Memory { command } => {
             let repo = resolve()?;
             match command {
                 MemoryCommand::Index => {
-                    let summary = index::index_workspace(&repo)?;
+                    let summary = index::index_workspace(&repo).await?;
                     index::report(&summary);
                     Ok(0)
                 }
                 MemoryCommand::Search { query, limit } => {
-                    let connection = db::open(&repo)?;
-                    let hits = search::search(&connection, &query, usize::from(limit))?;
+                    let connection = db::open(&repo).await?;
+                    let hits = search::search(&connection, &query, usize::from(limit)).await?;
                     println!("{}", search::format_hits(&hits));
                     Ok(0)
                 }
                 MemoryCommand::Serve => {
-                    mcp::serve(&repo)?;
+                    mcp::serve(&repo).await?;
                     Ok(0)
                 }
             }
@@ -409,9 +409,10 @@ fn run(cli: Cli) -> Result<i32> {
     }
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(cli) {
+    match run(cli).await {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(error) => {
             eprintln!("error: {error}");

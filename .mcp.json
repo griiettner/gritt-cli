@@ -3,6 +3,15 @@
     "gritt-local-memory": {
       "command": ".agents/cli/target/release/gritt-agent",
       "args": ["memory", "serve"]
+    },
+    "turso-local-memory": {
+      "command": "tursodb",
+      "args": [
+        "--readonly",
+        "--experimental-index-method",
+        ".agents/brain/data/agent-memory.db",
+        "--mcp"
+      ]
     }
   }
 }

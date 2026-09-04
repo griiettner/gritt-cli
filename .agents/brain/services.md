@@ -7,7 +7,6 @@ tags:
   - agent-brain
   - services
   - mcp
-  - turso
 read_when:
   - starting or diagnosing local agent services
   - changing MCP startup
@@ -18,14 +17,15 @@ read_when:
 
 | Service                  | Default                | Purpose                                        |
 | ------------------------ | ---------------------- | ---------------------------------------------- |
-| Local SQLite file        | enabled                | Stores indexed documents and chunks            |
+| Local Turso file         | enabled                | Stores indexed documents and chunks            |
 | Workspace indexer        | manual and MCP startup | Synchronizes supported files into the database |
 | `gritt-local-memory` MCP | project-configured     | Exposes local search and document tools        |
 | Local embeddings         | not implemented        | Reserved schema column only                    |
 
-The database is a plain SQLite file opened by the bundled SQLite inside
-`gritt-agent`. No cloud URL, authentication token, or remote endpoint is
-configured, and the CLI makes no network requests.
+The database is a local file opened by the embedded Turso engine inside
+`gritt-agent`. The crate's Cloud sync feature is disabled. No cloud URL,
+authentication token, or remote endpoint is configured, and the CLI makes no
+network requests.
 
 Generated database state belongs in `.agents/brain/data/agent-memory.db` and
 must not be committed. The root `.gitignore` excludes that directory.

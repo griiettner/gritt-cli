@@ -48,3 +48,20 @@ tickets:
     dependencies: []
     areas: []
     skills: []
+  - id: TKT-0004
+    namespace: griiettner
+    title: Close brain doc gaps and evaluate a Turso-backed local memory store
+    status: done
+    owner: griiettner
+    priority: normal
+    created: 2026-09-04
+    updated: 2026-09-04
+    artifacts:
+      concept: .agents/tasks/griiettner/TKT-0001-0025/TKT-0004/concept.md
+      plan: .agents/tasks/griiettner/TKT-0001-0025/TKT-0004/plan.md
+      task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0004/task.md
+      report: .agents/tasks/griiettner/TKT-0001-0025/TKT-0004/report.md
+      updates: .agents/tasks/griiettner/TKT-0001-0025/TKT-0004/updates/
+    dependencies: []
+    areas: []
+    skills: []

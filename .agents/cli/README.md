@@ -88,7 +88,7 @@ src/
   frontmatter.rs     restricted YAML frontmatter parser shared by tickets and memory
   fsx.rs             sorted directory listing, posix relative paths, file helpers
   repo.rs            repository root discovery and date helpers
-  memory/            chunking, SQLite schema, indexer, FTS5 search, MCP server
+  memory/            chunking, Turso schema, indexer, FTS search, MCP server
   ticket/            id and chunk rules, identity, allocation, shared scaffold frontmatter, chains, chain check, sync, validation
   skill/             skill scaffold, Claude stub and Codex metadata generation
   codex/             config.toml trust entry editing
@@ -133,7 +133,8 @@ Registry crates only, no Git dependencies:
 | Crate | Purpose | License |
 | --- | --- | --- |
 | clap | argument parsing | MIT OR Apache-2.0 |
-| rusqlite (`bundled`) | SQLite with FTS5 compiled in | MIT |
+| tokio | async runtime for the embedded database | MIT |
+| turso 0.7.2 (`sync` disabled) | local database and FTS engine | MIT |
 | regex | validation patterns | MIT OR Apache-2.0 |
 | serde, serde_json | MCP JSON-RPC messages | MIT OR Apache-2.0 |
 | sha2 | content hashes | MIT OR Apache-2.0 |

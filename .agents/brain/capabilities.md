@@ -19,7 +19,7 @@ read_when:
 
 - Index supported workspace documents.
 - Split documents into line-addressable chunks.
-- Search indexed chunks with SQLite FTS5.
+- Search indexed chunks with local Turso FTS.
 - Read an indexed document.
 - Return source paths and line ranges for retrieved chunks.
 - Rebuild the local index.

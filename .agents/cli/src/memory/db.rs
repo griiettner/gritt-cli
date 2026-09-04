@@ -1,9 +1,9 @@
-//! SQLite connection and schema management for the local memory database.
+//! Turso connection and schema management for the local memory database.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use turso::{Builder, Connection};
 
 use crate::Result;
 
@@ -17,40 +17,49 @@ pub fn database_path(repo: &Path) -> PathBuf {
 }
 
 /// Opens the database, creating the data directory and schema when needed.
-pub fn open(repo: &Path) -> Result<Connection> {
+pub async fn open(repo: &Path) -> Result<Connection> {
     let path = database_path(repo);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let connection = Connection::open(&path)?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
-    connection.execute_batch(SCHEMA)?;
-    ensure_migrations(&connection)?;
+    let database = Builder::new_local(&path.to_string_lossy())
+        .experimental_index_method(true)
+        .build()
+        .await?;
+    let connection = database.connect()?;
+    connection.execute_batch(SCHEMA).await?;
+    ensure_migrations(&connection).await?;
     Ok(connection)
 }
 
 /// Opens an in-memory database with the schema applied. Used by tests.
-pub fn open_in_memory() -> Result<Connection> {
-    let connection = Connection::open_in_memory()?;
-    connection.execute_batch(SCHEMA)?;
+pub async fn open_in_memory() -> Result<Connection> {
+    let database = Builder::new_local(":memory:")
+        .experimental_index_method(true)
+        .build()
+        .await?;
+    let connection = database.connect()?;
+    connection.execute_batch(SCHEMA).await?;
     Ok(connection)
 }
 
-fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let names = statement.query_map([], |row| row.get::<_, String>(1))?;
-    for name in names {
-        if name? == column {
+async fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut rows = connection
+        .query(format!("PRAGMA table_info({table})"), ())
+        .await?;
+    while let Some(row) = rows.next().await? {
+        if row.get::<String>(1)? == column {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-fn ensure_migrations(connection: &Connection) -> Result<()> {
-    if !table_has_column(connection, "document_chunks", "embedding")? {
+async fn ensure_migrations(connection: &Connection) -> Result<()> {
+    if !table_has_column(connection, "document_chunks", "embedding").await? {
         connection
-            .execute_batch("ALTER TABLE document_chunks ADD COLUMN embedding F32_BLOB(1536)")?;
+            .execute_batch("ALTER TABLE document_chunks ADD COLUMN embedding F32_BLOB(1536)")
+            .await?;
     }
     Ok(())
 }

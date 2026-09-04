@@ -6,7 +6,6 @@ date: 2026-08-13
 tags:
   - agent-brain
   - architecture
-  - turso
   - mcp
 read_when:
   - changing agent awareness or retrieval
@@ -23,9 +22,9 @@ Workspace files
 Local indexer
       |
       v
-SQLite file database
+Local Turso file database
       |
-      +--> SQLite FTS5 lexical search
+      +--> Turso FTS lexical search
       |
       +--> reserved F32_BLOB vector column (unused)
       |
@@ -41,13 +40,14 @@ Local MCP server
 - `.agents/brain/` documents agent infrastructure.
 - `.agents/memory/` stores project knowledge and architectural decisions.
 - `.agents/cli/` contains the `gritt-agent` binary that indexes, searches, and serves memory.
-- `.agents/tools/` contains the remaining Node scaffolding scripts.
+- `.agents/tools/` holds only a README that points at the CLI. The Node
+  scripts it once held were ported into `gritt-agent` and removed.
 - `.agents/brain/data/` contains developer-local generated state and is
   ignored by Git.
 
 ## Retrieval policy
 
-FTS5 is the required baseline and the only retrieval path the CLI implements.
+Turso FTS is the required baseline and the only retrieval path the CLI implements.
 If embeddings or reranking are added later, vector search must never be
 required to index or retrieve workspace knowledge, and any provider failure
-must fall back to FTS5.
+must fall back to local Turso FTS.

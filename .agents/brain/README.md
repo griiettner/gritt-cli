@@ -68,11 +68,11 @@ Workspace files
 gritt-agent memory index
       |
       v
-SQLite file (.agents/brain/data/agent-memory.db)
+Local Turso file (.agents/brain/data/agent-memory.db)
       |
       +--> document metadata
       +--> line-addressable chunks
-      +--> SQLite FTS5 indexes
+      +--> Turso FTS indexes
       +--> reserved vector column (unused)
       |
       v
@@ -87,11 +87,11 @@ The implementation lives in the `gritt-agent` crate:
 ```text
 .agents/cli/src/memory/
 ├── chunk.rs      Document chunking
-├── db.rs         SQLite connection and schema initialization
+├── db.rs         Turso connection and schema initialization
 ├── index.rs      Workspace indexer
 ├── mcp.rs        Stdio MCP server
 ├── schema.sql    Database schema
-└── search.rs     FTS5 retrieval
+└── search.rs     Turso FTS retrieval
 ```
 
 Generated state is stored at:
@@ -147,7 +147,7 @@ Documents are split into line-addressable chunks:
 .agents/brain/README.md:67-82
 ```
 
-Retrieval uses FTS5 over these chunks. Every query term must match. There is
+Retrieval uses Turso FTS over these chunks. Every query term must match. There is
 no query expansion and no generative model.
 
 ## Quick start
@@ -210,10 +210,10 @@ This avoids repeatedly rediscovering project knowledge from source files.
 ## Environment and providers
 
 The current CLI reads no provider configuration. Indexing and search are
-local SQLite operations, so the default and only mode is:
+local Turso operations, so the default and only mode is:
 
 ```text
-Local SQLite + FTS5 + MCP
+Local Turso + FTS + MCP
 No embeddings
 No reranking
 No query expansion
@@ -232,12 +232,13 @@ The local schema contains:
 | --------------------- | ----------------------------------- |
 | `documents`           | One row per indexed source file     |
 | `document_chunks`     | Line-addressable content chunks     |
-| `documents_fts`       | File-level FTS5 index               |
-| `document_chunks_fts` | Chunk retrieval index               |
+| `documents_turso_fts`       | File-level Turso FTS index          |
+| `document_chunks_turso_fts` | Chunk retrieval index               |
 | `index_runs`          | Index execution history             |
 
-SQLite is compiled into the binary through the `rusqlite` bundled build with
-FTS5 enabled. No system SQLite is required.
+Turso 0.7.2 is compiled into the binary with local FTS enabled and Cloud sync
+disabled. No system database, account, credentials, or network access is
+required.
 
 ## Troubleshooting
 

@@ -23,20 +23,11 @@ CREATE TABLE IF NOT EXISTS document_chunks (
   UNIQUE(document_id, chunk_index)
 );
 
-CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-  title,
-  content,
-  path UNINDEXED,
-  content='documents',
-  content_rowid='id'
-);
+CREATE INDEX IF NOT EXISTS documents_turso_fts ON documents USING fts(title, content)
+  WITH (weights = 'title=10.0,content=1.0');
 
-CREATE VIRTUAL TABLE IF NOT EXISTS document_chunks_fts USING fts5(
-  heading,
-  content,
-  content='document_chunks',
-  content_rowid='id'
-);
+CREATE INDEX IF NOT EXISTS document_chunks_turso_fts ON document_chunks USING fts(heading, content)
+  WITH (weights = 'heading=10.0,content=1.0');
 
 CREATE TABLE IF NOT EXISTS index_runs (
   id INTEGER PRIMARY KEY,

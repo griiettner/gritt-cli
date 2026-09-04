@@ -29,3 +29,14 @@ memories:
       - changing local memory indexing, search, or the MCP server
       - adding or replacing a repository maintenance command
       - deciding where repository tooling code lives
+  - id: ADR-005
+    title: Local Turso memory store
+    file: ADR-005-local-turso-memory-store.md
+    tags:
+      - memory
+      - turso
+      - local-first
+    read_when:
+      - changing the local memory database
+      - adding memory synchronization or credentials
+      - changing full-text retrieval

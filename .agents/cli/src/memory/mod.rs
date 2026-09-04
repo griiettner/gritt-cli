@@ -1,4 +1,4 @@
-//! Local memory: SQLite FTS5 index over project documents plus the MCP server.
+//! Local memory: Turso FTS index over project documents plus the MCP server.
 
 pub mod chunk;
 pub mod db;

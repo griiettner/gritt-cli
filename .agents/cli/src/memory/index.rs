@@ -1,11 +1,11 @@
-//! Workspace indexer: walks supported documents into the SQLite database.
+//! Workspace indexer: walks supported documents into the Turso database.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
+use turso::{params, Connection};
 
 use super::chunk::chunk_document;
 use super::db;
@@ -86,7 +86,7 @@ fn source_mtime_ms(path: &Path) -> i64 {
         .unwrap_or(0)
 }
 
-fn index_file(connection: &Connection, root: &Path, file: &Path) -> Result<()> {
+async fn index_file(connection: &Connection, root: &Path, file: &Path) -> Result<()> {
     let bytes = fs::read(file)?;
     let content = String::from_utf8_lossy(&bytes).into_owned();
     let relative = relative_posix(root, file);
@@ -97,17 +97,21 @@ fn index_file(connection: &Connection, root: &Path, file: &Path) -> Result<()> {
     let content_hash = sha256_hex(content.as_bytes());
     let source_mtime = source_mtime_ms(file);
 
-    let existing_hash: Option<String> = connection
-        .query_row(
+    let mut existing_rows = connection
+        .query(
             "SELECT content_hash FROM documents WHERE path = ?1",
-            params![relative],
-            |row| row.get(0),
+            params![relative.clone()],
         )
-        .ok();
+        .await?;
+    let existing_hash = match existing_rows.next().await? {
+        Some(row) => Some(row.get::<String>(0)?),
+        None => None,
+    };
     let unchanged = existing_hash.as_deref() == Some(content_hash.as_str());
 
-    connection.execute(
-        "INSERT INTO documents(path, title, content, content_hash, source_mtime)
+    connection
+        .execute(
+            "INSERT INTO documents(path, title, content, content_hash, source_mtime)
          VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(path) DO UPDATE SET
            title = excluded.title,
@@ -116,67 +120,79 @@ fn index_file(connection: &Connection, root: &Path, file: &Path) -> Result<()> {
            source_mtime = excluded.source_mtime,
            updated_at = CURRENT_TIMESTAMP
          WHERE documents.content_hash <> excluded.content_hash",
-        params![relative, title, content, content_hash, source_mtime],
-    )?;
+            params![
+                relative.clone(),
+                title,
+                content.clone(),
+                content_hash.clone(),
+                source_mtime
+            ],
+        )
+        .await?;
     if unchanged {
         return Ok(());
     }
 
-    let document_id: i64 = connection.query_row(
-        "SELECT id FROM documents WHERE path = ?1",
-        params![relative],
-        |row| row.get(0),
-    )?;
+    let mut rows = connection
+        .query(
+            "SELECT id FROM documents WHERE path = ?1",
+            params![relative],
+        )
+        .await?;
+    let document_id = rows
+        .next()
+        .await?
+        .ok_or_else(|| CliError::new("indexed document row is missing"))?
+        .get::<i64>(0)?;
     let chunks = chunk_document(&content);
-    let mut upsert = connection.prepare_cached(
-        "INSERT INTO document_chunks(
+    connection
+        .execute(
+            "DELETE FROM document_chunks WHERE document_id = ?1",
+            params![document_id],
+        )
+        .await?;
+    let mut upsert = connection
+        .prepare_cached(
+            "INSERT INTO document_chunks(
            document_id, chunk_index, heading, start_line, end_line, content, content_hash
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT(document_id, chunk_index) DO UPDATE SET
-           heading = excluded.heading,
-           start_line = excluded.start_line,
-           end_line = excluded.end_line,
-           content = excluded.content,
-           content_hash = excluded.content_hash,
-           embedding = CASE
-             WHEN document_chunks.content_hash = excluded.content_hash
-             THEN document_chunks.embedding
-             ELSE NULL
-           END",
-    )?;
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .await?;
     for (chunk_index, chunk) in chunks.iter().enumerate() {
-        upsert.execute(params![
-            document_id,
-            chunk_index as i64,
-            chunk.heading,
-            chunk.start_line as i64,
-            chunk.end_line as i64,
-            chunk.content,
-            sha256_hex(chunk.content.as_bytes()),
-        ])?;
+        upsert
+            .execute(params![
+                document_id,
+                chunk_index as i64,
+                chunk.heading.clone(),
+                chunk.start_line as i64,
+                chunk.end_line as i64,
+                chunk.content.clone(),
+                sha256_hex(chunk.content.as_bytes()),
+            ])
+            .await?;
     }
-    connection.execute(
-        "DELETE FROM document_chunks WHERE document_id = ?1 AND chunk_index >= ?2",
-        params![document_id, chunks.len() as i64],
-    )?;
     Ok(())
 }
 
 /// Indexes the workspace incrementally and records the run.
-pub fn index_workspace(repo: &Path) -> Result<IndexSummary> {
-    let connection = db::open(repo)?;
-    connection.execute("INSERT INTO index_runs(status) VALUES ('running')", [])?;
+pub async fn index_workspace(repo: &Path) -> Result<IndexSummary> {
+    let connection = db::open(repo).await?;
+    connection
+        .execute("INSERT INTO index_runs(status) VALUES ('running')", ())
+        .await?;
     let run_id = connection.last_insert_rowid();
     let files = collect_files(repo)?;
 
-    match index_files(&connection, repo, &files) {
+    match index_files(&connection, repo, &files).await {
         Ok(()) => {
-            connection.execute(
-                "UPDATE index_runs
+            connection
+                .execute(
+                    "UPDATE index_runs
                  SET completed_at = CURRENT_TIMESTAMP, files_seen = ?1, status = 'completed'
                  WHERE id = ?2",
-                params![files.len() as i64, run_id],
-            )?;
+                    params![files.len() as i64, run_id],
+                )
+                .await?;
             Ok(IndexSummary {
                 files: files.len(),
                 database: db::database_path(repo),
@@ -187,51 +203,54 @@ pub fn index_workspace(repo: &Path) -> Result<IndexSummary> {
                 "UPDATE index_runs
                  SET completed_at = CURRENT_TIMESTAMP, files_seen = ?1, status = 'failed', error = ?2
                  WHERE id = ?3",
-                params![files.len() as i64, error.message, run_id],
-            )?;
+                params![files.len() as i64, error.message.clone(), run_id],
+            ).await?;
             Err(CliError::new(format!("indexing failed: {}", error.message)))
         }
     }
 }
 
-fn index_files(connection: &Connection, repo: &Path, files: &[PathBuf]) -> Result<()> {
-    connection.execute_batch("BEGIN")?;
-    let result = (|| -> Result<()> {
-        connection.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS seen_paths(path TEXT PRIMARY KEY);
+async fn index_files(connection: &Connection, repo: &Path, files: &[PathBuf]) -> Result<()> {
+    connection.execute_batch("BEGIN").await?;
+    let result =
+        async {
+            connection
+                .execute_batch(
+                    "CREATE TEMP TABLE IF NOT EXISTS seen_paths(path TEXT PRIMARY KEY);
              DELETE FROM seen_paths;",
-        )?;
-        {
-            let mut insert =
-                connection.prepare_cached("INSERT OR IGNORE INTO seen_paths(path) VALUES (?1)")?;
-            for file in files {
-                insert.execute(params![relative_posix(repo, file)])?;
+                )
+                .await?;
+            {
+                let mut insert = connection
+                    .prepare_cached("INSERT OR IGNORE INTO seen_paths(path) VALUES (?1)")
+                    .await?;
+                for file in files {
+                    insert.execute(params![relative_posix(repo, file)]).await?;
+                }
             }
-        }
-        connection.execute(
-            "DELETE FROM documents WHERE path NOT IN (SELECT path FROM seen_paths)",
-            [],
-        )?;
-        connection.execute(
+            connection
+                .execute(
+                    "DELETE FROM documents WHERE path NOT IN (SELECT path FROM seen_paths)",
+                    (),
+                )
+                .await?;
+            connection.execute(
             "DELETE FROM document_chunks WHERE document_id NOT IN (SELECT id FROM documents)",
-            [],
-        )?;
-        for file in files {
-            index_file(connection, repo, file)?;
+            (),
+        ).await?;
+            for file in files {
+                index_file(connection, repo, file).await?;
+            }
+            Ok::<(), CliError>(())
         }
-        connection.execute_batch(
-            "INSERT INTO documents_fts(documents_fts) VALUES ('rebuild');
-             INSERT INTO document_chunks_fts(document_chunks_fts) VALUES ('rebuild');",
-        )?;
-        Ok(())
-    })();
+        .await;
     match result {
         Ok(()) => {
-            connection.execute_batch("COMMIT")?;
+            connection.execute_batch("COMMIT").await?;
             Ok(())
         }
         Err(error) => {
-            let _ = connection.execute_batch("ROLLBACK");
+            let _ = connection.execute_batch("ROLLBACK").await;
             Err(error)
         }
     }

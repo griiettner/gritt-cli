@@ -33,7 +33,7 @@ refreshes the index before accepting requests and speaks MCP over stdio.
 
 | Tool                  | Capability                                  |
 | --------------------- | ------------------------------------------- |
-| `search_local_memory` | Chunk search with SQLite FTS5               |
+| `search_local_memory` | Chunk search with local Turso FTS            |
 | `read_local_memory`   | Read one indexed workspace document         |
 
 Both tools return text with `path:start-end` citations. There is no vector

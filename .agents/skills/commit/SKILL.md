@@ -24,7 +24,7 @@ Write a conventional commit message (`feat:`, `fix:`, `chore:`, `refactor:`, `do
 - A concise subject line (≤72 chars)
 - A body with bullet points describing what changed and why
 
-**NEVER add a Co-Authored-By line or any AI/Warp, Cursor, Codex, Claude attribution.**
+Do not add a `Co-Authored-By` trailer or other AI attribution in `/commit` or `/commitpush`. An agent committing directly as part of a ticket follows its harness convention instead.
 
 ### 3. Commit
 

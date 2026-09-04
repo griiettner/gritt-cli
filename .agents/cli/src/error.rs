@@ -40,8 +40,8 @@ impl From<std::io::Error> for CliError {
     }
 }
 
-impl From<rusqlite::Error> for CliError {
-    fn from(error: rusqlite::Error) -> Self {
+impl From<turso::Error> for CliError {
+    fn from(error: turso::Error) -> Self {
         Self::new(format!("database error: {error}"))
     }
 }
