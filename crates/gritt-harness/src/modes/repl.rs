@@ -11,7 +11,9 @@ use gritt_core::event::ApprovalDecision;
 use gritt_core::session::{Phase, SessionStore};
 use gritt_core::Result;
 
-use crate::agent::{AgentBuilder, CancelHandle, NativeAgent, SessionSelector, TurnStatus, Ui};
+use crate::agent::{CancelHandle, SessionSelector, TurnStatus, Ui};
+use crate::control::ControlPlane;
+use crate::driver::Driver;
 use crate::modes::print::{read_yes_no, PrintUi, PrintUiOptions, Prompter};
 
 /// Where the binary's Ctrl-C handler finds the running turn, if any.
@@ -136,17 +138,18 @@ pub fn parse_command(line: &str) -> ReplCommand {
 pub const HELP: &str = "commands: /plan  /code  /sessions  /resume NAME  /history  /help  /quit\n\
 Ctrl-C cancels a running turn; a second Ctrl-C at the prompt quits.";
 
-/// Runs the loop until `/quit` or end of input. Returns the agent so the
-/// caller can inspect the final session.
+/// Runs the loop until `/quit` or end of input. Returns the driver so the
+/// caller can inspect the final session. Native and connector sessions
+/// run through the same loop.
 pub async fn run_repl<O: Write + Send, E: Write + Send>(
-    builder: &AgentBuilder,
-    mut agent: NativeAgent,
+    plane: &ControlPlane,
+    mut agent: Box<dyn Driver>,
     input: &LineInput,
     out: O,
     err: E,
     options: PrintUiOptions,
     cancel_slot: CancelSlot,
-) -> Result<NativeAgent> {
+) -> Result<Box<dyn Driver>> {
     let mut ui = PrintUi::new(out, err, options);
     let mut history: Vec<String> = Vec::new();
     loop {
@@ -191,27 +194,39 @@ pub async fn run_repl<O: Write + Send, E: Write + Send>(
                 let _ = writeln!(out, "phase: coding");
             }
             ReplCommand::Sessions => {
-                let sessions = builder.store.list().await?;
+                let sessions = plane.builder.store.list().await?;
                 let (out, _) = ui.parts_mut();
                 for session in sessions {
                     let _ = writeln!(
                         out,
-                        "{}  {}  {:?}  {}",
+                        "{}  {}  {:?}  {}  {}",
                         session.name,
                         &session.id.0[..8.min(session.id.0.len())],
                         session.phase,
+                        match &session.kind {
+                            gritt_core::session::SessionKind::Native {
+                                provider_profile,
+                                model,
+                            } => format!("{provider_profile}/{model}"),
+                            gritt_core::session::SessionKind::Connector { id } =>
+                                id.as_str().to_owned(),
+                        },
                         session.updated_at.to_rfc3339()
                     );
                 }
             }
             ReplCommand::Resume(name) => {
-                match builder
-                    .open(SessionSelector::Named(name.clone()), None, None, None)
+                match plane
+                    .open(SessionSelector::Named(name.clone()), None, None, None, None)
                     .await
                 {
                     Ok(resumed) => {
                         agent = resumed;
-                        let events = builder.store.read_events(&agent.session().id).await?;
+                        let events = plane
+                            .builder
+                            .store
+                            .read_events(&Driver::session(agent.as_ref()).id)
+                            .await?;
                         let (out, _) = ui.parts_mut();
                         let _ = writeln!(out, "resumed `{name}` ({} events)", events.len());
                     }

@@ -1,0 +1,2 @@
+{"type":"step_start","timestamp":1788523190000,"sessionID":"ses_opencode_0003","part":{"id":"prt_0020","messageID":"msg_0020","sessionID":"ses_opencode_0003","type":"step-start"}}
+{"type":"error","timestamp":1788523190100,"sessionID":"ses_opencode_0003","error":{"name":"ProviderAuthError","message":"provider credentials are missing"}}

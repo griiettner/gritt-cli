@@ -146,4 +146,20 @@ mod tests {
             "OPENROUTER_API_KEY"
         );
     }
+
+    #[test]
+    fn partial_connectors_sections_parse() {
+        let text =
+            "[connectors]\npty = [\"codex\"]\n[connectors.extra_args]\ncodex = [\"--full-auto\"]\n";
+        let layer = parse_toml(text, "test").unwrap();
+        let connectors = layer.connectors.unwrap();
+        assert_eq!(connectors.pty, vec!["codex".to_string()]);
+        assert_eq!(
+            connectors.extra_args["codex"],
+            vec!["--full-auto".to_string()]
+        );
+        assert!(connectors.executables.is_empty());
+        let layer = parse_toml("[connectors]\ntask_timeout_secs = 30\n", "test").unwrap();
+        assert_eq!(layer.connectors.unwrap().task_timeout_secs, Some(30));
+    }
 }

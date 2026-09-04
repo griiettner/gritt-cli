@@ -168,32 +168,9 @@ pub struct ShellOutput {
     pub cancelled: bool,
 }
 
-/// Name fragments that mark a credential. Any variable whose name
-/// contains one of these (case-insensitive), every configured profile key
-/// variable, and `AGENT_MEMORY_API_KEY` are removed from the shell child's
-/// environment so an approved command cannot hand a key back to the model.
-/// The conventional cloud and VCS names (`AWS_SECRET_ACCESS_KEY`,
-/// `GITHUB_TOKEN`, `NPM_TOKEN`) all fall under this rule.
-pub const SECRET_ENV_MARKERS: [&str; 6] =
-    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"];
-
-/// Variables that a shell needs and never carry a credential.
-const PLAIN_ENV_NAMES: [&str; 12] = [
-    "PATH", "HOME", "TMPDIR", "TEMP", "TMP", "TERM", "LANG", "USER", "SHELL", "PWD", "LOGNAME",
-    "SHLVL",
-];
-
-pub fn is_secret_env_name(name: &str, blocked: &[String]) -> bool {
-    let upper = name.to_ascii_uppercase();
-    if PLAIN_ENV_NAMES.contains(&upper.as_str()) || upper.starts_with("LC_") {
-        return false;
-    }
-    upper == "AGENT_MEMORY_API_KEY"
-        || blocked.iter().any(|known| known.eq_ignore_ascii_case(name))
-        || SECRET_ENV_MARKERS
-            .iter()
-            .any(|marker| upper.contains(marker))
-}
+/// The credential-name rule lives in `gritt-core` so the connector crate
+/// applies the same one to the environment its agents inherit.
+pub use gritt_core::secret::{is_secret_env_name, SECRET_ENV_MARKERS};
 
 /// The names in the current environment a shell child must not inherit.
 pub fn secret_env_names(blocked: &[String]) -> Vec<OsString> {

@@ -48,11 +48,20 @@ impl Default for ModelListPolicy {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ConnectorSettings {
     /// Connector name to executable path override.
     pub executables: BTreeMap<String, String>,
     pub health_check_timeout_secs: Option<u64>,
     pub task_timeout_secs: Option<u64>,
+    /// Connector names launched through a PTY instead of pipes. The
+    /// machine-readable interface stays the default (ADR-010).
+    #[serde(default)]
+    pub pty: Vec<String>,
+    /// Extra command-line arguments per connector, passed through verbatim
+    /// so the user can select the external agent's own permission mode.
+    #[serde(default)]
+    pub extra_args: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,5 +331,29 @@ mod tests {
         });
         let layer = layer_from_value(raw, "user config").unwrap();
         assert_eq!(layer.profiles["openai"].key.env_var_name, "OPENAI_API_KEY");
+    }
+
+    #[test]
+    fn a_partial_connectors_section_parses_with_defaults() {
+        let layer = layer_from_value(
+            serde_json::json!({ "connectors": { "pty": ["codex"] } }),
+            "test",
+        )
+        .unwrap();
+        let connectors = layer.connectors.unwrap();
+        assert_eq!(connectors.pty, vec!["codex".to_string()]);
+        assert!(connectors.executables.is_empty());
+        assert!(connectors.extra_args.is_empty());
+        let layer = layer_from_value(
+            serde_json::json!({ "connectors": { "extra_args": { "codex": ["--full-auto"] } } }),
+            "test",
+        )
+        .unwrap();
+        let connectors = layer.connectors.unwrap();
+        assert_eq!(
+            connectors.extra_args["codex"],
+            vec!["--full-auto".to_string()]
+        );
+        assert!(connectors.pty.is_empty());
     }
 }

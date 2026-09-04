@@ -489,13 +489,18 @@ impl App {
             Phase::Planning => "planning".into(),
             Phase::Coding => "coding".into(),
         };
-        if let gritt_core::session::SessionKind::Native {
-            provider_profile,
-            model,
-        } = &session.kind
-        {
-            self.status.profile = provider_profile.clone();
-            self.status.model = model.clone();
+        match &session.kind {
+            gritt_core::session::SessionKind::Native {
+                provider_profile,
+                model,
+            } => {
+                self.status.profile = provider_profile.clone();
+                self.status.model = model.clone();
+            }
+            gritt_core::session::SessionKind::Connector { id } => {
+                self.status.profile = id.as_str().to_owned();
+                self.status.model.clear();
+            }
         }
     }
 }

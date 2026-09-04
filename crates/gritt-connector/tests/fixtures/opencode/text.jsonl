@@ -1,0 +1,3 @@
+{"type":"step_start","timestamp":1788523141485,"sessionID":"ses_opencode_0001","part":{"id":"prt_0001","messageID":"msg_0001","sessionID":"ses_opencode_0001","type":"step-start"}}
+{"type":"text","timestamp":1788523141518,"sessionID":"ses_opencode_0001","part":{"id":"prt_0002","messageID":"msg_0001","sessionID":"ses_opencode_0001","type":"text","text":"PONG","time":{"start":1788523141485,"end":1788523141516}}}
+{"type":"step_finish","timestamp":1788523141546,"sessionID":"ses_opencode_0001","part":{"id":"prt_0003","reason":"stop","messageID":"msg_0001","sessionID":"ses_opencode_0001","type":"step-finish","tokens":{"total":8479,"input":6684,"output":3,"reasoning":0,"cache":{"write":0,"read":1792}},"cost":0}}

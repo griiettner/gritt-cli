@@ -79,3 +79,67 @@ mod tests {
         assert_eq!(reference.env_var_name, "OPENROUTER_API_KEY");
     }
 }
+
+/// Name fragments that mark a credential. Any variable whose name
+/// contains one of these (case-insensitive), every configured profile key
+/// variable, and `AGENT_MEMORY_API_KEY` count as credentials: the native
+/// shell tool removes them from its child's environment, and the connector
+/// layer redacts their values out of an external agent's output. The
+/// conventional cloud and VCS names (`AWS_SECRET_ACCESS_KEY`,
+/// `GITHUB_TOKEN`, `NPM_TOKEN`) all fall under this rule.
+pub const SECRET_ENV_MARKERS: [&str; 6] =
+    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"];
+
+/// Variables that a shell needs and never carry a credential.
+const PLAIN_ENV_NAMES: [&str; 12] = [
+    "PATH", "HOME", "TMPDIR", "TEMP", "TMP", "TERM", "LANG", "USER", "SHELL", "PWD", "LOGNAME",
+    "SHLVL",
+];
+
+/// True when an environment variable name looks like it carries a
+/// credential. `blocked` lists the configured profile key variables.
+pub fn is_secret_env_name(name: &str, blocked: &[String]) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if PLAIN_ENV_NAMES.contains(&upper.as_str()) || upper.starts_with("LC_") {
+        return false;
+    }
+    upper == "AGENT_MEMORY_API_KEY"
+        || blocked.iter().any(|known| known.eq_ignore_ascii_case(name))
+        || SECRET_ENV_MARKERS
+            .iter()
+            .any(|marker| upper.contains(marker))
+}
+
+/// Picks the credential values out of an environment snapshot so they can
+/// be redacted wherever that environment's output is shown or stored.
+pub fn secret_env_values<'a>(
+    vars: impl IntoIterator<Item = (&'a str, &'a str)>,
+    blocked: &[String],
+) -> Vec<Secret> {
+    vars.into_iter()
+        .filter(|(name, value)| !value.is_empty() && is_secret_env_name(name, blocked))
+        .map(|(_, value)| Secret::new(value))
+        .collect()
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    #[test]
+    fn secret_env_values_follow_the_name_rule() {
+        let vars = [
+            ("AWS_SECRET_ACCESS_KEY", "aws-value"),
+            ("GITHUB_TOKEN", "gh-value"),
+            ("PATH", "/usr/bin"),
+            ("MY_PROFILE_VAR", "profile-value"),
+            ("EMPTY_TOKEN", ""),
+            ("LC_ALL", "C"),
+        ];
+        let secrets = secret_env_values(vars, &["MY_PROFILE_VAR".to_owned()]);
+        let exposed: Vec<&str> = secrets.iter().map(Secret::expose).collect();
+        assert_eq!(exposed, vec!["aws-value", "gh-value", "profile-value"]);
+        assert!(is_secret_env_name("KEYCHAIN_PATH", &[]));
+        assert!(!is_secret_env_name("HOME", &[]));
+    }
+}
