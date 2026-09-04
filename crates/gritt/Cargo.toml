@@ -17,7 +17,7 @@ gritt-core = { workspace = true }
 gritt-provider = { workspace = true }
 gritt-harness = { workspace = true }
 gritt-connector = { workspace = true }
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
 clap = { workspace = true }
 dirs = { workspace = true }
 keyring = { workspace = true }

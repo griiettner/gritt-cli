@@ -31,10 +31,13 @@ jobs:
       - name: Keep LF line endings
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
-      - name: Install stable toolchain
+      # The repository root pins the compiler in `rust-toolchain.toml` so
+      # product releases rebuild byte for byte; this crate is checked with
+      # the same pinned version rather than a floating `stable`.
+      - name: Install the pinned toolchain
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
-          rustup default stable
+          rustup toolchain install
+          rustup show active-toolchain
       - uses: actions/cache@v4
         with:
           path: |

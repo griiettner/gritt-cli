@@ -27,7 +27,9 @@ gritt-provider = { path = "crates/gritt-provider" }
 gritt-harness = { path = "crates/gritt-harness" }
 gritt-connector = { path = "crates/gritt-connector" }
 
-chrono = { version = "0.4.45", default-features = false, features = ["clock", "std", "serde"] }
+# `clock` stays out of the workspace default so `gritt-core` keeps its no-I/O
+# boundary (ADR-006); the I/O crates enable it where they read the clock.
+chrono = { version = "0.4.45", default-features = false, features = ["std", "serde"] }
 clap = { version = "4.6.6", features = ["derive"] }
 dirs = "6.0.0"
 bytes = "1.12.1"
