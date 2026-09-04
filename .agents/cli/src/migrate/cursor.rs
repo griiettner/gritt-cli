@@ -15,7 +15,7 @@ use serde_json::json;
 
 use crate::frontmatter::{split_fence, split_lines, Split};
 use crate::fsx::{self, compare_names, kebab_case, relative_posix};
-use crate::repo::{expand_home, local_date};
+use crate::repo::{expand_home, local_date, skills_root};
 use crate::skill::sync::{display_name, quote_yaml};
 use crate::Result;
 
@@ -315,7 +315,7 @@ pub fn plan_skill(repo: &Path, doc: &SourceDoc) -> Vec<Write> {
         doc.body.clone()
     };
     let skill_content = format!(
-        "---\nname: {name}\ndescription: {}\n---\n\n{MIGRATION_MARKER}\n<!-- source: {} -->\n<!-- source_system: {source_system} -->\n\n{}\n",
+        "---\nname: {name}\ndescription: {}\ndisable-model-invocation: true\n---\n\n{MIGRATION_MARKER}\n<!-- source: {} -->\n<!-- source_system: {source_system} -->\n\n{}\n",
         quote_yaml(&description),
         doc.rel_path,
         normalize_heading(&body, &display)
@@ -724,14 +724,16 @@ fn apply_writes(writes: &[Write], report: &mut Report, force: bool) -> Result<()
 
 /// Runs the maintenance commands through this same binary with captured
 /// output, so the manifest keeps each command's exit code, stdout, and
-/// stderr the way the replaced script recorded them.
+/// stderr the way the replaced script recorded them. `skill sync` runs only
+/// when the target has a skills root, since it fails without one and a
+/// migration that imported no skills has nothing for it to do.
 fn run_maintenance(repo: &Path, source: &Path, report: &mut Report) -> Result<()> {
     let binary = std::env::current_exe()?;
-    for subcommand in [
-        ["skill", "sync"],
-        ["ticket", "sync"],
-        ["ticket", "validate"],
-    ] {
+    let subcommands: Vec<[&str; 2]> = std::iter::once(["skill", "sync"])
+        .filter(|_| fsx::is_dir(&skills_root(repo)))
+        .chain([["ticket", "sync"], ["ticket", "validate"]])
+        .collect();
+    for subcommand in subcommands {
         let output = Command::new(&binary)
             .arg("--repo-root")
             .arg(repo)
@@ -985,7 +987,7 @@ mod tests {
             writes[0].destination,
             Path::new("/repo/.agents/skills/example/SKILL.md")
         );
-        assert!(writes[0].content.starts_with("---\nname: example\ndescription: \"Example imported skill.\"\n---\n\n<!-- MIGRATED BY gritt-agent migrate cursor; DO NOT EDIT -->\n<!-- source: .cursor/skills/example.md -->\n<!-- source_system: cursor -->\n\n# Example\n"));
+        assert!(writes[0].content.starts_with("---\nname: example\ndescription: \"Example imported skill.\"\ndisable-model-invocation: true\n---\n\n<!-- MIGRATED BY gritt-agent migrate cursor; DO NOT EDIT -->\n<!-- source: .cursor/skills/example.md -->\n<!-- source_system: cursor -->\n\n# Example\n"));
         assert_eq!(writes[1].kind, "skill-agent-metadata");
         assert!(writes[1].content.contains("  display_name: \"Example\"\n  short_description: \"Example imported skill.\"\n  default_prompt: \"Use $example in this repository.\"\n"));
     }

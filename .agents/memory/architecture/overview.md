@@ -26,7 +26,7 @@ This repository demonstrates an agent-friendly documentation layout.
 - `.agents/memory/` stores durable cross-task knowledge.
 - `.agents/skills/` stores reusable procedures and command-like workflows.
 - `.agents/tasks/` stores the lifecycle history for specific work units.
-- `.agents/tools/` stores optional maintenance scripts such as index sync and validation.
+- `.agents/cli/` is the `gritt-agent` Rust CLI that owns index sync, validation, ticket and skill scaffolding, Codex trust, and migration. `.agents/tools/` holds only a README pointing at it.
 
 ## Routing model
 

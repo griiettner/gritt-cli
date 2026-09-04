@@ -25,7 +25,7 @@ decisions are accepted in ADRs or ticket artifacts.
 - `.agents/tasks/` holds canonical ticket history.
 - `.agents/skills/` holds reusable procedures.
 - `.agents/brain/` documents local memory and holds its generated database.
-- `.agents/cli/` is the `gritt-agent` Rust CLI for memory, ticket, and skill maintenance.
+- `.agents/cli/` is the `gritt-agent` Rust CLI for memory, ticket, skill, Codex trust, and migration maintenance.
 - `.agents/plans/` holds proposals and planning inputs.
 
 Indexes route to canonical files. Generated indexes and `.claude/skills/`

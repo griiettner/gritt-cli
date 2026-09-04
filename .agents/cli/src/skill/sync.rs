@@ -190,8 +190,14 @@ fn sync_codex_metadata(repo: &Path, skill_dirs: &[PathBuf], check: bool) -> Resu
                     .unwrap_or(""),
             ),
         };
-        let desired = render_openai_yaml(&interface, allow_implicit);
         let current = fsx::read_text_or(&target, "")?;
+        // Leading `#` lines are kept so a migrator-owned file keeps its
+        // ownership marker across regeneration.
+        let desired = format!(
+            "{}{}",
+            leading_comments(&current),
+            render_openai_yaml(&interface, allow_implicit)
+        );
         if current == desired {
             continue;
         }
@@ -341,6 +347,23 @@ fn render_openai_yaml(interface: &[(String, String)], allow_implicit: bool) -> S
     format!("{}\n", lines.join("\n"))
 }
 
+/// The `#` comment lines at the top of a file, each with its newline, or an
+/// empty string when the file does not start with a comment.
+fn leading_comments(content: &str) -> String {
+    let mut kept = String::new();
+    for line in content.split_inclusive('\n') {
+        if line.starts_with('#') {
+            kept.push_str(line);
+            if !line.ends_with('\n') {
+                kept.push('\n');
+            }
+        } else {
+            break;
+        }
+    }
+    kept
+}
+
 fn is_generated_stub(target: &Path) -> bool {
     match fsx::read_text(target) {
         Ok(content) => {
@@ -447,6 +470,16 @@ mod tests {
         assert!(!parsed.contains_key("nested"));
         assert_eq!(quote_yaml("a \"b\" \\"), "\"a \\\"b\\\" \\\\\"");
         assert_eq!(unquote("'x'"), "x");
+    }
+
+    #[test]
+    fn leading_comments_keep_only_the_opening_block() {
+        assert_eq!(
+            leading_comments("# a\n# b\ninterface:\n# not this\n"),
+            "# a\n# b\n"
+        );
+        assert_eq!(leading_comments("interface:\n"), "");
+        assert_eq!(leading_comments("# only"), "# only\n");
     }
 
     #[test]

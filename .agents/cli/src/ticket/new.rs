@@ -53,7 +53,7 @@ pub fn run(repo_root: &Path, options: &NewOptions) -> Result<i32> {
         &ResolveOptions {
             namespace: options.namespace.clone(),
             refresh: false,
-            persist: true,
+            persist: !options.dry_run,
         },
     )?;
     let namespace = identity.github_login.as_str();
@@ -133,15 +133,22 @@ pub(super) fn sync_or_rollback(
             1
         }
     };
+    remove_scaffold_dirs(repo_root, dirs)?;
+    eprintln!(
+        "{label} creation rolled back because index sync failed for {ticket_id}; no ticket number was consumed"
+    );
+    Ok(status)
+}
+
+/// Removes scaffolded ticket folders and any chunk or namespace folder left
+/// empty by that, so a failed scaffold consumes no ticket number.
+pub(super) fn remove_scaffold_dirs(repo_root: &Path, dirs: &[&Path]) -> Result<()> {
     let tasks = tasks_root(repo_root);
     for dir in dirs {
         fsx::remove_dir_all(dir)?;
         remove_empty_parents(dir, &tasks);
     }
-    eprintln!(
-        "{label} creation rolled back because index sync failed for {ticket_id}; no ticket number was consumed"
-    );
-    Ok(status)
+    Ok(())
 }
 
 /// Removes the chunk and namespace folders a rolled-back scaffold created

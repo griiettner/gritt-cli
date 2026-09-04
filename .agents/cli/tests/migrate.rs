@@ -46,7 +46,7 @@ fn cursor_migration_plans_writes_skips_and_reports() {
     );
     let skill = read(&repo.root, ".agents/skills/example/SKILL.md");
     assert!(skill.starts_with(&format!(
-        "---\nname: example\ndescription: \"Example imported skill.\"\n---\n\n{MARKER}\n<!-- source: .cursor/skills/example.md -->\n<!-- source_system: cursor -->\n\n# Example\n\nUse the example flow.\n"
+        "---\nname: example\ndescription: \"Example imported skill.\"\ndisable-model-invocation: true\n---\n\n{MARKER}\n<!-- source: .cursor/skills/example.md -->\n<!-- source_system: cursor -->\n\n# Example\n\nUse the example flow.\n"
     )));
     assert!(
         read(&repo.root, ".agents/skills/example/agents/openai.yaml").starts_with(&format!(
@@ -191,6 +191,43 @@ fn cursor_migration_reports_sources_that_collide_on_one_destination() {
         .starts_with("conflicts with `.cursor/commands/review.md`"));
 }
 
+#[test]
+fn cursor_migration_without_skills_skips_skill_sync() {
+    let repo = empty_repo();
+    let source = tempfile::tempdir().unwrap();
+    let source_root = source.path().canonicalize().unwrap();
+    write(
+        &source_root,
+        ".cursor/rules/decide.mdc",
+        "We decided this after a decision.\n",
+    );
+    let migrated = run(
+        &repo.root,
+        &[
+            "migrate",
+            "cursor",
+            "--source",
+            source_root.to_str().unwrap(),
+        ],
+    );
+    migrated.assert_status(0);
+    assert_eq!(
+        migrated.stdout,
+        "cursor/claude migration migrated\nwrites: 3\nskipped: 0\nambiguous: 0\n"
+    );
+    let manifest: serde_json::Value = serde_json::from_str(&read(
+        &repo.root,
+        ".agents/migrations/cursor-migration-manifest.json",
+    ))
+    .unwrap();
+    let commands = manifest["commands"].as_array().unwrap();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(
+        commands[0]["argv"],
+        serde_json::json!(["gritt-agent", "ticket", "sync"])
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn cursor_migration_reads_a_file_once_through_overlapping_source_roots() {
@@ -255,6 +292,16 @@ fn cursor_migration_runs_maintenance_and_rejects_bad_sources() {
         .root
         .join(".agents/memory/decisions/index.yaml")
         .exists());
+    // The sync keeps the migration marker and the migrated policy.
+    let openai = read(&repo.root, ".agents/skills/review/agents/openai.yaml");
+    assert!(openai.starts_with(&format!(
+        "# {MARKER}\n# source: .claude/commands/review.md\n"
+    )));
+    assert!(openai.ends_with("policy:\n  allow_implicit_invocation: false\n"));
+    let rerun = run(&repo.root, &["migrate", "cursor", "--source", &source]);
+    rerun.assert_status(0);
+    assert!(rerun.stdout.contains("writes: 9\nskipped: 0\n"));
+    run(&repo.root, &["skill", "sync", "--check"]).assert_status(0);
 
     let same = run(
         &repo.root,

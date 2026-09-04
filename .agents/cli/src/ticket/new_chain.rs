@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::identity::{resolve_ticket_identity, ResolveOptions};
-use super::new::sync_or_rollback;
+use super::new::{remove_scaffold_dirs, sync_or_rollback};
 use super::scaffold::{render_frontmatter, Frontmatter as TicketFrontmatter};
 use super::store::{next_ticket_number, pad_ticket_number, ticket_dir};
 use crate::fsx::{self, kebab_case, relative_path_posix, relative_posix};
@@ -15,7 +15,7 @@ use crate::{CliError, Result};
 
 pub const TODO: &str = "TODO(tkt):";
 pub const DEFAULT_BASE_BRANCH: &str = "main";
-pub const DEFAULT_BRANCH_PATTERN: &str = "tkt-{id}-{slug}";
+pub const DEFAULT_BRANCH_PATTERN: &str = "tkt-{id}-{step}-{slug}";
 pub const DEFAULT_MERGE_POLICY: &str = "Each worker opens a PR against main; reviewer runs after every PR; do not wait for CI/CD before merge when quota is unreliable.";
 pub const DEFAULT_SKILLS: [&str; 2] = ["tkt", "tkt-exec-chain"];
 pub const DEFAULT_AREAS: [&str; 2] = [".agents/tasks", ".agents/skills"];
@@ -94,7 +94,7 @@ pub fn run(repo_root: &Path, options: &NewChainOptions) -> Result<i32> {
         &ResolveOptions {
             namespace: options.namespace.clone(),
             refresh: false,
-            persist: true,
+            persist: !options.dry_run,
         },
     )?;
     let namespace = identity.github_login.as_str();
@@ -134,36 +134,25 @@ pub fn run(repo_root: &Path, options: &NewChainOptions) -> Result<i32> {
         merge_policy: &options.merge_policy,
     };
 
-    fs::create_dir_all(&chain.orchestrator.dir)?;
-    fsx::write_text(
-        &chain.orchestrator.dir.join("task.md"),
-        &render_orchestrator_task(&common, &chain, &options.dependencies),
-    )?;
-    if options.create_concept {
-        fsx::write_text(
-            &chain.orchestrator.dir.join("concept.md"),
-            &render_concept(&common, &chain),
-        )?;
+    let dirs: Vec<&Path> = std::iter::once(chain.orchestrator.dir.as_path())
+        .chain(chain.workers.iter().map(|w| w.ticket.dir.as_path()))
+        .chain(chain.reviewer.iter().map(|r| r.dir.as_path()))
+        .collect();
+    // A stray folder or file at an allocated id would leave a half-written
+    // chain, so refuse before touching the tree.
+    if let Some(existing) = dirs.iter().find(|dir| fsx::exists(dir)) {
+        return Err(CliError::new(format!(
+            "cannot scaffold chain: {} already exists; run `gritt-agent ticket validate`",
+            relative_posix(repo_root, existing)
+        )));
     }
-    if options.create_plan {
-        fsx::write_text(
-            &chain.orchestrator.dir.join("plan.md"),
-            &render_plan(&common, &chain),
-        )?;
-    }
-    for (index, worker) in chain.workers.iter().enumerate() {
-        fs::create_dir_all(&worker.ticket.dir)?;
-        fsx::write_text(
-            &worker.ticket.dir.join("task.md"),
-            &render_worker_task(&common, &chain, index),
-        )?;
-    }
-    if let Some(reviewer) = &chain.reviewer {
-        fs::create_dir_all(&reviewer.dir)?;
-        fsx::write_text(
-            &reviewer.dir.join("task.md"),
-            &render_reviewer_task(&common, &chain),
-        )?;
+    if let Err(error) = write_chain(&common, &chain, options) {
+        remove_scaffold_dirs(repo_root, &dirs)?;
+        eprintln!(
+            "chain creation rolled back because writing {} failed; no ticket number was consumed",
+            chain.orchestrator.ticket_id
+        );
+        return Err(error);
     }
 
     let announce = || print_chain(repo_root, namespace, &chain, options);
@@ -171,10 +160,6 @@ pub fn run(repo_root: &Path, options: &NewChainOptions) -> Result<i32> {
         announce();
         return Ok(0);
     }
-    let dirs: Vec<&Path> = std::iter::once(chain.orchestrator.dir.as_path())
-        .chain(chain.workers.iter().map(|w| w.ticket.dir.as_path()))
-        .chain(chain.reviewer.iter().map(|r| r.dir.as_path()))
-        .collect();
     sync_or_rollback(
         repo_root,
         &dirs,
@@ -182,6 +167,43 @@ pub fn run(repo_root: &Path, options: &NewChainOptions) -> Result<i32> {
         &chain.orchestrator.ticket_id,
         announce,
     )
+}
+
+/// Writes every artifact of the chain. The caller removes the folders when
+/// any write fails.
+fn write_chain(common: &Common<'_>, chain: &Chain, options: &NewChainOptions) -> Result<()> {
+    fs::create_dir_all(&chain.orchestrator.dir)?;
+    fsx::write_text(
+        &chain.orchestrator.dir.join("task.md"),
+        &render_orchestrator_task(common, chain, &options.dependencies),
+    )?;
+    if options.create_concept {
+        fsx::write_text(
+            &chain.orchestrator.dir.join("concept.md"),
+            &render_concept(common, chain),
+        )?;
+    }
+    if options.create_plan {
+        fsx::write_text(
+            &chain.orchestrator.dir.join("plan.md"),
+            &render_plan(common, chain),
+        )?;
+    }
+    for (index, worker) in chain.workers.iter().enumerate() {
+        fs::create_dir_all(&worker.ticket.dir)?;
+        fsx::write_text(
+            &worker.ticket.dir.join("task.md"),
+            &render_worker_task(common, chain, index),
+        )?;
+    }
+    if let Some(reviewer) = &chain.reviewer {
+        fs::create_dir_all(&reviewer.dir)?;
+        fsx::write_text(
+            &reviewer.dir.join("task.md"),
+            &render_reviewer_task(common, chain),
+        )?;
+    }
+    Ok(())
 }
 
 /// Parses `slug:title` values. A missing colon uses the whole text as the
@@ -321,10 +343,15 @@ fn ticket_link(from_dir: &Path, target: &ChainTicket) -> String {
     )
 }
 
-pub fn worker_branch(worker: &Worker) -> String {
+/// Expands the branch pattern for one worker: `{id}` is the four-digit
+/// ticket number, `{step}` the two-digit step, `{slug}` the step slug.
+pub fn worker_branch(worker: &Worker, pattern: &str) -> String {
     let number = worker.ticket.ticket_id.to_lowercase();
     let number = number.strip_prefix("tkt-").unwrap_or(&number);
-    format!("tkt-{number}-{:02}-{}", worker.step, worker.slug)
+    pattern
+        .replace("{id}", number)
+        .replace("{step}", &format!("{:02}", worker.step))
+        .replace("{slug}", &worker.slug)
 }
 
 struct Frontmatter<'a> {
@@ -404,7 +431,7 @@ pub fn render_orchestrator_task(
         },
     );
     text.push_str(&format!(
-        "# {} Task: {}\n\n## Goal\n\n{TODO} state the concrete outcome this chain delivers.\n\n## Chain Execution Contract\n\n- Execution mode: `tkt-exec-chain`\n- Base branch: `{}`\n- Branch naming pattern: `{}`\n- Worker branch pattern: `tkt-{{id}}-{{step}}-{{step-slug}}`\n- Merge policy: {}\n- Reviewer gate: reviewer runs after every worker PR\n- Child tickets: required and fixed as {first_child} through {last_child}\n- Validation required on every worker step: {TODO} name the checks\n- Benchmark requirements: {TODO} name them or state none\n- Final completion condition: {TODO} state it\n- Concurrency: exactly one active worker; no later step starts before the previous PR merges\n\n## Child Ticket Chain\n\n{}\n\nThe orchestrator activates exactly one worker ticket at a time. Every\nworker opens one PR and receives a reviewer verdict before merge. The next\nworker is activated only after that merge.\n\n## Inputs\n\n- {TODO} list the plans, ADRs, and package READMEs a worker must read.\n\n## Scope\n\n- {TODO} describe the work covered by the child chain.\n\n## Out of Scope\n\n- {TODO} describe what the chain must not change.\n\n## Acceptance Criteria\n\n- {TODO} give concrete, checkable criteria.\n\n## Verification\n\n- {TODO} name the checks every worker and reviewer pass must respect.\n- Run `gritt-agent ticket chain-check --ticket {} --base {}` before semantic review.\n",
+        "# {} Task: {}\n\n## Goal\n\n{TODO} state the concrete outcome this chain delivers.\n\n## Chain Execution Contract\n\n- Execution mode: `tkt-exec-chain`\n- Base branch: `{}`\n- Branch naming pattern: `{}` (`{{id}}` is the worker ticket number, `{{step}}` the two-digit step, `{{slug}}` the step slug)\n- Merge policy: {}\n- Reviewer gate: reviewer runs after every worker PR\n- Child tickets: required and fixed as {first_child} through {last_child}\n- Validation required on every worker step: {TODO} name the checks\n- Benchmark requirements: {TODO} name them or state none\n- Final completion condition: {TODO} state it\n- Concurrency: exactly one active worker; no later step starts before the previous PR merges\n\n## Child Ticket Chain\n\n{}\n\nThe orchestrator activates exactly one worker ticket at a time. Every\nworker opens one PR and receives a reviewer verdict before merge. The next\nworker is activated only after that merge.\n\n## Inputs\n\n- {TODO} list the plans, ADRs, and package READMEs a worker must read.\n\n## Scope\n\n- {TODO} describe the work covered by the child chain.\n\n## Out of Scope\n\n- {TODO} describe what the chain must not change.\n\n## Acceptance Criteria\n\n- {TODO} give concrete, checkable criteria.\n\n## Verification\n\n- {TODO} name the checks every worker and reviewer pass must respect.\n- Run `gritt-agent ticket chain-check --ticket {} --base {}` before semantic review.\n",
         orchestrator.ticket_id,
         orchestrator.title,
         common.base_branch,
@@ -453,7 +480,7 @@ pub fn render_worker_task(common: &Common<'_>, chain: &Chain, index: usize) -> S
         worker.step,
         worker.total,
         chain.orchestrator.ticket_id,
-        worker_branch(worker),
+        worker_branch(worker, common.branch_pattern),
         worker.ticket.ticket_id,
         common.base_branch,
     ));
@@ -530,7 +557,7 @@ pub fn render_plan(common: &Common<'_>, chain: &Chain) -> String {
                 "{}. {} on `{}`. {TODO} describe the step.",
                 worker.step,
                 worker.ticket.ticket_id,
-                worker_branch(worker)
+                worker_branch(worker, common.branch_pattern)
             )
         })
         .collect();
@@ -595,7 +622,14 @@ mod tests {
         assert_eq!(reviewer.ticket_id, "TKT-0027");
         assert_eq!(reviewer.title, "Review integrated Big chain chain");
         assert!(reviewer.dir.ends_with("TKT-0026-0050/TKT-0027"));
-        assert_eq!(worker_branch(&chain.workers[0]), "tkt-0025-01-one");
+        assert_eq!(
+            worker_branch(&chain.workers[0], DEFAULT_BRANCH_PATTERN),
+            "tkt-0025-01-one"
+        );
+        assert_eq!(
+            worker_branch(&chain.workers[1], "feat/{id}-{slug}"),
+            "feat/0026-two"
+        );
         assert_eq!(
             ticket_link(&chain.orchestrator.dir, &chain.workers[1].ticket),
             "[TKT-0026 Second step](../../TKT-0026-0050/TKT-0026/task.md)"

@@ -2,9 +2,11 @@
 //! entry for a repository in Codex's `config.toml`.
 //!
 //! The file is edited line by line and only understands the
-//! `[projects."<path>"]` table form Codex itself writes. When the path shows
-//! up in any other form the tool refuses to touch the file rather than append
-//! a duplicate table, which would make the TOML invalid.
+//! `[projects."<path>"]` table form Codex itself writes. When the same path
+//! is keyed in another form (a literal-string header or an inline table
+//! entry) the tool refuses to touch the file rather than append a duplicate
+//! table, which would make the TOML invalid. Other paths, comments, and
+//! values that merely contain the path text do not block the edit.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -103,20 +105,38 @@ fn split_config(text: &str) -> Vec<String> {
     lines
 }
 
+/// True when `line` keys the project in a form this tool does not edit: a
+/// literal-string table header, or an inline `"<path>" = { ... }` entry.
+fn keys_project_in_another_form(line: &str, project: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed == format!("[projects.'{project}']") {
+        return true;
+    }
+    for key in [
+        format!("\"{}\"", toml_basic_string(project)),
+        format!("'{project}'"),
+    ] {
+        if let Some(rest) = trimmed.strip_prefix(key.as_str()) {
+            if rest.trim_start().starts_with('=') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Returns the updated config text, or `None` when the project is already
-/// trusted and nothing needs to change. Errors when the path is mentioned in
-/// a form this tool does not edit, so it never appends a duplicate table.
-pub fn apply_trust(text: &str, header: &str) -> Result<Option<String>> {
+/// trusted and nothing needs to change. Errors when the path is keyed in a
+/// form this tool does not edit, so it never appends a duplicate table.
+pub fn apply_trust(text: &str, project_path: &Path) -> Result<Option<String>> {
+    let header = project_header(project_path);
+    let project = project_path.to_string_lossy();
     let mut lines = split_config(text);
-    match find_section(&lines, header) {
+    match find_section(&lines, &header) {
         None => {
-            let quoted = header
-                .trim_start_matches("[projects.")
-                .trim_end_matches(']');
-            let raw = quoted.trim_matches('"');
             if let Some(line) = lines
                 .iter()
-                .find(|line| line.contains(quoted) || line.contains(raw))
+                .find(|line| keys_project_in_another_form(line, &project))
             {
                 return Err(CliError::new(format!(
                     "config.toml already mentions this project in a form this tool does not edit (`{}`); set trust_level = \"trusted\" there by hand",
@@ -126,7 +146,7 @@ pub fn apply_trust(text: &str, header: &str) -> Result<Option<String>> {
             if lines.last().is_some_and(|line| !line.trim().is_empty()) {
                 lines.push(String::new());
             }
-            lines.push(header.to_owned());
+            lines.push(header);
             lines.push(TRUSTED_LINE.to_owned());
         }
         Some(section) if section_is_trusted(&lines, section) => return Ok(None),
@@ -146,7 +166,7 @@ pub fn apply_trust(text: &str, header: &str) -> Result<Option<String>> {
 
 fn ensure_trusted(config_path: &Path, project_path: &Path) -> Result<bool> {
     let text = fsx::read_text_or(config_path, "")?;
-    match apply_trust(&text, &project_header(project_path))? {
+    match apply_trust(&text, project_path)? {
         Some(updated) => {
             fsx::write_text(config_path, &updated)?;
             Ok(true)
@@ -158,23 +178,27 @@ fn ensure_trusted(config_path: &Path, project_path: &Path) -> Result<bool> {
 /// Trusted exactly when `apply_trust` would change nothing.
 fn is_trusted(config_path: &Path, project_path: &Path) -> Result<bool> {
     let text = fsx::read_text_or(config_path, "")?;
-    Ok(apply_trust(&text, &project_header(project_path))?.is_none())
+    Ok(apply_trust(&text, project_path)?.is_none())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const HEADER: &str = "[projects.\"/work/repo\"]";
+    const PROJECT: &str = "/work/repo";
+
+    fn trust(text: &str) -> Result<Option<String>> {
+        apply_trust(text, Path::new(PROJECT))
+    }
 
     #[test]
     fn appends_a_new_section_after_a_blank_line() {
         assert_eq!(
-            apply_trust("", HEADER).unwrap().unwrap(),
+            trust("").unwrap().unwrap(),
             "[projects.\"/work/repo\"]\ntrust_level = \"trusted\"\n"
         );
         assert_eq!(
-            apply_trust("model = \"x\"\n", HEADER).unwrap().unwrap(),
+            trust("model = \"x\"\n").unwrap().unwrap(),
             "model = \"x\"\n\n[projects.\"/work/repo\"]\ntrust_level = \"trusted\"\n"
         );
     }
@@ -184,20 +208,16 @@ mod tests {
         let untrusted =
             "[projects.\"/work/repo\"]\ntrust_level = \"untrusted\"\n\n[other]\nk = 1\n";
         assert_eq!(
-            apply_trust(untrusted, HEADER).unwrap().unwrap(),
+            trust(untrusted).unwrap().unwrap(),
             "[projects.\"/work/repo\"]\ntrust_level = \"trusted\"\n\n[other]\nk = 1\n"
         );
         let missing_key = "[projects.\"/work/repo\"]\nnote = 1\n";
         assert_eq!(
-            apply_trust(missing_key, HEADER).unwrap().unwrap(),
+            trust(missing_key).unwrap().unwrap(),
             "[projects.\"/work/repo\"]\ntrust_level = \"trusted\"\nnote = 1\n"
         );
         assert_eq!(
-            apply_trust(
-                "[projects.\"/work/repo\"]\ntrust_level = \"trusted\"\n",
-                HEADER
-            )
-            .unwrap(),
+            trust("[projects.\"/work/repo\"]\ntrust_level = \"trusted\"\n").unwrap(),
             None
         );
     }
@@ -205,11 +225,28 @@ mod tests {
     #[test]
     fn refuses_to_duplicate_a_project_written_in_another_form() {
         let inline = "[projects]\n\"/work/repo\" = { trust_level = \"untrusted\" }\n";
-        let error = apply_trust(inline, HEADER).unwrap_err();
+        let error = trust(inline).unwrap_err();
         assert!(error.message.contains("form this tool does not edit"));
         assert!(error.message.contains("\"/work/repo\" = { trust_level"));
         let literal = "[projects.'/work/repo']\ntrust_level = \"untrusted\"\n";
-        assert!(apply_trust(literal, HEADER).is_err());
+        assert!(trust(literal).is_err());
+    }
+
+    #[test]
+    fn other_paths_and_comments_do_not_block_the_append() {
+        let config = "# see /work/repo for details\n\n[projects.\"/work/repo-old\"]\ntrust_level = \"trusted\"\n\n[projects.\"/work/repo/sub\"]\ntrust_level = \"trusted\"\nnotes = \"/work/repo\"\n";
+        let updated = trust(config).unwrap().unwrap();
+        assert!(updated.ends_with(
+            "notes = \"/work/repo\"\n\n[projects.\"/work/repo\"]\ntrust_level = \"trusted\"\n"
+        ));
+        assert!(!keys_project_in_another_form(
+            "\"/work/repo-old\" = {}",
+            PROJECT
+        ));
+        assert!(keys_project_in_another_form(
+            "  '/work/repo'   = { trust_level = \"x\" }",
+            PROJECT
+        ));
     }
 
     #[test]

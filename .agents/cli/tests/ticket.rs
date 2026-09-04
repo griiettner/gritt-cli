@@ -318,6 +318,8 @@ fn new_honours_env_namespace_and_dry_run() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("qualified: carol/TKT-0001"));
     assert!(stdout.contains("would run: gritt-agent ticket sync"));
+    // A dry run writes nothing, including the identity file.
+    assert!(!repo.root.join(".agents/state/identity.local.yaml").exists());
     assert!(!repo.root.join(".agents/tasks/carol").exists());
 }
 
@@ -647,6 +649,72 @@ fn new_chain_guards_steps_and_honours_no_reviewer() {
         .root
         .join(".agents/tasks/alice/TKT-0001-0025/TKT-0006")
         .exists());
+}
+
+#[test]
+fn new_chain_refuses_an_occupied_id_and_applies_the_branch_pattern() {
+    let repo = fixture();
+    // A stray file where the second worker would go.
+    write(
+        &repo.root,
+        ".agents/tasks/alice/TKT-0001-0025/TKT-0005",
+        "stray\n",
+    );
+    let blocked = run(
+        &repo.root,
+        &[
+            "ticket",
+            "new-chain",
+            "--title",
+            "Blocked",
+            "--namespace",
+            "alice",
+            "--step",
+            "a:A",
+            "--step",
+            "b:B",
+            "--no-sync",
+        ],
+    );
+    blocked.assert_status(1);
+    assert!(blocked.stderr.contains(
+        "cannot scaffold chain: .agents/tasks/alice/TKT-0001-0025/TKT-0005 already exists"
+    ));
+    assert!(!repo
+        .root
+        .join(".agents/tasks/alice/TKT-0001-0025/TKT-0003")
+        .exists());
+    std::fs::remove_file(repo.root.join(".agents/tasks/alice/TKT-0001-0025/TKT-0005")).unwrap();
+
+    let created = run(
+        &repo.root,
+        &[
+            "ticket",
+            "new-chain",
+            "--title",
+            "Patterned",
+            "--namespace",
+            "alice",
+            "--step",
+            "a:A",
+            "--step",
+            "b:B",
+            "--branch-pattern",
+            "feat/{id}-{slug}",
+            "--no-sync",
+        ],
+    );
+    created.assert_status(0);
+    let orchestrator = read(
+        &repo.root,
+        ".agents/tasks/alice/TKT-0001-0025/TKT-0003/task.md",
+    );
+    assert!(orchestrator.contains("- Branch naming pattern: `feat/{id}-{slug}`"));
+    let worker = read(
+        &repo.root,
+        ".agents/tasks/alice/TKT-0001-0025/TKT-0005/task.md",
+    );
+    assert!(worker.contains("Branch: `feat/0005-b`\n"));
 }
 
 #[test]

@@ -138,7 +138,7 @@ struct NewChainArgs {
     /// Chain base branch.
     #[arg(long, default_value = DEFAULT_BASE_BRANCH)]
     base_branch: String,
-    /// Branch naming pattern.
+    /// Worker branch pattern with {id}, {step}, and {slug} placeholders.
     #[arg(long, default_value = DEFAULT_BRANCH_PATTERN)]
     branch_pattern: String,
     /// Merge policy text recorded in task.md.

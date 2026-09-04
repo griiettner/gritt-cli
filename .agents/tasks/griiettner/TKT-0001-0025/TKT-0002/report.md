@@ -234,3 +234,7 @@ replacement. Deferred items are under Follow-up.
 - `ticket chain-check` reads `report.md` up to three times and spawns six
   `git` processes; harmless at this size.
 - CI on Linux and Windows, carried from TKT-0001.
+
+## Updates
+
+- [2026-09-04 Settle the pre-existing findings from the TKT-0003 review](updates/2026-09-04-review-settlement.md)

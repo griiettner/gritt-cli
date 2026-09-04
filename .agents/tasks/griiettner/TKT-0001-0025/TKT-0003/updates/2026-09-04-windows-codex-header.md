@@ -44,10 +44,12 @@ platform. No product code changed.
 - `cargo test --test codex`: 3 pass on macOS.
 - `cargo fmt --all --check` and `cargo clippy --all-targets -- -D warnings`:
   pass.
-- The `agent-cli` workflow result on the pushed commit is recorded in the
-  report's Updates entry for this file once observed.
+- The `agent-cli` workflow ran on commit `cfd4b92` (run 33838663261):
+  `verify (ubuntu-latest)` and `verify (windows-latest)` both succeeded on
+  the first attempt. Item 9's last criterion is met.
 
 ## Remaining follow-up
 
-The Windows job has not run yet at the time of writing; see the report for
-the observed result.
+None for this item. The runner annotates `actions/checkout@v4` and
+`actions/cache@v4` as Node 20 actions being forced onto Node 24; harmless
+until GitHub removes the shim, then bump both to the next major.

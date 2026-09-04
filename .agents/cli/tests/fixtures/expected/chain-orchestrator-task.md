@@ -30,8 +30,7 @@ TODO(tkt): state the concrete outcome this chain delivers.
 
 - Execution mode: `tkt-exec-chain`
 - Base branch: `main`
-- Branch naming pattern: `tkt-{id}-{slug}`
-- Worker branch pattern: `tkt-{id}-{step}-{step-slug}`
+- Branch naming pattern: `tkt-{id}-{step}-{slug}` (`{id}` is the worker ticket number, `{step}` the two-digit step, `{slug}` the step slug)
 - Merge policy: Each worker opens a PR against main; reviewer runs after every PR; do not wait for CI/CD before merge when quota is unreliable.
 - Reviewer gate: reviewer runs after every worker PR
 - Child tickets: required and fixed as TKT-0004 through TKT-0006

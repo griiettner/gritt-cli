@@ -38,9 +38,9 @@ the working directory to the nearest folder that contains `.agents/`.
 | `ticket sync [--check]` | Regenerate `.agents/tasks/**/index.yaml` and `.agents/memory/*/index.yaml` |
 | `ticket validate` | Check ticket folders, frontmatter, chain links, memory frontmatter, and the optional indexes |
 | `skill new <name> <description> [--title <title>] [--force] [--no-openai] [--no-sync] [--dry-run]` | Scaffold `.agents/skills/<name>/SKILL.md` and `agents/openai.yaml`, then run `skill sync` |
-| `skill sync [--check] [--prune]` | Regenerate `.claude/skills/*/SKILL.md` stubs and each skill's `agents/openai.yaml` policy block |
-| `codex trust [path] [--check]` | Add or check the `trust_level = "trusted"` entry for a repository in `$CODEX_HOME/config.toml` (default `~/.codex`) |
-| `migrate cursor --source <path> [--dry-run] [--force] [--no-sync]` | Import `.cursor`/`.claude` skills, agents, and rules into `.agents/`, write `.agents/migrations/` reports, and run the maintenance commands |
+| `skill sync [--check] [--prune]` | Regenerate `.claude/skills/*/SKILL.md` stubs and each skill's `agents/openai.yaml` policy block, keeping any leading `#` comment lines such as the migration marker |
+| `codex trust [path] [--check]` | Add or check the `trust_level = "trusted"` entry for a repository in `$CODEX_HOME/config.toml` (default `~/.codex`). Refuses only when the same path is keyed as a literal-string header or an inline table entry |
+| `migrate cursor --source <path> [--dry-run] [--force] [--no-sync]` | Import `.cursor`/`.claude` skills, agents, and rules into `.agents/`, write `.agents/migrations/` reports, and run the maintenance commands (`skill sync` only when `.agents/skills/` exists) |
 
 `ticket new` and `ticket new-chain` also accept `--namespace`, `--owner`,
 `--areas`, `--skills`, `--dependencies`, `--create-concept`, `--create-plan`,
@@ -49,7 +49,13 @@ the working directory to the nearest folder that contains `.agents/`.
 `.agents/tasks` and `.agents/skills` and `--skills` to `tkt` and
 `tkt-exec-chain`, and passing a list flag with no values clears it.
 `new-chain` adds `--base-branch`, `--branch-pattern`, `--merge-policy`,
-`--reviewer-title`, and `--no-reviewer`. Both commands render one shared
+`--reviewer-title`, and `--no-reviewer`. `--branch-pattern` (default
+`tkt-{id}-{step}-{slug}`) names every worker branch: `{id}` is the worker
+ticket number, `{step}` the two-digit step, `{slug}` the step slug.
+`new-chain` refuses to write when a folder already exists at any allocated
+id, and removes everything it wrote when a later write fails. `--dry-run` on
+either command writes nothing, not even the identity file. Both commands
+render one shared
 frontmatter block: `areas` and `skills` go on every artifact, `dependencies`
 on `task.md` only. Identity resolution order is `--namespace`,
 `GRITT_TKT_NAMESPACE`, `.agents/state/identity.local.yaml`, then
