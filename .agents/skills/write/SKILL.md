@@ -79,3 +79,8 @@ Where imported rules disagree, use the tighter rule. Full instructions remain in
 - When rewriting existing prose, rewrite rather than delete coverage. If the original has five paragraphs, the rewrite has five unless the user asked to cut. New drafts are as long as their content needs; do not pad to a template.
 - Never invent personal experience, sources, quotations, uncertainty, opinions, or personality to make prose sound human.
 - Do not treat a detector result as proof that a person used AI, or use it alone for hiring, academic, attribution, or disciplinary decisions.
+
+## Output
+
+Return the requested prose or edit, preserving meaning and register. For an
+in-place pass, state the files changed and the final audit result.

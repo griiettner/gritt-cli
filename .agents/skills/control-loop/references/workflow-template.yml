@@ -1,0 +1,27 @@
+name: agent-loop
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * 1"
+
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bound scheduled work
+        run: |
+          count=$(gh pr list --label "agent-loop" --state open --json number --jq 'length')
+          test "$count" -lt 1 || test "${{ github.event_name }}" = "workflow_dispatch"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Sensor
+        run: ./scripts/agent-loop-sensor
+      - name: Controller
+        run: ./scripts/agent-loop-controller
+      - name: Actuator
+        run: ./scripts/agent-loop-actuator
+
+# Replace every command, label, cadence, and credential boundary with values
+# agreed for the target repository before enabling this workflow.

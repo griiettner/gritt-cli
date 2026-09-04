@@ -7,6 +7,9 @@ description: Audits a skill against skill-management rules. Use when reviewing, 
 
 Read [skill-management](../SKILL.md) first. Load `write`. Report only unless the user asks to apply fixes.
 
+Run `.agents/cli/target/release/gritt-agent skill audit --skill <name>` for
+the deterministic checks first. Then perform the judgment checks below.
+
 ## Input
 
 A skill folder, a nested `SKILL.md`, or a family (`dev`, `tkt`, `write`, `write-docs`). If missing, ask once.

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Control Loop"
+  short_description: "Designs a bounded recurring agent workflow around a measurable repository target."
+  default_prompt: "Use $control-loop in this repository."
+policy:
+  allow_implicit_invocation: false

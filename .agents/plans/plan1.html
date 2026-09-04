@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gritt agent workspace plan</title>
+<link rel="stylesheet" href="assets/doc-theme.css">
+</head>
+<body>
+<header class="masthead">
+  <div class="masthead-inner">
+    <h1>Gritt agent workspace plan</h1>
+    <span class="chip good status-chip"><span class="dot"></span>Accepted architecture</span>
+    <button class="theme" id="themeBtn" type="button">Dark</button>
+  </div>
+  <nav class="toc">
+    <a href="#summary">Summary</a>
+    <a href="#decisions">Decisions</a>
+    <a href="#providers">Providers</a>
+    <a href="#sessions">Sessions</a>
+    <a href="#harness">Harness</a>
+    <a href="#configuration">Configuration</a>
+    <a href="#connectors">Connectors</a>
+    <a href="#phases">Phases</a>
+    <a href="#risks">Risks</a>
+    <a href="#open">Open decision</a>
+  </nav>
+</header>
+<div class="wrap">
+  <section id="summary">
+    <h2 style="margin-top:40px">Summary</h2>
+    <p class="lede">Gritt is an open-source Rust application for running AI coding agents from one place.</p>
+    <p>The first release targets macOS, Windows, and Linux. Gritt supports native provider sessions and supervised connectors for installed agents. Both paths share events, sessions, and the terminal interface.</p>
+    <div class="flow">
+      <div class="flow-box">User<br><small>planning or coding</small></div>
+      <div class="flow-arrow">&rarr;<small>uses</small></div>
+      <div class="flow-box store">Control plane<br><small>events and sessions</small></div>
+      <div class="flow-arrow">&rarr;<small>runs</small></div>
+      <div class="flow-box">Native loop or connector<br><small>provider-neutral output</small></div>
+    </div>
+  </section>
+
+  <section id="decisions">
+    <h2>Accepted decisions</h2>
+    <p class="lede">ADR-006 through ADR-011 define the architecture that implementation must follow.</p>
+    <div class="tscroll"><table class="prose">
+      <thead><tr><th>Area</th><th>Decision</th></tr></thead>
+      <tbody>
+        <tr><td>Product</td><td>Rust, open source, macOS, Windows, and Linux</td></tr>
+        <tr><td>Crates</td><td><code>gritt-core</code>, <code>gritt-provider</code>, <code>gritt-harness</code>, <code>gritt-connector</code>, and <code>gritt</code></td></tr>
+        <tr><td>Terminal UI</td><td>Ratatui 0.30.2 with Crossterm 0.29</td></tr>
+        <tr><td>Providers</td><td>OpenAI Responses and Chat Completions, OpenRouter and generic Chat Completions, Anthropic Messages</td></tr>
+        <tr><td>Secrets</td><td>OS keychain first, named environment variable second, no secret files</td></tr>
+        <tr><td>Caches</td><td>Daily model refresh with stale-cache fallback</td></tr>
+        <tr><td>Logging</td><td>Content-free by default, seven-day retention when explicitly enabled</td></tr>
+        <tr><td>Frontend</td><td>First non-terminal client uses an in-process API</td></tr>
+        <tr><td>Connectors</td><td>External agents retain their documented command and tool authority</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section id="providers">
+    <h2>Provider boundary</h2>
+    <p class="lede">Adapters hide wire formats and provider details from the control plane.</p>
+    <p>Requests route by configured provider profile, never by guessing from a model name. Each adapter sends prompts, streams provider-neutral events, submits tool results, restores continuation state, reports capabilities, and returns internal error kinds.</p>
+    <div class="callout">
+      <div class="ctitle">One event model</div>
+      <p>Text, reasoning summaries, tool calls, results, approvals, usage, status, errors, and completion have the same shape for native and connector sessions.</p>
+    </div>
+    <p>Each wire envelope has its own normalizer and tool-schema generator. Provider-specific fields stay in optional diagnostic metadata.</p>
+  </section>
+
+  <section id="harness">
+    <h2>Harness and execution</h2>
+    <p class="lede">Planning is conversation. Coding reads, writes, and runs approved tools.</p>
+    <p>Print mode is scriptable. REPL mode adds history and continuation. Full-screen mode adds the streamed transcript, tool activity, multiline input, status, approvals, diff review, cancellation, command palette, and task views.</p>
+    <p>The native policy engine evaluates every tool call as <code>allow</code>, <code>ask</code>, or <code>deny</code>. It matches tool names and resources with workspace-aware wildcard rules. Native tools are workspace-bounded file read, file write, and shell execution. Child processes are tracked so cancellation can stop them.</p>
+  </section>
+
+  <section id="sessions">
+    <h2>Sessions and phases</h2>
+    <p class="lede">Planning is conversational. Coding is the tool-using execution phase, and both remain in one session.</p>
+    <p>Native and connector sessions emit the same provider-neutral events for text, reasoning summaries, tool calls, results, approvals, usage, status, errors, and completion. Sessions are named, listable, resumable, removable, and owned by Gritt. Adapter continuation state stays behind the session interface.</p>
+  </section>
+
+  <section id="configuration">
+    <h2>Configuration and security</h2>
+    <p class="lede">Configuration is explicit, layered, and safe to inspect.</p>
+    <p>Precedence is command-line flags, project config, user config, environment variables, then built-in defaults. Profiles hold protocol, base URL, and key variable name, but never secret values. Keys come from the OS credential store first and the named environment variable second. Structured logs are content-free by default; explicit content logging retains seven days.</p>
+  </section>
+
+  <section id="connectors">
+    <h2>Connectors</h2>
+    <p class="lede">Gritt supervises external agents without taking away their authority.</p>
+    <p>Connectors launch installed agents through documented machine-readable interfaces where available. PTY is the fallback, and terminal scraping is the last resort. Gritt supervises processes, relays approvals, records decisions, and reports each connector's capabilities, version, and auth state. Missing or outdated connectors never break the native path.</p>
+  </section>
+
+  <section id="phases">
+    <h2>Phases</h2>
+    <p class="lede">Build the contracts first, then the native path, harness, and connectors.</p>
+    <div class="phases">
+      <div class="phase"><span class="pname">Phase 0</span><span class="pscope">Workspace, contracts, OpenRouter fixtures, Ratatui shell</span><span class="chip warning"><span class="dot"></span>Next</span></div>
+      <div class="phase"><span class="pname">Phase 1</span><span class="pscope">Chat Completions, daily model cache, print, REPL, sessions, tools</span><span class="chip neutral"><span class="dot"></span>Planned</span></div>
+      <div class="phase"><span class="pname">Phase 2</span><span class="pscope">OpenAI Responses, Anthropic Messages, keychain, capability checks</span><span class="chip neutral"><span class="dot"></span>Planned</span></div>
+      <div class="phase"><span class="pname">Phase 3</span><span class="pscope">Full-screen harness, diff review, child sessions, release packaging</span><span class="chip neutral"><span class="dot"></span>Planned</span></div>
+      <div class="phase"><span class="pname">Phase 4</span><span class="pscope">Native, Codex, Claude Code, Cursor, and OpenCode connectors</span><span class="chip neutral"><span class="dot"></span>Planned</span></div>
+    </div>
+  </section>
+
+  <section id="open">
+    <h2>Open decision</h2>
+    <p class="lede">Model alias deprecation behavior remains the only unresolved product policy.</p>
+    <ol class="blockers"><li><span class="bid">1</span><div><div class="btitle">Deprecated model aliases</div><div class="bdesc">Aliases are stored per provider profile. Until a policy is accepted, Gritt warns and does not remap automatically.</div></div></li></ol>
+  </section>
+
+  <section id="risks">
+    <h2>Risks</h2>
+    <p class="lede">The plan keeps compatibility and safety risks visible from the first phase.</p>
+    <p>Provider drift is controlled with recorded fixtures, adapter contract tests, and capability checks. Connector fragility is isolated with documented protocols, version checks, health checks, and cancellation. Key handling keeps secrets out of files and logs. Cross-platform packaging and signing start in Phase 0. Phase order limits harness and connector scope creep.</p>
+  </section>
+
+  <footer class="pagefoot"><p>Source: <code>.agents/plans/plan1.md</code>, ADR-006 through ADR-011, and the current repository configuration. This document contains no performance claims or external metrics.</p></footer>
+</div>
+<script src="assets/doc-charts.js"></script>
+</body>
+</html>

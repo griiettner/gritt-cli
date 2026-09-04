@@ -99,6 +99,23 @@ After any skill change:
 .agents/cli/target/release/gritt-agent skill sync
 ```
 
+## Audit
+
+Run the read-only semantic audit before handing off a new or edited skill:
+
+```bash
+.agents/cli/target/release/gritt-agent skill audit --skill <skill-name>
+```
+
+Audit the whole canonical tree with no `--skill`. Use `--strict` when the
+repository is ready to require an explicit `## Output` or `## Verification`
+section from every skill. The audit checks frontmatter names, local Markdown
+references, and completion guidance. It never edits files.
+
+Long examples, templates, response formats, and recurring-loop feedback belong
+under the skill's `references/` directory. Keep `SKILL.md` focused on judgement
+and ordered behavior, and make the final response contract explicit.
+
 ## Rules
 
 - Procedure only. Cut examples, pep talks, and duplicated policy.

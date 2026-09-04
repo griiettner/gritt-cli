@@ -1,0 +1,6 @@
+interface:
+  display_name: "Improve Agents Md"
+  short_description: "Refactors AGENTS.md into a short router with targeted relevance rules."
+  default_prompt: "Use $improve-agents-md in this repository."
+policy:
+  allow_implicit_invocation: false

@@ -14,3 +14,7 @@ Rules:
 - Do not write a plan placeholder. Skip the file when `task.md` is already executable as written.
 - Ask only for product or implementation preferences that cannot be discovered from the repo.
 - When updating a real plan, preserve intentional manual decisions unless the user asks for a rewrite.
+
+## Output
+
+Report the qualified ticket, decisions locked, files in scope, and the checks that make the plan executable without reopening settled questions.

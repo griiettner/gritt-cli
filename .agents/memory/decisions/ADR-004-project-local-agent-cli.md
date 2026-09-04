@@ -16,6 +16,8 @@ read_when:
 
 # ADR-004: Project-local agent CLI
 
+The memory storage details in this ADR are superseded by [ADR-005](ADR-005-local-turso-memory-store.md). The Rust binary, repository location, and MCP wiring remain in force.
+
 ## Decision
 
 Repository maintenance for local memory, tickets, and skill adapters runs
@@ -23,8 +25,8 @@ through one Rust binary, `gritt-agent`, whose crate lives at `.agents/cli/`.
 The crate is its own Cargo workspace root and is not a member of the product
 workspace.
 
-Local memory is a SQLite file at `.agents/brain/data/agent-memory.db`. SQLite
-FTS5 is the retrieval baseline and the only retrieval path. The MCP server
+Local memory is a local Turso file at `.agents/brain/data/agent-memory.db`.
+Turso FTS is the retrieval baseline and the only retrieval path. The MCP server
 `gritt-local-memory` is `gritt-agent memory serve` over stdio, declared in
 `.mcp.json` as the release binary path. Each checkout builds it once with
 `cargo build --release --manifest-path .agents/cli/Cargo.toml`.
@@ -44,7 +46,7 @@ tooling is Rust only.
   cost is a documented one-time build.
 - Keeping the crate outside the product workspace means product crate rules
   (no I/O in core, provider neutrality) do not have to bend for tooling.
-- FTS5 alone satisfies the retrieval contract in `.agents/brain/`. Embeddings
+- Local lexical search alone satisfies the retrieval contract in `.agents/brain/`. Embeddings
   and reranking remain future options behind the reserved vector columns.
 
 ## Consequences
@@ -56,4 +58,4 @@ tooling is Rust only.
 - A new maintenance command is a `gritt-agent` subcommand with integration
   coverage under `.agents/cli/tests/`, never a script in another language.
 - Memory search returns citations as `path:start-end` line ranges. Tools that
-  add retrieval later must keep FTS5 working without any provider.
+  add retrieval later must keep local lexical search working without any provider.

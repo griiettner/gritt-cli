@@ -75,3 +75,8 @@ Output exactly:
 ---
 PR created: <full_pr_url>
 ---
+
+## Output
+
+Return the commit hash, pushed branch, PR URL, validation result, and any
+unresolved branch-base issue.

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Show Me"
+  short_description: "Explains a repository topic with the smallest useful diagram or artifact."
+  default_prompt: "Use $show-me in this repository."
+policy:
+  allow_implicit_invocation: true

@@ -40,3 +40,7 @@ Routing metadata: [`index.yaml`](index.yaml).
 2. Match the task to one row in the table.
 3. Load that sub-skill only.
 4. When the work is ticket-driven, [tkt](../tkt/SKILL.md) owns the lifecycle and the report. This family owns the code.
+
+## Output
+
+Report the selected domain skill, files or crate boundaries touched, validation commands, and any follow-up outside the implementation scope.

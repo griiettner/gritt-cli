@@ -34,3 +34,7 @@ Run `git commit -m "<message>"` with the generated message.
 
 If successful, output the commit hash and a brief confirmation.
 If it failed, show the error and suggest next steps.
+
+## Output
+
+Return the commit hash, subject, and whether the staged changes were committed.

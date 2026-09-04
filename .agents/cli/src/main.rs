@@ -215,6 +215,18 @@ enum SkillCommand {
         #[arg(long)]
         prune: bool,
     },
+    /// Audit canonical skill metadata, references, and completion contracts.
+    Audit(SkillAuditArgs),
+}
+
+#[derive(Args)]
+struct SkillAuditArgs {
+    /// Audit one skill instead of the complete canonical tree.
+    #[arg(long)]
+    skill: Option<String>,
+    /// Treat advisory completion-contract findings as errors.
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Args)]
@@ -378,6 +390,13 @@ async fn run(cli: Cli) -> Result<i32> {
                 SkillCommand::Sync { check, prune } => {
                     skill::sync::run(&repo, skill::sync::SyncOptions { check, prune })
                 }
+                SkillCommand::Audit(args) => skill::audit::run(
+                    &repo,
+                    &skill::audit::AuditOptions {
+                        skill: args.skill,
+                        strict: args.strict,
+                    },
+                ),
             }
         }
         // `codex trust` names its target directly: the positional path, else

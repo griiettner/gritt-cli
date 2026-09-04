@@ -67,3 +67,7 @@ After ticket or memory files change:
 .agents/cli/target/release/gritt-agent ticket sync
 .agents/cli/target/release/gritt-agent ticket validate
 ```
+
+## Output
+
+Report the qualified ticket id or lifecycle action, files changed, sync and validation results, and any follow-up recorded outside the ticket.

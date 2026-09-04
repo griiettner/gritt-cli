@@ -40,3 +40,69 @@ memories:
       - changing the local memory database
       - adding memory synchronization or credentials
       - changing full-text retrieval
+  - id: ADR-006
+    title: Gritt product architecture
+    file: ADR-006-product-architecture.md
+    tags:
+      - architecture
+      - rust
+      - workspace
+    read_when:
+      - adding a product crate
+      - changing crate boundaries
+      - deciding where product I/O belongs
+  - id: ADR-007
+    title: Provider and session contracts
+    file: ADR-007-provider-and-session-contracts.md
+    tags:
+      - providers
+      - sessions
+      - events
+    read_when:
+      - adding a provider adapter
+      - changing event or session types
+      - adding a continuation mechanism
+  - id: ADR-008
+    title: Configuration secrets and caches
+    file: ADR-008-configuration-secrets-and-caches.md
+    tags:
+      - configuration
+      - security
+      - providers
+    read_when:
+      - adding a config value
+      - loading or storing a provider key
+      - changing model-list refresh behavior
+  - id: ADR-009
+    title: Terminal interface and tool execution
+    file: ADR-009-terminal-and-tool-execution.md
+    tags:
+      - terminal
+      - tools
+      - permissions
+    read_when:
+      - building the terminal harness
+      - adding a native tool
+      - changing approval or cancellation behavior
+  - id: ADR-010
+    title: Connector authority and supervision
+    file: ADR-010-connector-authority.md
+    tags:
+      - connectors
+      - supervision
+      - approvals
+    read_when:
+      - adding an external agent connector
+      - changing PTY or machine-readable process handling
+      - deciding who owns a connector approval
+  - id: ADR-011
+    title: Release and frontend boundary
+    file: ADR-011-release-and-frontend-boundary.md
+    tags:
+      - release
+      - frontend
+      - distribution
+    read_when:
+      - preparing a release
+      - adding a non-terminal frontend
+      - changing the control-plane boundary

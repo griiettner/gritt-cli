@@ -63,6 +63,11 @@ A review may be split across a subagent, a workflow, or a background or forked s
 3. Resolve and review per that sub-skill's procedure.
 4. Report findings ranked most severe first, with file:line pointers. Use the `ReportFindings` tool when the harness offers it; otherwise write the same ranked list as prose. Fold findings into a ticket's `report.md` instead when the sub-skill says to.
 
+## Output
+
+Return ranked findings with file and line evidence, the verification performed,
+and a clear verdict when no findings remain.
+
 ## Relationship to other review tools
 
 This skill is the repository's own procedure for its three common review shapes. The harness may also offer a separate, more general review skill, for example a deep multi-agent or cloud review across an arbitrary diff. That one is complementary, not a replacement, and the delegation and disclosure rule above still applies when a `review` sub-skill uses it.

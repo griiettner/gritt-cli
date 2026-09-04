@@ -32,4 +32,9 @@ Inspect the artifact frontmatter before executing:
 
 Do not commit, push, or open PRs.
 
+## Output
+
+Report the ticket outcome, acceptance-criteria evidence, validation commands,
+review verdict, and any unresolved follow-up in `report.md`.
+
 For sequenced multi-agent work use [`tkt-exec-chain`](../tkt-exec-chain/SKILL.md) instead.

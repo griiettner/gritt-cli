@@ -206,3 +206,8 @@ Record chain-specific facts in the report:
 - Do not merge a PR and continue on the same branch for the next subtask.
 - Do not treat CI status as the gate if the task policy explicitly says not to
   wait for CI.
+
+## Output
+
+Report each chain step, branch and PR state, reviewer result, and the next
+permitted lifecycle transition.

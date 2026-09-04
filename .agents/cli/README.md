@@ -39,6 +39,7 @@ the working directory to the nearest folder that contains `.agents/`.
 | `ticket validate` | Check ticket folders, frontmatter, chain links, memory frontmatter, and the optional indexes |
 | `skill new <name> <description> [--title <title>] [--force] [--no-openai] [--no-sync] [--dry-run]` | Scaffold `.agents/skills/<name>/SKILL.md` and `agents/openai.yaml`, then run `skill sync` |
 | `skill sync [--check] [--prune]` | Regenerate `.claude/skills/*/SKILL.md` stubs and each skill's `agents/openai.yaml` policy block, keeping any leading `#` comment lines such as the migration marker |
+| `skill audit [--skill NAME] [--strict]` | Read-only semantic checks for canonical skill metadata, local references, and output or verification contracts |
 | `codex trust [path] [--check]` | Add or check the `trust_level = "trusted"` entry for a repository in `$CODEX_HOME/config.toml` (default `~/.codex`). Refuses only when the same path is keyed as a literal-string header or an inline table entry |
 | `migrate cursor --source <path> [--dry-run] [--force] [--no-sync]` | Import `.cursor`/`.claude` skills, agents, and rules into `.agents/`, write `.agents/migrations/` reports, and run the maintenance commands (`skill sync` only when `.agents/skills/` exists) |
 

@@ -24,3 +24,7 @@ Build the binary first when it is missing: `cargo build --release --manifest-pat
 Add `--check` to the first two to report drift without writing.
 
 Report what changed and any validation error. Never hand-edit a generated file to make the check pass. The tools are idempotent and safe to rerun.
+
+## Output
+
+Report generated files updated, drift status, validation status, and any preserved user-owned files.

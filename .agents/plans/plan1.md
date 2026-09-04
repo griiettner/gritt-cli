@@ -1,15 +1,28 @@
 # Plan: Gritt agent workspace
 
+[HTML version](plan1.html)
+
 ## Objective
 
-Build Gritt, a local application for running AI agent sessions from one place. It starts as a terminal program and grows into a control plane with a desktop or web front end later. The repository keeps the name `gritt-cli` for now.
+Build Gritt, an open-source Rust application for running AI coding agents from one place. The first release targets macOS, Windows, and Linux. It starts as a terminal program and grows into a control plane with another frontend later. The repository keeps the name `gritt-cli` for now.
 
 Gritt gives the user two ways to run work:
 
 1. Native path. The user supplies an API key for a model provider. Gritt runs its own agent loop, tools, permissions, and sessions against that provider.
-2. Connector path. The user prefers an installed agent such as Codex, Claude Code, Cursor, or OpenCode. Gritt launches and supervises that agent, and the agent's own harness owns the loop. Gritt shows its activity, relays approvals, and stores the session alongside native ones.
+2. Connector path. The user prefers an installed agent such as Codex, Claude Code, Cursor, or OpenCode. Gritt launches and supervises that agent. The agent keeps its own command and tool authority. Gritt shows its activity, relays approvals, and stores the session alongside native ones.
 
-Both paths feed one event model, one session store, and one interface.
+Both paths feed one event model, one session store, and one interface. Planning is conversational. Coding is the tool-using execution phase. Both phases remain in one session.
+
+```mermaid
+flowchart LR
+  User --> UI[Terminal interface]
+  UI --> Control[Control plane]
+  Control --> Native[Native provider loop]
+  Control --> Connector[External agent connector]
+  Native --> Events[Provider-neutral events]
+  Connector --> Events
+  Events --> Sessions[Owned session store]
+```
 
 ## Providers
 
@@ -26,11 +39,11 @@ Routing is by configured provider profile, never by guessing from a model name. 
 
 ### Model lists
 
-Each provider adapter fetches its own model list (`GET /models` on OpenRouter and OpenAI, `GET /v1/models` on Anthropic) and caches it on disk with a fetch timestamp. Gritt exposes a refresh command and an expiry policy. On fetch failure it uses the last cached list and marks it stale. Where a provider reports capabilities (context length, tools, vision, structured output, pricing), Gritt records them and does not advertise a feature the provider does not report.
+Each provider adapter fetches its own model list (`GET /models` on OpenRouter and OpenAI, `GET /v1/models` on Anthropic) and caches it on disk with a fetch timestamp. Gritt refreshes at most once per day. On fetch failure it uses the last cached list and marks it stale. Where a provider reports capabilities, Gritt records them and does not advertise a feature the provider does not report.
 
 ### Adapter contract
 
-One internal trait: send a prompt and stream provider-neutral events, submit tool results, restore a session from stored continuation state, report capabilities for a selected model, and report errors in internal error kinds. Provider-specific fields travel only as optional diagnostic metadata on events. Nothing above an adapter learns which provider served a request.
+One internal trait sends a prompt and streams provider-neutral events, submits tool results, restores a session from stored continuation state, reports capabilities for a selected model, and reports errors in internal error kinds. Provider-specific fields travel only as optional diagnostic metadata on events. Nothing above an adapter learns which provider served a request.
 
 Implementation order: OpenAI-compatible Chat Completions first, because it covers OpenRouter and the generic profile. Then OpenAI Responses. Then Anthropic Messages.
 
@@ -44,9 +57,10 @@ Tool definitions are generated per adapter, because accepted JSON schema dialect
 
 ## Keys
 
-- Keys come from the environment or the operating system keychain. A config file names the variable that carries a key. It never holds the value. Loading a config that contains a key fails loudly.
+- Keys come from the operating system credential store first, then the named environment variable. A config file names the variable that carries a key. It never holds the value. Loading a config that contains a key fails loudly.
 - Entering a key in the interface stores it in the keychain, not in a file.
 - Keys never appear in logs, fixtures, errors, or transcripts.
+- If no keychain is available, environment-only operation remains supported.
 
 ## Sessions and events
 
@@ -56,13 +70,13 @@ Sessions are named, listable, resumable, and removable, and are owned by Gritt. 
 
 ## Permissions and built-in tools
 
-A policy engine with `allow`, `ask`, and `deny` outcomes, matched on tool name and resource, with wildcard resource rules and workspace-aware defaults. It runs before every tool execution on the native path. On the connector path, Gritt relays the agent's own approval requests and records the decision.
+A policy engine with `allow`, `ask`, and `deny` outcomes, matched on tool name and resource, with wildcard resource rules and workspace-aware defaults. It runs before every tool execution on the native path. Native tools include workspace-bounded file read, file write, and shell execution. On the connector path, the external agent retains its documented authority. Gritt relays approval requests and records the decision.
 
 First-version native tools: file read and write within the workspace, and shell execution under approval. Child processes are tracked so cancellation stops them.
 
 ## Harness and interface
 
-Terminal first. Print mode (one prompt in, streamed text out, scriptable) is the fallback every feature degrades to. REPL mode adds history and continuation. The full-screen harness adds a streamed transcript with tool activity, a multiline prompt editor, a status bar (model, provider, session, usage, connection), tool approval views, diff review before file writes, cancellation, a command palette, and task views.
+Terminal first. Ratatui 0.30.2 with Crossterm 0.29 provides the full-screen UI on macOS, Windows, and Linux. Print mode (one prompt in, streamed text out, scriptable) is the fallback every feature degrades to. REPL mode adds history and continuation. The full-screen harness adds a streamed transcript with tool activity, a multiline prompt editor, a status bar (model, provider, session, usage, connection), tool approval views, diff review before file writes, cancellation, a command palette, and task views.
 
 Reference projects for interaction design are OpenCode's permission model, Warp's terminal and agent mode split, and T3 Code's local multi-agent workspace. Study behavior and reimplement. Do not copy source, and do not add Git dependencies without a license and maintenance review.
 
@@ -78,7 +92,7 @@ Order: native, Codex, Claude Code, then Cursor and OpenCode after their interfac
 
 Precedence: command-line flags, then project config, then user config, then environment variables, then built-in defaults.
 
-Config holds provider profiles (protocol, base URL, key variable name), model aliases, default model and provider, list refresh policy, tool policy, connector settings, and interface preferences.
+Config holds provider profiles (protocol, base URL, key variable name), model aliases, default model and provider, list refresh policy, tool policy, connector settings, and interface preferences. Structured logs are content-free by default. Explicit content logging retains seven days of data.
 
 ## Language and runtime
 
@@ -86,7 +100,7 @@ Rust. One native binary per platform, no runtime dependency at install time. Gri
 
 ## First-version scope
 
-Provider profiles for OpenRouter, OpenAI, Anthropic, and generic OpenAI-compatible endpoints. Model list fetch, cache, and refresh. Print and REPL modes with streaming. Named sessions with resume. File and shell tools under the permission engine. Clear unsupported-capability and provider errors. Structured, content-free logs by default.
+Provider profiles for OpenRouter, OpenAI, Anthropic, and generic OpenAI-compatible endpoints. Model list fetch, daily cache, and stale fallback. Print and REPL modes with streaming. Named sessions with resume. Planning and coding phases. File and shell tools under the permission engine. Clear unsupported-capability and provider errors. Structured, content-free logs by default.
 
 Deferred: plugin systems, embeddings and reranking commands, automatic retry after failed tool calls, multi-agent orchestration beyond child sessions, a desktop front end, and reproducing every feature of the connected agents.
 
@@ -98,7 +112,7 @@ Deferred: plugin systems, embeddings and reranking commands, automatic retry aft
 - Create the Cargo workspace and crate boundaries.
 - Define the event, session, tool, config, and adapter contracts.
 - Prototype the HTTPS client and SSE parser against OpenRouter with recorded fixtures.
-- Pick the terminal UI crate after the reference study, with the decision recorded.
+- Add the terminal shell with Ratatui and Crossterm, with the decision recorded in ADR-009.
 
 Exit: packaging is viable, contracts compile in a crate with no I/O dependency, a streamed request succeeds through OpenRouter, fixtures replay in tests.
 
@@ -137,16 +151,29 @@ Exit: a new user installs one binary, adds a key, and runs both modes without re
 
 Exit: the control plane runs the native connector and at least two external ones in one interface and recovers from cancellation, process exit, and connector failure.
 
-## Open questions
+## Decisions recorded in ADRs
 
-- Which terminal UI crate meets accessibility and platform requirements?
-- Which operating systems must the first release support?
-- Should the OpenAI profile default to Responses or Chat Completions?
-- Which keychain crate covers macOS, Windows, and Linux acceptably, and what is the fallback when no keychain exists?
-- How are model aliases and deprecations managed across providers?
-- How long is a cached model list valid, and does Gritt fail closed when it is stale?
-- What logging and retention rules apply to prompts, tool inputs, outputs, and provider errors?
-- What is the first non-terminal front end, and does it talk to the control plane over a local socket or an in-process API?
+- The first release supports macOS, Windows, and Linux. See ADR-006 and
+  ADR-011.
+- The full-screen terminal UI uses Ratatui 0.30.2 with Crossterm 0.29. See
+  ADR-009.
+- OpenAI profiles support both Responses and Chat Completions. OpenRouter and
+  generic endpoints use Chat Completions first. See ADR-007.
+- Provider keys use the OS keychain first and the named environment variable
+  second. If no keychain exists, environment-only operation is allowed. See
+  ADR-008.
+- Model lists refresh once per day by default. Failed refreshes use the last
+  cached list and mark it stale. See ADR-008.
+- Content-free structured logs are the default. Explicit content logging is
+  retained for seven days. See ADR-008.
+- The first non-terminal frontend uses an in-process API. A local socket is
+  deferred until a second process needs it. See ADR-011.
+- External connectors retain their documented command and tool authority.
+  Gritt supervises, relays approvals, records decisions, and normalizes
+  events. See ADR-010.
+
+Model aliases are stored per provider profile. Until a deprecation policy is
+accepted, Gritt warns about deprecated aliases and does not remap them.
 
 ## Risks
 

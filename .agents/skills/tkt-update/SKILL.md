@@ -9,4 +9,9 @@ Read [tkt](../tkt/SKILL.md) first. Update file contents and the report `## Updat
 
 Only create an update when the user names `TKT-NNNN` or the command argument resolves one. Ask which ticket it belongs to when none is named.
 
+## Output
+
+Report the qualified ticket, update path, linked report change, and any later
+work that remains open.
+
 Resolve the ticket through [tkt/store](../tkt/store/SKILL.md), using `<namespace>/TKT-NNNN` when the bare id is ambiguous. Write `updates/YYYY-MM-DD-<slug>.md` in that ticket folder, then link it from `report.md` in reverse chronological order. Create a concise `report.md` first when the ticket has none.
