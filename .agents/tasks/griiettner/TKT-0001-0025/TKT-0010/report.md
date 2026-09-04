@@ -37,7 +37,10 @@ provider field except through the event `diagnostic`.
 - Base branch: `feature/tkt-0008-gritt-cli` at `d0adcb2` (PR #1 merge).
 - Worktree: `/Users/griiettner/Projects/grittflow/gritt-cli-tkt-0010`.
 - Branch: `tkt-0010-02-providers`.
-- Commits and PR: listed under Updates once the PR is open.
+- Commits: `1070cb9` (provider layer, fixtures, ticket artifacts) and the
+  report update listed under Updates.
+- PR: https://github.com/griiettner/gritt-cli/pull/2 into
+  `feature/tkt-0008-gritt-cli`.
 - `gritt-core` change: none. The TKT-0009 contracts were sufficient.
 
 ## What Landed
@@ -161,8 +164,17 @@ All run from the worktree root on 2026-09-04:
   cache, 1 TCP end to end, 3 live tests that skip without keys).
 - `cargo test --workspace`: pass, 60 tests.
 - `cargo build --release`: pass, 1m 34s.
-- `gritt-agent ticket validate --repo-root .` and both chain-check commands:
-  recorded under Updates with the PR.
+- `gritt-agent ticket validate --repo-root .`: `tkt_validate ok (0
+  warnings)`.
+- `gritt-agent ticket chain-check --repo-root . --ticket TKT-0010 --base
+  origin/feature/tkt-0008-gritt-cli`: `tkt_chain_check ok (0 warning(s))`,
+  45 changed files, merge-base equal to the base tip `d0adcb2`. The remote
+  ref was used because the local `feature/tkt-0008-gritt-cli` branch in the
+  main checkout still pointed at `ab3e34a`; the PM should fast-forward it.
+- `gritt-agent ticket chain-check --repo-root . --ticket TKT-0010 --base
+  main`: `tkt_chain_check ok (3 warning(s))`. The warnings are the TKT-0009
+  ticket files that reached the feature branch through PR #1 and the
+  expected merge-base gap between `main` and the feature branch.
 
 ## Completion Gate
 
@@ -195,4 +207,5 @@ All run from the worktree root on 2026-09-04:
 
 ## Updates
 
-- None yet.
+- 2026-09-04 report update. Added the commit, PR #2, and chain-check
+  evidence after the PR was opened. No code changed.
