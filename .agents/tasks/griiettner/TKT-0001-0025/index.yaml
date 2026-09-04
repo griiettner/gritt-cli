@@ -131,7 +131,7 @@ tickets:
   - id: TKT-0008
     namespace: griiettner
     title: Build the complete Gritt local AI coding agent CLI
-    status: planning
+    status: in_progress
     owner: griiettner
     priority: normal
     created: 2026-09-04
