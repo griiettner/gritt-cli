@@ -131,6 +131,10 @@ pub struct ReqwestTransport {
 
 impl ReqwestTransport {
     pub fn new() -> Result<Self> {
+        // `reqwest` is built without a TLS crypto provider so the workspace
+        // never pulls `aws-lc-rs`; `ring` is installed once here. A second
+        // install attempt only reports that one already exists.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
             .user_agent(concat!("gritt/", env!("CARGO_PKG_VERSION")))
             .build()

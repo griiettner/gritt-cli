@@ -1,0 +1,7 @@
+# Pinned so a release can be rebuilt byte for byte later. `cargo` and
+# `rustup` read this file automatically; the release scripts and the
+# product workflow install exactly this version.
+[toolchain]
+channel = "1.93.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

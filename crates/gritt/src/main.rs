@@ -24,6 +24,7 @@ use gritt_provider::models::{ModelCache, ModelCatalog};
 use gritt_provider::ReqwestTransport;
 
 mod config;
+mod doctor;
 mod keys;
 
 /// Run native and installed AI coding agents from one local terminal.
@@ -83,6 +84,12 @@ enum Command {
     /// List connectors with installed state, version, auth, and
     /// capabilities.
     Connectors,
+    /// Diagnose this installation: config locations and precedence, key
+    /// availability, database and migrations, model cache freshness,
+    /// connectors, and terminal capabilities. Never prints a secret.
+    Doctor,
+    /// Print the local, content-free telemetry and analytics records.
+    Telemetry,
 }
 
 #[derive(Args, Clone)]
@@ -630,6 +637,45 @@ async fn connectors_command(workspace: &Path, database: Option<&Path>) -> Result
     Ok(ExitCode::SUCCESS)
 }
 
+async fn doctor_command(workspace: &Path, database: Option<&Path>) -> Result<ExitCode> {
+    let store = open_store(workspace, database).await?;
+    let args = SessionArgs {
+        session: None,
+        profile: None,
+        model: None,
+        plan: false,
+        code: false,
+        approve_all: false,
+        deny_all: true,
+        ask: false,
+        no_models: true,
+        connector: None,
+    };
+    // A broken config or connector setup is itself a finding, not a reason
+    // to print nothing.
+    let (plane, config_error) = match builder(workspace, database, &args).await {
+        Ok(builder) => match plane(builder) {
+            Ok(plane) => (Some(plane), None),
+            Err(error) => (None, Some(error.message)),
+        },
+        Err(error) => (None, Some(error.message)),
+    };
+    let report = doctor::report(workspace, &store, plane.as_ref(), config_error.as_deref()).await?;
+    for line in report.lines {
+        println!("{line}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn telemetry_command(workspace: &Path, database: Option<&Path>) -> Result<ExitCode> {
+    let store = open_store(workspace, database).await?;
+    let config = config::load(workspace, std::env::vars())?;
+    let telemetry = Telemetry::new(Arc::clone(&store), config.logging.clone());
+    telemetry.purge_content(chrono::Utc::now()).await?;
+    print!("{}", telemetry.dump_text().await?);
+    Ok(ExitCode::SUCCESS)
+}
+
 fn show_config(workspace: &Path) -> Result<ExitCode> {
     let config = config::load(workspace, std::env::vars())?;
     println!("workspace: {}", workspace.display());
@@ -698,6 +744,8 @@ async fn main() -> ExitCode {
         Some(Command::Tui { session }) => run_tui_mode(&workspace, database, &session).await,
         Some(Command::Session { command }) => session_command(&workspace, database, command).await,
         Some(Command::Connectors) => connectors_command(&workspace, database).await,
+        Some(Command::Doctor) => doctor_command(&workspace, database).await,
+        Some(Command::Telemetry) => telemetry_command(&workspace, database).await,
     };
     match result {
         Ok(code) => code,
