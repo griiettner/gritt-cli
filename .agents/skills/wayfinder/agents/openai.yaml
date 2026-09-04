@@ -1,0 +1,6 @@
+interface:
+  display_name: "Wayfinder"
+  short_description: "Decomposes large work into decision-complete dependency tickets."
+  default_prompt: "Use $wayfinder in this repository."
+policy:
+  allow_implicit_invocation: false

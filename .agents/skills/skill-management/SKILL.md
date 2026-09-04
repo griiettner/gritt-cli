@@ -116,6 +116,17 @@ Long examples, templates, response formats, and recurring-loop feedback belong
 under the skill's `references/` directory. Keep `SKILL.md` focused on judgement
 and ordered behavior, and make the final response contract explicit.
 
+Skills have two invocation axes. User-invoked skills orchestrate a conversation
+or workflow and should stay disabled for implicit invocation. Model-invoked
+skills hold reusable discipline that can be reached when the task matches. A
+user-invoked skill may route to a model-invoked skill, but not to another
+user-invoked skill.
+
+Treat every description and local link as a context pointer. It must name the
+material and the branch that should trigger loading it. Keep universal context
+in `AGENTS.md`, disclose branch-specific guidance through targeted skills, and
+end ordered steps with checkable completion criteria.
+
 ## Rules
 
 - Procedure only. Cut examples, pep talks, and duplicated policy.

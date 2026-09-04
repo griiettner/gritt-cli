@@ -63,6 +63,12 @@ A review may be split across a subagent, a workflow, or a background or forked s
 3. Resolve and review per that sub-skill's procedure.
 4. Report findings ranked most severe first, with file:line pointers. Use the `ReportFindings` tool when the harness offers it; otherwise write the same ranked list as prose. Fold findings into a ticket's `report.md` instead when the sub-skill says to.
 
+For a broad implementation review, run two independent axes before aggregating:
+[standards](standards/SKILL.md) checks repository and design rules, while
+[spec](spec/SKILL.md) checks the originating ticket or request. Keep their
+findings separate until the final report so one perspective does not hide the
+other.
+
 ## Output
 
 Return ranked findings with file and line evidence, the verification performed,

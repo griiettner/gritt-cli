@@ -9,6 +9,12 @@ Read [tkt](../SKILL.md) first. This governs every execution skill: `tkt-exec` an
 
 The ticket is the contract. `task.md` and `plan.md` exist to close the open questions before execution starts, so execution does not reopen them.
 
+For a chain, the delivery contract includes a new worktree, branch, commit, PR,
+review, and merge for every worker step. The agent owns carrying that sequence
+through to the final integrated result. It must use best judgment on choices
+already within the ticket's scope and must not invent a requirements pause to
+avoid the delivery steps.
+
 ## Track the goal
 
 1. Before the first edit, state the goal as one outcome with the qualified ticket id, for example `griiettner/TKT-0007: catalog cache falls back to the last good copy`. Use the harness goal or task tool when one exists; otherwise write it at the top of your working notes.
@@ -39,6 +45,11 @@ These questions are noise during execution. Pick, note the choice, move on:
 - "should I also..."
 - "which approach do you prefer..."
 - anything already settled in the plan.
+
+If execution reveals missing context that should have been answered during
+ticket creation, record the best-judgment assumption and continue when safe.
+Only a real external blocker may pause the chain, and it must include a
+concrete recovery action.
 
 ## Keep changes to the task
 

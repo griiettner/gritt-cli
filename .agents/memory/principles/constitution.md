@@ -32,3 +32,9 @@ read_when:
 - Read indexes first; do not scan entire trees by default.
 - Do not create placeholder files just to satisfy structure.
 - Regenerated indexes may be replaced at any time; they are not the source of truth.
+- A chain-managed ticket is an end-to-end delivery contract. Each worker uses a
+  new worktree and branch, commits, opens a PR, passes review, and merges before
+  the next worker starts. The chain is incomplete until the final reviewer and
+  integrated merge pass.
+- Material requirements belong in ticket creation and planning. Execution uses
+  best judgment within that contract and does not reopen settled questions.

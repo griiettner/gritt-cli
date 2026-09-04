@@ -1,0 +1,6 @@
+interface:
+  display_name: "Writing For Agents"
+  short_description: "Writes concise, discoverable instructions for agents."
+  default_prompt: "Use $writing-for-agents in this repository."
+policy:
+  allow_implicit_invocation: true

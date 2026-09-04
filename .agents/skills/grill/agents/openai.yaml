@@ -1,0 +1,6 @@
+interface:
+  display_name: "Grill"
+  short_description: "Resolves ambiguous plans and designs through a focused interview."
+  default_prompt: "Use $grill in this repository."
+policy:
+  allow_implicit_invocation: false

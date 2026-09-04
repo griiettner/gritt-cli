@@ -39,6 +39,10 @@ Recommended order:
 3. Open only the files needed for the current task.
 4. Treat task folders as canonical for ticket-specific history.
 
+Chain-managed tickets add a delivery sequence on top of this routing: one
+worker per fresh worktree and branch, one committed PR per worker, review and
+merge before the next worker, then a final integrated review.
+
 ## Frontmatter and indexes
 
 Durable memory files and task artifacts should start with YAML frontmatter.

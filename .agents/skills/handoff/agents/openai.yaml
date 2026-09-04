@@ -1,0 +1,6 @@
+interface:
+  display_name: "Handoff"
+  short_description: "Captures compact continuation context for another agent or session."
+  default_prompt: "Use $handoff in this repository."
+policy:
+  allow_implicit_invocation: false

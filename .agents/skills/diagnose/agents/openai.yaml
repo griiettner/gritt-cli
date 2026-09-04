@@ -1,0 +1,6 @@
+interface:
+  display_name: "Diagnose"
+  short_description: "Builds a tight red-capable debugging loop before fixing a failure."
+  default_prompt: "Use $diagnose in this repository."
+policy:
+  allow_implicit_invocation: false

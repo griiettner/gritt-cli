@@ -86,3 +86,45 @@ tickets:
       - skill-management
       - dev-cli
       - write-docs
+  - id: TKT-0006
+    namespace: griiettner
+    title: Add engineering discipline and agent handoff skills
+    status: done
+    owner: griiettner
+    priority: normal
+    created: 2026-09-04
+    updated: 2026-09-04
+    artifacts:
+      concept: .agents/tasks/griiettner/TKT-0001-0025/TKT-0006/concept.md
+      plan: .agents/tasks/griiettner/TKT-0001-0025/TKT-0006/plan.md
+      task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0006/task.md
+      report: .agents/tasks/griiettner/TKT-0001-0025/TKT-0006/report.md
+    dependencies: []
+    areas:
+      - .agents/skills
+      - .agents/cli
+    skills:
+      - skill-management
+      - dev-cli
+      - tkt-plan
+  - id: TKT-0007
+    namespace: griiettner
+    title: Enforce end-to-end chain worktree PR and merge delivery
+    status: done
+    owner: griiettner
+    priority: normal
+    created: 2026-09-04
+    updated: 2026-09-04
+    artifacts:
+      task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0007/task.md
+      report: .agents/tasks/griiettner/TKT-0001-0025/TKT-0007/report.md
+    dependencies: []
+    areas:
+      - .agents/skills
+      - .agents/memory
+    skills:
+      - tkt-exec-chain
+      - tkt-new-chain
+      - tkt-autonomy
+      - tkt-plan
+      - memory-write

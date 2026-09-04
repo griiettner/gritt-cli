@@ -12,6 +12,21 @@ This skill extends `tkt` for tickets that must run as a controlled PM -> worker 
 
 For a one-shot ticket run use [`tkt-exec`](../tkt-exec/SKILL.md) instead.
 
+## Non-negotiable delivery contract
+
+A chain is not complete when code exists or a PR is open. Every worker step
+must run in a new worktree and feature branch, commit its changes, push the
+branch, open a PR, pass review, and merge that PR before the next step starts.
+The chain must continue through the final reviewer and merged result. Stopping
+after implementation, leaving work on the current branch, opening an unmerged
+PR, or asking the user whether to merge is a chain-execution failure.
+
+The only valid reason to pause is a real external blocker such as missing
+credentials, unavailable GitHub access, an explicit permission denial, or a
+merge conflict that requires information unavailable to the agent. State the
+exact blocker and recovery action. “This is safer,” “the user should merge,”
+“CI is inconvenient,” or “the work is done” are not blockers.
+
 ## Goal and autonomy
 
 Every role in the chain follows [tkt/autonomy](../tkt/autonomy/SKILL.md):
@@ -52,7 +67,10 @@ PM responsibilities:
   asking the user for confirmation first — this is standing autonomy for the
   chain, not a per-PR judgement call. Do not stop to ask whether to merge.
 - route reviewer findings back into the next worker step;
-- close the loop only after the final reviewer pass.
+- close the loop only after every worker PR is merged and the final reviewer
+  pass confirms the integrated result;
+- treat any worker without a merged PR as incomplete and route it back to
+  execution instead of reporting partial completion.
 
 If a merge attempt is blocked by a permission or classifier layer outside the
 skill (for example a harness auto-mode safety classifier), that is a tooling
@@ -75,10 +93,11 @@ The worker performs one scoped subtask only.
 Worker responsibilities:
 
 - sync from the configured base branch before doing work;
-- create a fresh feature branch for that subtask;
+- create a fresh worktree and feature branch for that subtask;
 - keep changes inside the assigned scope;
 - update ticket artifacts needed for review evidence;
 - commit, push, and open a PR;
+- merge its approved PR, or return the exact external blocker to the PM;
 - report back to the PM with branch name, PR link, validation run, and
   unresolved risks;
 - stop after handoff; do not start the next subtask.
@@ -99,14 +118,19 @@ Reviewer responsibilities:
 ## Chain Rules
 
 1. One active worker at a time.
-2. Every worker starts from a freshly updated base branch.
-3. Every worker uses a new feature branch.
-4. Every worker opens a separate PR.
-5. Every worker PR is reviewed before the PM advances the chain.
-6. The next worker does not start until the prior PR is merged.
-7. Do not wait for CI/CD if this chain's policy says CI is unreliable or out
+2. Every worker starts from a freshly updated base branch in a new worktree.
+3. Every worker uses a new feature branch. Reusing the current checkout or a
+   prior worker branch is prohibited.
+4. Every worker commits its scoped changes before opening a PR.
+5. Every worker opens a separate PR against the configured base branch.
+6. Every worker PR is reviewed before the PM advances the chain.
+7. The PM merges every approved worker PR before the next worker starts.
+8. The next worker starts from the updated base branch and a new worktree.
+9. Do not wait for CI/CD if this chain's policy says CI is unreliable or out
    of quota; rely on explicit reviewer validation instead.
-8. The PM must record reviewer findings and route fixes before moving on.
+10. The PM must record reviewer findings and route fixes before moving on.
+11. The final reviewer pass and merged integrated state are required for
+    completion. A partial chain is not a successful chain.
 
 ## Required Inputs
 
@@ -121,6 +145,10 @@ Before using this skill, make these explicit in the task or PM handoff:
 - benchmark steps, if any;
 - final completion condition.
 
+If any input is missing, the chain ticket was written too weakly. Return to
+ticket creation or planning and resolve it there. Do not turn execution into a
+requirements interview.
+
 Current default: if no later process decision overrides it, use `main` as the
 base branch.
 
@@ -128,19 +156,28 @@ base branch.
 
 For each worker step:
 
-1. Check out the configured base branch.
-2. Pull the latest remote state for that base branch.
-3. Create a fresh feature branch for the subtask.
-4. Execute only the assigned scope.
-5. Run the required validation from the ticket.
-6. Commit the changes.
-7. Push the branch.
-8. Open a PR against the configured base branch.
-9. Hand off to reviewer.
-10. Wait for PM instruction after review.
+1. Pull the latest remote state for the configured base branch.
+2. Create a new worktree and feature branch for the subtask:
+   `git worktree add ../<repo>-<step> -b <branch> <base>`.
+3. Execute only the assigned scope inside that worktree.
+4. Run the required validation from the ticket.
+5. Commit the changes in the worker worktree.
+6. Push the branch and open a PR against the configured base branch.
+7. Hand off to the reviewer with the commit, branch, worktree, PR, and
+   validation evidence.
+8. Resolve every review finding in the same worker branch, commit and push the
+   fix, and repeat review until `pass`.
+9. Merge the approved PR. Confirm the merge commit or merged state.
+10. Remove the worker worktree only after the merge is confirmed.
+11. Report the merged result to the PM, which may then start the next step.
 
 Never continue working on a previous worker branch after merge. The next worker
 must restart from the updated base branch.
+
+The worker handoff is not the end of the step. Before marking a step complete,
+verify the PR state with `gh pr view <number> --json state,mergeCommit` and
+require `state: MERGED`. An open, approved, closed-without-merge, or locally
+committed branch is incomplete and must remain active.
 
 ## Reviewer Sequence
 
@@ -158,6 +195,9 @@ Use the tool output as the deterministic gate before semantic review.
 Then run the semantic review: [review/ticket](../review/ticket/SKILL.md) against the worker ticket's `task.md` covers scope drift, unrelated files, and acceptance criteria; [review/impact](../review/impact/SKILL.md) over the worker's diff covers regressions. On top of both, check what neither one knows about the chain:
 
 - branch was created from the correct base branch;
+- a new worktree was used and removed only after merge;
+- a commit exists on the worker branch;
+- the PR is merged, not merely opened or approved;
 - validation was run or honestly reported as not run;
 - benchmarks were executed when the task required them;
 - no obvious conflict was introduced for later chain steps.
@@ -197,6 +237,19 @@ Record chain-specific facts in the report:
 - reviewer verdicts;
 - benchmarks run;
 - final unresolved risks.
+
+Also record, for every worker, the worktree path, branch, commit, PR, merge
+commit or merged state, reviewer verdict, and any fix round.
+
+The completion table is a hard gate:
+
+```text
+new worktree -> new branch -> scoped changes -> validation -> commit
+-> push -> PR -> review pass -> merge -> confirm merged state
+```
+
+No arrow may be skipped, and the next worker may not begin until the merge
+confirmation is recorded.
 
 ## Boundaries
 

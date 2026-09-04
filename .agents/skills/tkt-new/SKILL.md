@@ -18,6 +18,13 @@ Before running the allocator, reason about the requested work:
    and reviewer gates. Do not use it merely because the work has multiple
    files.
 
+Write an executable ticket, not a placeholder for future discovery. Before
+allocation, establish the goal, scope, exclusions, acceptance criteria,
+verification, dependencies, and owner. For chain work, also establish the
+worktree, branch, PR, review, merge, and final completion contract. If context
+is missing, use planning or a focused interview first. A ticket that knowingly
+defers material context to execution is a failed ticket-writing pass.
+
 Then run the allocator. Never choose or skip an id manually. The allocator
 rejects any namespace with a missing earlier id instead of silently advancing.
 Ticket creation and index synchronization are treated as one operation. If

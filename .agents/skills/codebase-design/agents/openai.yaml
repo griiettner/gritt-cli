@@ -1,0 +1,6 @@
+interface:
+  display_name: "Codebase Design"
+  short_description: "Evaluates module boundaries and public seams for deep, maintainable design."
+  default_prompt: "Use $codebase-design in this repository."
+policy:
+  allow_implicit_invocation: true

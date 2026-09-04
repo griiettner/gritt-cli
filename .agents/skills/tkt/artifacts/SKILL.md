@@ -32,6 +32,11 @@ Full ticket, for complex, risky, multi-step, cross-file, or future-reference-hea
 
 Do not create placeholder artifacts just to satisfy structure. A missing `plan.md` or `report.md` is valid when the ticket has not needed that artifact yet.
 
+Every created `task.md` must be executable by the owner without reopening
+material requirements. Missing context belongs in `concept.md` or `plan.md`
+before execution, with an explicit assumption or decision owner. Chain tickets
+must include the complete delivery contract before `tkt-exec-chain` starts.
+
 ## Artifact roles
 
 - `concept.md`: initial idea, user problem, rough scope, unknowns, success criteria.

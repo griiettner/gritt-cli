@@ -46,7 +46,15 @@ Replace them with real content in the same session that created the chain:
 - orchestrator goal, inputs, scope, out of scope, acceptance criteria, verification, validation per step, benchmark requirements, final completion condition;
 - each worker goal, scope, out of scope, acceptance criteria, verification;
 - reviewer architecture and behavior checks;
-- `plan.md` step descriptions and open decisions.
+- `plan.md` step descriptions and resolved decisions. A chain may not enter
+  execution with open material decisions.
+
+The chain must not be handed to `tkt-exec-chain` while any material context is
+missing. Resolve the objective, scope, dependencies, branch and merge policy,
+validation, review gates, and final completion condition during ticket creation
+or planning. “The worker can decide later” is not a substitute for context.
+If the ticket cannot answer a question, record the explicit assumption and its
+owner before execution starts.
 
 Add `concept.md` when the chain needs user-problem framing, and `plan.md` when the PM must sequence subtasks or set review gates. `report.md` comes later, once execution produces history.
 
@@ -72,6 +80,12 @@ The tool writes the structural ones. You still own the judgement ones:
 
 A clean run means every chain ticket exists, the parent and child links agree, and no scaffold marker is left. Do not report the chain as created until this passes.
 
+Before reporting readiness, read every generated `task.md` and `plan.md` as an
+executor. Confirm that each worker can create its worktree, commit, open a PR,
+and merge without asking a requirements question that belongs in the ticket.
+
 ## Output
 
-Report the orchestrator id and path, the ordered worker ids with their branch names, the reviewer id, that the ticket is chain-managed under `tkt-exec-chain`, and any process decision the PM must settle before execution starts.
+Report the orchestrator id and path, the ordered worker ids with their branch
+names, the reviewer id, and that the ticket is chain-managed under
+`tkt-exec-chain`. Do not report unresolved process decisions as a normal output.
