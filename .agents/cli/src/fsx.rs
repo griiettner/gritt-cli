@@ -26,7 +26,7 @@ pub struct Entry {
 
 /// Orders names the way the replaced scripts did: case-insensitively first,
 /// then by bytes so the order is still total.
-fn compare_names(left: &str, right: &str) -> Ordering {
+pub fn compare_names(left: &str, right: &str) -> Ordering {
     left.to_lowercase()
         .cmp(&right.to_lowercase())
         .then_with(|| left.cmp(right))
@@ -115,5 +115,138 @@ pub fn relative_posix(root: &Path, target: &Path) -> String {
             .collect::<Vec<_>>()
             .join("/"),
         Err(_) => target.to_string_lossy().into_owned(),
+    }
+}
+
+/// Renders the path from directory `from` to `target` with `..` segments and
+/// forward slashes, like Node's `path.relative`. Both paths should be
+/// absolute or share the same base.
+pub fn relative_path_posix(from: &Path, target: &Path) -> String {
+    let from: Vec<_> = from.components().collect();
+    let to: Vec<_> = target.components().collect();
+    let common = from
+        .iter()
+        .zip(to.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut parts: Vec<String> = vec!["..".to_owned(); from.len() - common];
+    parts.extend(
+        to[common..]
+            .iter()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned()),
+    );
+    parts.join("/")
+}
+
+/// Resolves `.` and `..` segments lexically and drops a trailing separator,
+/// like Node's `path.resolve`, without touching the filesystem.
+pub fn normalize_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !matches!(
+                    result.components().next_back(),
+                    None | Some(Component::RootDir) | Some(Component::Prefix(_))
+                ) {
+                    result.pop();
+                }
+            }
+            other => result.push(other.as_os_str()),
+        }
+    }
+    result
+}
+
+/// Lowercases `value` and collapses every run of non-alphanumerics into one
+/// hyphen, trimming the ends. Returns an empty string when nothing is left;
+/// callers choose their own fallback.
+pub fn kebab_case(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut pending = false;
+    for ch in value.trim().to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending && !result.is_empty() {
+                result.push('-');
+            }
+            pending = false;
+            result.push(ch);
+        } else {
+            pending = true;
+        }
+    }
+    result
+}
+
+/// Lists every regular file under `dir` recursively, sorted by full path.
+/// Symlinks are skipped so a migration never reads outside its source tree.
+pub fn list_files_recursive(dir: &Path) -> Result<Vec<PathBuf>> {
+    fn walk(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in list_entries(dir)? {
+            if entry.is_symlink {
+                continue;
+            }
+            if entry.is_dir {
+                walk(&entry.path, files)?;
+            } else if entry.is_file {
+                files.push(entry.path);
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    if is_dir(dir) {
+        walk(dir, &mut files)?;
+        files.sort();
+    }
+    Ok(files)
+}
+
+/// Reads a file as UTF-8, replacing invalid sequences instead of failing, the
+/// way Node's `readFile(..., 'utf8')` did for imported documents.
+pub fn read_text_lossy(target: &Path) -> Result<String> {
+    Ok(String::from_utf8_lossy(&fs::read(target)?).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lexical_normalization_matches_path_resolve() {
+        assert_eq!(
+            normalize_lexical(Path::new("/a/b/../c/./d/")),
+            PathBuf::from("/a/c/d")
+        );
+        assert_eq!(normalize_lexical(Path::new("/../x")), PathBuf::from("/x"));
+        assert_eq!(normalize_lexical(Path::new("/a/b")), PathBuf::from("/a/b"));
+    }
+
+    #[test]
+    fn kebab_case_collapses_and_trims() {
+        assert_eq!(kebab_case("  My Skill!! v2 "), "my-skill-v2");
+        assert_eq!(kebab_case("--already-kebab--"), "already-kebab");
+        assert_eq!(kebab_case("???"), "");
+    }
+
+    #[test]
+    fn relative_paths_walk_up_and_down() {
+        let from = Path::new("/r/.agents/tasks/a/TKT-0001-0025/TKT-0025");
+        assert_eq!(
+            relative_path_posix(
+                from,
+                Path::new("/r/.agents/tasks/a/TKT-0001-0025/TKT-0002/task.md")
+            ),
+            "../TKT-0002/task.md"
+        );
+        assert_eq!(
+            relative_path_posix(
+                from,
+                Path::new("/r/.agents/tasks/a/TKT-0026-0050/TKT-0026/task.md")
+            ),
+            "../../TKT-0026-0050/TKT-0026/task.md"
+        );
     }
 }

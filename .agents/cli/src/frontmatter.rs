@@ -118,30 +118,82 @@ pub fn load(path: &Path) -> Parsed {
 }
 
 pub fn parse_document(path: &str, content: &str) -> Parsed {
-    if !content.starts_with("---\n") {
-        return Parsed::default();
-    }
-    let Some(end) = content[4..].find("\n---").map(|i| i + 4) else {
-        return Parsed {
+    match split_fence(content) {
+        Split::None => Parsed::default(),
+        Split::Unclosed => Parsed {
             metadata: Metadata::default(),
             errors: vec![FrontmatterError {
                 path: path.to_owned(),
                 message: "frontmatter starts with `---` but does not close".to_owned(),
             }],
-        };
+        },
+        Split::Fenced(fence) => parse_block(path, fence.inner),
+    }
+}
+
+/// A document split at its `---` fences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fence<'a> {
+    /// The lines between the fences, without the closing line terminator.
+    pub inner: &'a str,
+    /// Everything after the closing fence line.
+    pub body: &'a str,
+    /// The raw block from the opening `---` through the closing `---`.
+    pub block: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Split<'a> {
+    /// The content does not open with a fence.
+    None,
+    /// The content opens with a fence that never closes.
+    Unclosed,
+    Fenced(Fence<'a>),
+}
+
+/// Splits a document at its frontmatter fences. The opening fence is `---`
+/// on the first line, ending in `\n` or `\r\n`. The closing fence is the
+/// next line that is `---` once trailing whitespace and `\r` are dropped,
+/// so a line such as `----` inside the block does not close it while a
+/// hand-edited `--- ` still does. Every parser in the crate goes through
+/// this function so they agree on both rules.
+pub fn split_fence(content: &str) -> Split<'_> {
+    let Some(first) = content.split_inclusive('\n').next() else {
+        return Split::None;
     };
-    parse_block(path, &content[4..end])
+    if !first.ends_with('\n') || !is_fence(first) {
+        return Split::None;
+    }
+    let open = first.len();
+    let mut offset = open;
+    for line in content[open..].split_inclusive('\n') {
+        if is_fence(line) {
+            let inner = &content[open..offset];
+            let inner = inner.strip_suffix('\n').unwrap_or(inner);
+            let inner = inner.strip_suffix('\r').unwrap_or(inner);
+            return Split::Fenced(Fence {
+                inner,
+                body: &content[offset + line.len()..],
+                block: &content[..offset + 3],
+            });
+        }
+        offset += line.len();
+    }
+    Split::Unclosed
+}
+
+/// A line is a fence when it is `---` after dropping the line ending and
+/// any trailing whitespace.
+fn is_fence(line: &str) -> bool {
+    line.trim_end() == "---"
 }
 
 /// Returns the raw frontmatter block including both `---` fences, or an
 /// empty string when the content has none.
 pub fn extract_block(content: &str) -> &str {
-    if !content.starts_with("---\n") {
-        return "";
-    }
-    match content[4..].find("\n---") {
-        Some(index) => &content[..index + 4 + 4],
-        None => "",
+    match split_fence(content) {
+        Split::Fenced(fence) => fence.block,
+        Split::None | Split::Unclosed => "",
     }
 }
 
@@ -317,5 +369,48 @@ mod tests {
     fn extracts_block() {
         assert_eq!(extract_block("---\na: 1\n---\nbody"), "---\na: 1\n---");
         assert_eq!(extract_block("no frontmatter"), "");
+    }
+
+    #[test]
+    fn fence_accepts_crlf_and_matches_the_closing_line_whole() {
+        let crlf = "---\r\nid: TKT-0001\r\ntitle: Windows\r\n---\r\n\r\n# Body\r\n";
+        let parsed = parse_document("t.md", crlf);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        assert_eq!(parsed.metadata.scalar("id"), Some("TKT-0001"));
+        assert_eq!(parsed.metadata.scalar("title"), Some("Windows"));
+        let Split::Fenced(fence) = split_fence(crlf) else {
+            panic!("expected a fenced document");
+        };
+        assert_eq!(fence.inner, "id: TKT-0001\r\ntitle: Windows");
+        assert_eq!(fence.body, "\r\n# Body\r\n");
+        assert_eq!(fence.block, "---\r\nid: TKT-0001\r\ntitle: Windows\r\n---");
+
+        // A `----` line is not a closing fence; the real one comes later.
+        let dashes = "---\nid: TKT-0002\n----\ntitle: After\n---\n\n----\n";
+        let Split::Fenced(fence) = split_fence(dashes) else {
+            panic!("expected a fenced document");
+        };
+        assert_eq!(fence.inner, "id: TKT-0002\n----\ntitle: After");
+        assert_eq!(fence.body, "\n----\n");
+        let parsed = parse_document("t.md", dashes);
+        assert_eq!(parsed.metadata.scalar("title"), Some("After"));
+        assert_eq!(parsed.errors.len(), 1);
+        assert_eq!(parsed.errors[0].message, "line 3: expected `key: value`");
+        assert_eq!(split_fence("---\nid: X\n----\n"), Split::Unclosed);
+        // Trailing whitespace on either fence line is tolerated.
+        let Split::Fenced(fence) = split_fence("--- \nid: X\n---\t\nbody") else {
+            panic!("expected a fenced document");
+        };
+        assert_eq!(fence.inner, "id: X");
+        assert_eq!(fence.body, "body");
+        assert_eq!(
+            split_fence("---\n---"),
+            Split::Fenced(Fence {
+                inner: "",
+                body: "",
+                block: "---\n---"
+            })
+        );
+        assert_eq!(split_fence("--- not a fence\n"), Split::None);
     }
 }

@@ -8,8 +8,6 @@
       "Bash(git diff *)",
       "Bash(git log *)",
       "Bash(git add *)",
-      "Bash(node .agents/tools/agent-tools/create-skill.mjs *)",
-      "Bash(node .agents/tools/agent-tools/trust-codex-project.mjs *)",
       "Bash(.agents/cli/target/release/gritt-agent *)",
       "Bash(cargo build *)",
       "Bash(cargo test *)",

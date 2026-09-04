@@ -37,7 +37,7 @@ Example: `Formats git commit messages. Use when the user asks to create or edit 
 3. Scaffold:
 
 ```bash
-node .agents/tools/agent-tools/create-skill.mjs <skill-name> "<description>"
+.agents/cli/target/release/gritt-agent skill new <skill-name> "<description>"
 ```
 
 4. Replace the starter body with the real procedure. Keep it short: steps, rules, verification.

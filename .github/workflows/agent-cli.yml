@@ -1,0 +1,52 @@
+# Runs the dev/cli verify set for the gritt-agent crate on Linux and Windows.
+# macOS is the development platform and is covered locally.
+name: agent-cli
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".agents/cli/**"
+      - ".github/workflows/agent-cli.yml"
+  pull_request:
+    paths:
+      - ".agents/cli/**"
+      - ".github/workflows/agent-cli.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  MANIFEST: .agents/cli/Cargo.toml
+
+jobs:
+  verify:
+    name: verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      # The integration tests compare generated files byte for byte with
+      # committed fixtures, so the checkout must keep LF line endings.
+      - name: Keep LF line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            .agents/cli/target
+          key: ${{ runner.os }}-agent-cli-${{ hashFiles('.agents/cli/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-agent-cli-
+      - name: cargo fmt --check
+        run: cargo fmt --manifest-path ${{ env.MANIFEST }} --all --check
+      - name: cargo clippy
+        run: cargo clippy --manifest-path ${{ env.MANIFEST }} --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --manifest-path ${{ env.MANIFEST }}

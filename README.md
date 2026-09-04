@@ -83,8 +83,7 @@ crates/
 Dependency versions will be shared from the workspace `Cargo.toml`. Product
 code is Rust and the installed binary has no runtime dependency. Repository
 maintenance runs through the separate `gritt-agent` crate at `.agents/cli/`.
-Node remains only for the chain, skill scaffold, migration, and Codex trust
-scripts under `.agents/tools/agent-tools/`.
+The repository has no Node tooling.
 
 ## Terminal modes
 
@@ -173,8 +172,7 @@ skills, and ticket history:
     ├── skills/               canonical reusable procedures
     ├── tasks/                ticket history and backlog
     ├── brain/                agent infrastructure and local RAG
-    ├── cli/                  gritt-agent maintenance CLI (Rust)
-    └── tools/agent-tools/    remaining Node scaffolding scripts
+    └── cli/                  gritt-agent maintenance CLI (Rust)
 ```
 
 `AGENTS.md` is intentionally short. Agents query `gritt-local-memory` first,

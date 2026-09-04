@@ -12,7 +12,7 @@ Gritt is a local agent workspace written in Rust. A user either supplies a provi
 
 ## Common rules
 
-- Rust only for the product. No runtime dependency at install time. Node exists in this repository only for the `.agents/tools/` maintenance scripts.
+- Rust only, for the product and for the repository tooling in `.agents/cli/`. No runtime dependency at install time.
 - The provider-neutral boundary is hard. Code above an adapter never learns which provider served a request. Provider-specific fields travel only as optional diagnostic metadata on events.
 - Routing is by configured provider profile. Never infer a provider from a model name.
 - Capabilities come from the provider's model list. Do not advertise a feature the provider does not report, and refuse an explicitly requested unsupported feature with a clear error.

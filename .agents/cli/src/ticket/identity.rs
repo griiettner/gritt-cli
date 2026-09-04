@@ -69,6 +69,24 @@ pub fn persist_identity(repo_root: &Path, identity: &Identity) -> Result<PathBuf
     Ok(target)
 }
 
+/// `gritt-agent ticket identity`: prints the resolved login and, unless
+/// `--no-persist` was passed, stores it in `.agents/state/identity.local.yaml`.
+pub fn run(repo_root: &Path, options: &ResolveOptions) -> Result<i32> {
+    let identity = resolve_ticket_identity(repo_root, options)?;
+    if options.persist {
+        persist_identity(repo_root, &identity)?;
+    }
+    println!("{}", identity.github_login);
+    println!("source: {}", identity.source);
+    if options.persist {
+        println!(
+            "stored: {}",
+            fsx::relative_posix(repo_root, &identity_file_path(repo_root))
+        );
+    }
+    Ok(0)
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ResolveOptions {
     pub namespace: Option<String>,

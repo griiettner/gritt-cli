@@ -1,0 +1,6 @@
+interface:
+  display_name: "Sample Skill"
+  short_description: "Sample description. Use when sampling."
+  default_prompt: "Use $sample-skill in this repository."
+policy:
+  allow_implicit_invocation: false

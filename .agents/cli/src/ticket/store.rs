@@ -203,6 +203,90 @@ pub fn next_ticket_number(tasks_root: &Path, namespace: &str) -> Result<u32> {
     Ok(highest + 1)
 }
 
+/// Resolves a bare or qualified ticket reference to its folder.
+///
+/// A bare id prefers `preferred_namespace`, then a unique match across every
+/// namespace. Ambiguity and missing folders are usage errors so callers exit
+/// with code 2, as the replaced script did.
+pub fn find_ticket_dir(
+    tasks_root: &Path,
+    ticket_ref: &str,
+    preferred_namespace: Option<&str>,
+) -> Result<TicketDir> {
+    find_ticket_dir_with(tasks_root, ticket_ref, || {
+        preferred_namespace.map(str::to_owned)
+    })
+}
+
+/// Like [`find_ticket_dir`], but only asks for the preferred namespace when a
+/// bare id matches more than one namespace, so callers whose lookup may be
+/// expensive (a `gh` call) pay for it only when it can change the answer.
+pub fn find_ticket_dir_with(
+    tasks_root: &Path,
+    ticket_ref: &str,
+    preferred_namespace: impl FnOnce() -> Option<String>,
+) -> Result<TicketDir> {
+    let Some(parsed) = parse_ticket_ref(ticket_ref) else {
+        return Err(CliError::usage(format!("invalid ticket id: {ticket_ref}")));
+    };
+    if let Some(namespace) = parsed.namespace {
+        if !is_namespace_name(&namespace) {
+            return Err(CliError::usage(format!(
+                "invalid ticket namespace: {namespace}"
+            )));
+        }
+        let dir = ticket_dir(tasks_root, &namespace, &parsed.ticket_id);
+        if !fsx::is_dir(&dir) {
+            return Err(CliError::usage(format!(
+                "ticket folder does not exist: {namespace}/{}",
+                parsed.ticket_id
+            )));
+        }
+        return Ok(TicketDir {
+            dir,
+            ticket_id: parsed.ticket_id,
+            namespace,
+        });
+    }
+
+    let mut matches = Vec::new();
+    for namespace in list_namespaces(tasks_root)? {
+        let dir = ticket_dir(tasks_root, &namespace.id, &parsed.ticket_id);
+        if fsx::is_dir(&dir) {
+            matches.push(TicketDir {
+                dir,
+                ticket_id: parsed.ticket_id.clone(),
+                namespace: namespace.id,
+            });
+        }
+    }
+    if matches.len() > 1 {
+        if let Some(preferred) = preferred_namespace() {
+            if let Some(index) = matches.iter().position(|m| m.namespace == preferred) {
+                return Ok(matches.swap_remove(index));
+            }
+        }
+    }
+    match matches.len() {
+        1 => Ok(matches.pop().unwrap()),
+        0 => Err(CliError::usage(format!(
+            "ticket folder does not exist: {}",
+            parsed.ticket_id
+        ))),
+        _ => {
+            let options: Vec<String> = matches
+                .iter()
+                .map(|m| qualified_ticket_id(&m.namespace, &m.ticket_id))
+                .collect();
+            Err(CliError::usage(format!(
+                "ambiguous ticket id {}; use one of: {}",
+                parsed.ticket_id,
+                options.join(", ")
+            )))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

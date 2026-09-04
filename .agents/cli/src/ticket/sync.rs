@@ -11,7 +11,7 @@ use super::store::{
 use crate::frontmatter::{self, FrontmatterError, Metadata};
 use crate::fsx::{self, relative_posix};
 use crate::repo::{memory_root, tasks_root};
-use crate::Result;
+use crate::{CliError, Result};
 
 const ARTIFACTS: [&str; 4] = ["concept", "plan", "task", "report"];
 
@@ -69,13 +69,68 @@ impl Context<'_> {
     }
 }
 
-/// Runs the sync and returns the process exit code. Output goes to stdout
-/// and stderr exactly as the replaced script printed it.
+/// What a sync did or, in check mode, would do. Printing is separate so a
+/// command that scaffolds tickets can announce them before the sync line.
+#[derive(Debug, Default)]
+pub struct Summary {
+    pub check: bool,
+    /// Frontmatter errors that stopped the sync before any index was written.
+    pub errors: Vec<FrontmatterError>,
+    /// Generated files written, or out of sync in check mode.
+    pub drift: Vec<String>,
+}
+
+impl Summary {
+    pub fn exit_code(&self) -> i32 {
+        i32::from(!self.errors.is_empty() || (self.check && !self.drift.is_empty()))
+    }
+
+    /// Prints the summary to stdout and stderr exactly as the replaced
+    /// script did.
+    pub fn print(&self) {
+        if !self.errors.is_empty() {
+            for error in &self.errors {
+                eprintln!("error: {}", error.render());
+            }
+            eprintln!(
+                "tkt_sync failed ({} frontmatter error(s))",
+                self.errors.len()
+            );
+            return;
+        }
+        if self.check {
+            if self.drift.is_empty() {
+                println!("tkt_sync ok (no drift)");
+                return;
+            }
+            for item in &self.drift {
+                eprintln!("drift: {item}");
+            }
+            eprintln!(
+                "tkt_sync: {} generated index file(s) out of sync",
+                self.drift.len()
+            );
+            return;
+        }
+        println!("synced .agents task and memory indexes");
+    }
+}
+
+/// Runs the sync, prints its summary, and returns the process exit code.
 pub fn run(repo: &Path, check: bool) -> Result<i32> {
+    let summary = sync(repo, check)?;
+    summary.print();
+    Ok(summary.exit_code())
+}
+
+/// Runs the sync without printing the summary.
+pub fn sync(repo: &Path, check: bool) -> Result<Summary> {
     let tasks = tasks_root(repo);
     if !fsx::is_dir(&tasks) {
-        eprintln!("error: missing tasks root: {}", tasks.display());
-        return Ok(1);
+        return Err(CliError::new(format!(
+            "missing tasks root: {}",
+            tasks.display()
+        )));
     }
     let mut context = Context {
         repo,
@@ -87,35 +142,21 @@ pub fn run(repo: &Path, check: bool) -> Result<i32> {
     let entries = collect_ticket_entries(&mut context, &tasks)?;
     let memory_indexes = collect_memory_indexes(&mut context, &memory_root(repo))?;
     if !context.errors.is_empty() {
-        for error in &context.errors {
-            eprintln!("error: {}", error.render());
-        }
-        eprintln!(
-            "tkt_sync failed ({} frontmatter error(s))",
-            context.errors.len()
-        );
-        return Ok(1);
+        return Ok(Summary {
+            check,
+            errors: context.errors,
+            drift: Vec::new(),
+        });
     }
     write_task_indexes(&mut context, &tasks, &entries)?;
     for (target, desired) in &memory_indexes {
         context.update_generated(target, desired)?;
     }
-    if check {
-        if !context.drift.is_empty() {
-            for item in &context.drift {
-                eprintln!("drift: {item}");
-            }
-            eprintln!(
-                "tkt_sync: {} generated index file(s) out of sync",
-                context.drift.len()
-            );
-            return Ok(1);
-        }
-        println!("tkt_sync ok (no drift)");
-        return Ok(0);
-    }
-    println!("synced .agents task and memory indexes");
-    Ok(0)
+    Ok(Summary {
+        check,
+        errors: Vec::new(),
+        drift: context.drift,
+    })
 }
 
 fn collect_ticket_entries(context: &mut Context<'_>, tasks: &Path) -> Result<Vec<TicketEntry>> {
@@ -400,7 +441,7 @@ fn render_memory_index(memories: &[MemoryEntry]) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
-fn render_list(lines: &mut Vec<String>, key: &str, values: &[String], indent: &str) {
+pub(super) fn render_list(lines: &mut Vec<String>, key: &str, values: &[String], indent: &str) {
     if values.is_empty() {
         lines.push(format!("{indent}{key}: []"));
     } else {

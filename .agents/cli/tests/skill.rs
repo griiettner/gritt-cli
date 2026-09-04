@@ -125,3 +125,100 @@ fn sync_ignores_symlinked_skill_directories() {
     assert!(!outside.path().join("agents/openai.yaml").exists());
     assert!(!repo.root.join(".claude/skills/linked").exists());
 }
+
+#[test]
+fn new_scaffolds_a_skill_and_passes_sync_check() {
+    let repo = fixture();
+    let args = [
+        "skill",
+        "new",
+        "Sample Skill",
+        "Sample description. Use when sampling.",
+    ];
+    let dry = run(&repo.root, &[&args[..], &["--dry-run"]].concat());
+    dry.assert_status(0);
+    assert_eq!(
+        dry.stdout,
+        "would create skill: .agents/skills/sample-skill/SKILL.md\nwould create Codex metadata: .agents/skills/sample-skill/agents/openai.yaml\nwould run: gritt-agent skill sync\n"
+    );
+    assert!(!repo.root.join(".agents/skills/sample-skill").exists());
+
+    let created = run(&repo.root, &args);
+    created.assert_status(0);
+    assert_eq!(
+        created.stdout,
+        "created skill: .agents/skills/sample-skill/SKILL.md\ncreated Codex metadata: .agents/skills/sample-skill/agents/openai.yaml\nsynced skill adapters (5 file(s) updated)\n"
+    );
+    assert_eq!(
+        read(&repo.root, ".agents/skills/sample-skill/SKILL.md"),
+        expected("skill-new-SKILL.md")
+    );
+    assert_eq!(
+        read(&repo.root, ".agents/skills/sample-skill/agents/openai.yaml"),
+        expected("skill-new-openai.yaml")
+    );
+    assert!(repo
+        .root
+        .join(".claude/skills/sample-skill/SKILL.md")
+        .exists());
+    run(&repo.root, &["skill", "sync", "--check"]).assert_status(0);
+
+    let again = run(
+        &repo.root,
+        &["skill", "new", "sample-skill", "Other.", "--no-sync"],
+    );
+    again.assert_status(1);
+    assert!(again.stderr.contains("skill already exists"));
+
+    let forced = run(
+        &repo.root,
+        &[
+            "skill",
+            "new",
+            "sample-skill",
+            "Other.",
+            "--force",
+            "--no-sync",
+            "--no-openai",
+            "--title",
+            "Custom Title",
+        ],
+    );
+    forced.assert_status(0);
+    assert_eq!(
+        forced.stdout,
+        "created skill: .agents/skills/sample-skill/SKILL.md\n"
+    );
+    let skill = read(&repo.root, ".agents/skills/sample-skill/SKILL.md");
+    assert!(skill.contains("description: \"Other.\"\n"));
+    assert!(skill.contains("# Custom Title\n"));
+    // --no-openai leaves the existing metadata alone even under --force.
+    assert_eq!(
+        read(&repo.root, ".agents/skills/sample-skill/agents/openai.yaml"),
+        expected("skill-new-openai.yaml")
+    );
+
+    // Without --no-openai, --force resets the interface block too.
+    let reset = run(
+        &repo.root,
+        &[
+            "skill",
+            "new",
+            "sample-skill",
+            "Reset description.",
+            "--force",
+            "--no-sync",
+        ],
+    );
+    reset.assert_status(0);
+    assert_eq!(
+        read(&repo.root, ".agents/skills/sample-skill/agents/openai.yaml"),
+        "interface:\n  display_name: \"Sample Skill\"\n  short_description: \"Reset description.\"\n  default_prompt: \"Use $sample-skill in this repository.\"\npolicy:\n  allow_implicit_invocation: false\n"
+    );
+
+    let bad = run(&repo.root, &["skill", "new", "???", "Desc.", "--no-sync"]);
+    bad.assert_status(1);
+    assert!(bad
+        .stderr
+        .contains("skill name must contain at least one letter or digit"));
+}

@@ -12,6 +12,38 @@ tickets:
       plan: .agents/tasks/griiettner/TKT-0001-0025/TKT-0001/plan.md
       task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0001/task.md
       report: .agents/tasks/griiettner/TKT-0001-0025/TKT-0001/report.md
+      updates: .agents/tasks/griiettner/TKT-0001-0025/TKT-0001/updates/
+    dependencies: []
+    areas: []
+    skills: []
+  - id: TKT-0002
+    namespace: griiettner
+    title: Finish migrating agent-tools to gritt-agent
+    status: done
+    owner: griiettner
+    priority: normal
+    created: 2026-09-03
+    updated: 2026-09-03
+    artifacts:
+      concept: .agents/tasks/griiettner/TKT-0001-0025/TKT-0002/concept.md
+      plan: .agents/tasks/griiettner/TKT-0001-0025/TKT-0002/plan.md
+      task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0002/task.md
+      report: .agents/tasks/griiettner/TKT-0001-0025/TKT-0002/report.md
+    dependencies: []
+    areas: []
+    skills: []
+  - id: TKT-0003
+    namespace: griiettner
+    title: Fix gritt-agent parity and cleanup gaps from TKT-0002 review
+    status: done
+    owner: griiettner
+    priority: normal
+    created: 2026-09-04
+    updated: 2026-09-04
+    artifacts:
+      task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0003/task.md
+      report: .agents/tasks/griiettner/TKT-0001-0025/TKT-0003/report.md
+      updates: .agents/tasks/griiettner/TKT-0001-0025/TKT-0003/updates/
     dependencies: []
     areas: []
     skills: []

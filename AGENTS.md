@@ -37,5 +37,5 @@ once per checkout with `cargo build --release --manifest-path .agents/cli/Cargo.
 - Keep provider-specific behavior behind provider adapters.
 - Keep native and connector sessions on one event model.
 - Keep secrets out of config, logs, errors, fixtures, and transcripts.
-- Use Rust for product code. Node is limited to repository tooling.
+- Use Rust for product code and for repository tooling.
 - Record durable architecture decisions as ADRs before treating them as rules.

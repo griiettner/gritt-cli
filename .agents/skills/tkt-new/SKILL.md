@@ -27,7 +27,7 @@ synchronization fails, creation is rolled back, so do not retry blindly:
 .agents/cli/target/release/gritt-agent ticket new --title "Short title"
 ```
 
-Add `--create-concept` and `--create-plan` when those artifacts are needed. Refresh identity alone with `node .agents/tools/agent-tools/tkt-identity.mjs`. After an ambiguous failure, check the ticket directory and indexes before running the allocator again.
+Add `--create-concept` and `--create-plan` when those artifacts are needed. Add `--areas`, `--skills`, and `--dependencies` (each taking zero or more values; the empty form clears the list) when the ticket should carry those frontmatter lists from the start; they are empty by default. Refresh identity alone with `.agents/cli/target/release/gritt-agent ticket identity`. After an ambiguous failure, check the ticket directory and indexes before running the allocator again.
 
 Default to a slim ticket: `task.md` alone when the work is already clear, `concept.md` plus `task.md` when the idea needs framing. Use the full lifecycle only for complex, risky, multi-step, cross-file, or reference-heavy work.
 

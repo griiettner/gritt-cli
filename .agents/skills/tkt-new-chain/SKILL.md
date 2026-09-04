@@ -21,7 +21,7 @@ Use [`tkt-new`](../tkt-new/SKILL.md) instead when the work is a small localized 
 Use the tool. Do not hand-write folders, and do not pick ids by reading `index.yaml`:
 
 ```bash
-node .agents/tools/agent-tools/tkt-new-chain.mjs \
+.agents/cli/target/release/gritt-agent ticket new-chain \
   --title "Chain title" \
   --step "contract:Freeze the request and response contract" \
   --step "skeleton:Add the service and route skeleton" \

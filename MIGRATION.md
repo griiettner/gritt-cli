@@ -27,19 +27,20 @@ Run from target repo root:
 
 ```bash
 git status --short
-node .agents/tools/agent-tools/migrate-cursor-setup.mjs --help
+cargo build --release --manifest-path .agents/cli/Cargo.toml
+.agents/cli/target/release/gritt-agent migrate cursor --help
 ```
 
 Checks:
 
 - Confirm you are in the intended target repository.
-- Confirm the migrator script is available.
+- Confirm the `gritt-agent` binary built and prints the `migrate cursor` help.
 - Confirm you understand existing uncommitted local changes before migration.
 
 ## 2) Dry-Run Migration
 
 ```bash
-node .agents/tools/agent-tools/migrate-cursor-setup.mjs --source /absolute/path/to/source-repo --dry-run
+.agents/cli/target/release/gritt-agent migrate cursor --source /absolute/path/to/source-repo --dry-run
 ```
 
 Review dry-run output:
@@ -51,13 +52,13 @@ Review dry-run output:
 If you need to intentionally replace non-migrator-owned destination files:
 
 ```bash
-node .agents/tools/agent-tools/migrate-cursor-setup.mjs --source /absolute/path/to/source-repo --dry-run --force
+.agents/cli/target/release/gritt-agent migrate cursor --source /absolute/path/to/source-repo --dry-run --force
 ```
 
 ## 3) Execute Migration
 
 ```bash
-node .agents/tools/agent-tools/migrate-cursor-setup.mjs --source /absolute/path/to/source-repo
+.agents/cli/target/release/gritt-agent migrate cursor --source /absolute/path/to/source-repo
 ```
 
 Expected immediate outcomes:
@@ -79,13 +80,13 @@ Default behavior includes maintenance commands:
 2. `.agents/cli/target/release/gritt-agent ticket sync`
 3. `.agents/cli/target/release/gritt-agent ticket validate`
 
-The migrator finds the binary through `GRITT_AGENT_BIN`, then the release or
-debug build under `.agents/cli/target/`, then `cargo run`.
+The migrator runs these through the same `gritt-agent` binary and records
+each command's exit code, stdout, and stderr in the manifest.
 
 To skip maintenance (not recommended except debugging):
 
 ```bash
-node .agents/tools/agent-tools/migrate-cursor-setup.mjs --source /absolute/path/to/source-repo --no-sync
+.agents/cli/target/release/gritt-agent migrate cursor --source /absolute/path/to/source-repo --no-sync
 ```
 
 ## 4) Post-Migration Validation
@@ -171,7 +172,7 @@ Confirm:
 Re-run migration:
 
 ```bash
-node .agents/tools/agent-tools/migrate-cursor-setup.mjs --source /absolute/path/to/source-repo
+.agents/cli/target/release/gritt-agent migrate cursor --source /absolute/path/to/source-repo
 ```
 
 Expected:
@@ -191,7 +192,7 @@ Review that changes are scoped to migration outputs and expected indexes/docs.
 
 ## 9) Troubleshooting
 
-- Script fails with missing source path:
+- The command fails with a missing source path:
   - Verify `--source` uses an absolute path and points to a directory.
 - Many skipped files:
   - Existing destination files are not migrator-owned. Re-run with `--force` only if overwrite is intended.

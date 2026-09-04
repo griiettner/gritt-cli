@@ -26,9 +26,9 @@ Do not pick or skip ids manually. Create tickets with:
 .agents/cli/target/release/gritt-agent ticket new --title "Short title"
 ```
 
-Use `node .agents/tools/agent-tools/tkt-new-chain.mjs` for chain-managed work. The tool resolves GitHub identity, allocates the next number in that login's contiguous sequence, and writes the folder. If an earlier id is missing, allocation fails until the gap is restored or explicitly accounted for.
+Use `gritt-agent ticket new-chain` for chain-managed work. The tool resolves GitHub identity, allocates the next number in that login's contiguous sequence, and writes the folder. If an earlier id is missing, allocation fails until the gap is restored or explicitly accounted for.
 
-Identity resolution order: `--namespace`, `GRITT_TKT_NAMESPACE`, `.agents/state/identity.local.yaml`, then `gh api user --jq .login`. `ticket new` stores the resolved login in that file. Refresh it alone with `node .agents/tools/agent-tools/tkt-identity.mjs`.
+Identity resolution order: `--namespace`, `GRITT_TKT_NAMESPACE`, `.agents/state/identity.local.yaml`, then `gh api user --jq .login`. `ticket new` stores the resolved login in that file. Refresh it alone with `gritt-agent ticket identity`.
 
 ## Chunk resolution
 

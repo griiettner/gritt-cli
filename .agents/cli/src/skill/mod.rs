@@ -1,3 +1,4 @@
-//! Skill adapter generation for Claude Code stubs and Codex metadata.
+//! Skill scaffolding and adapter generation.
 
+pub mod new;
 pub mod sync;

@@ -4,6 +4,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::fsx::normalize_lexical;
 use crate::{CliError, Result};
 
 /// Resolves the repository root.
@@ -31,7 +32,8 @@ pub fn resolve_root(explicit: Option<&Path>) -> Result<PathBuf> {
     ))
 }
 
-fn git_toplevel(start: &Path) -> Option<PathBuf> {
+/// Runs `git rev-parse --show-toplevel` from `start`.
+pub fn git_toplevel(start: &Path) -> Option<PathBuf> {
     let output = Command::new("git")
         .arg("-C")
         .arg(start)
@@ -47,6 +49,26 @@ fn git_toplevel(start: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(trimmed))
+}
+
+/// The user's home directory from `HOME`, then `USERPROFILE`.
+pub fn home_dir() -> PathBuf {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
+/// Expands a leading `~` and makes the path absolute without resolving
+/// symlinks, like Node's `path.resolve` after a manual `~` expansion.
+pub fn expand_home(value: &Path) -> PathBuf {
+    if value == Path::new("~") {
+        return home_dir();
+    }
+    if let Ok(rest) = value.strip_prefix("~") {
+        return home_dir().join(rest);
+    }
+    normalize_lexical(&std::path::absolute(value).unwrap_or_else(|_| value.to_path_buf()))
 }
 
 pub fn tasks_root(repo: &Path) -> PathBuf {

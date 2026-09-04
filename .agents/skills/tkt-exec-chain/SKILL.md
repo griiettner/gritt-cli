@@ -147,7 +147,7 @@ must restart from the updated base branch.
 For each worker PR, run this tool first:
 
 ```bash
-node .agents/tools/agent-tools/tkt-chain-check.mjs --ticket TKT-NNNN --base main
+.agents/cli/target/release/gritt-agent ticket chain-check --ticket TKT-NNNN --base main
 ```
 
 Add `--require-report` when the ticket policy requires a report before review.
