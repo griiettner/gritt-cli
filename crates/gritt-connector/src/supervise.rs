@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use futures::Stream;
@@ -39,21 +39,32 @@ const STDERR_TAIL: usize = 20;
 /// terminal event, capped by the idle timeout.
 const WRAP_UP: Duration = Duration::from_secs(10);
 
-/// The launch arguments as a diagnostic: the prompt is user content and
-/// any `name=value` argument may carry a value, so neither is recorded
-/// raw. The connector's own secrets are redacted on top of this.
+/// The launch arguments as a diagnostic. Option names are kept; the
+/// prompt, every positional token, and every option value (attached with
+/// `=` or given as the next token) become placeholders, so no value can
+/// reach the diagnostic. The connector's own secrets are redacted on top.
 pub fn diagnostic_args(args: &[String], prompt: &str) -> Vec<String> {
-    args.iter()
-        .map(|arg| {
-            if arg == prompt {
-                "[prompt]".to_owned()
-            } else if let Some((name, _)) = arg.split_once('=') {
-                format!("{name}=[redacted]")
+    let mut out = Vec::with_capacity(args.len());
+    let mut value_next = false;
+    for arg in args {
+        if arg == prompt {
+            out.push("[prompt]".to_owned());
+            value_next = false;
+        } else if value_next {
+            out.push("[value]".to_owned());
+            value_next = false;
+        } else if crate::is_option(arg) {
+            if let Some((name, _)) = arg.split_once('=') {
+                out.push(format!("{name}=[value]"));
             } else {
-                arg.clone()
+                out.push(arg.clone());
+                value_next = crate::is_credential_option(arg);
             }
-        })
-        .collect()
+        } else {
+            out.push("[value]".to_owned());
+        }
+    }
+    out
 }
 
 /// What the agent's own terminal event said, kept so the process exit can
@@ -543,9 +554,14 @@ impl Driver {
         let mut malformed = 0u64;
         let mut first_line = true;
         let mut consumer_gone = false;
+        // One absolute deadline once the agent has spoken its terminal
+        // event: trailing output must not keep extending it.
+        let mut wrap_deadline: Option<Instant> = None;
         loop {
             let limit = if self.normalizer.terminal_seen() {
-                WRAP_UP.min(self.timeouts.idle)
+                let deadline = *wrap_deadline
+                    .get_or_insert_with(|| Instant::now() + WRAP_UP.min(self.timeouts.idle));
+                deadline.saturating_duration_since(Instant::now())
             } else if first_line {
                 self.timeouts.startup
             } else {

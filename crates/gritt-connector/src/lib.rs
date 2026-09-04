@@ -40,24 +40,57 @@ pub fn environment_secrets(blocked: &[String]) -> Vec<Secret> {
     )
 }
 
+/// Names that mark an option as credential-bearing, matched case-insensitively
+/// inside the option name (`--api-key`, `-k`, `--auth-token=`).
+const CREDENTIAL_MARKERS: [&str; 6] =
+    ["key", "token", "secret", "password", "passwd", "credential"];
+
+/// Whether `arg` is an option (`--flag`, `--flag=value`, `-f`) rather than a
+/// positional value.
+pub fn is_option(arg: &str) -> bool {
+    arg.starts_with('-') && arg.len() > 1
+}
+
+/// The option name without any attached `=value`.
+fn option_name(arg: &str) -> &str {
+    arg.split_once('=').map_or(arg, |(name, _)| name)
+}
+
+/// Whether an option name looks like it carries a credential, whether its
+/// value is attached with `=` or comes as the next token.
+pub fn is_credential_option(arg: &str) -> bool {
+    if !is_option(arg) {
+        return false;
+    }
+    let name = option_name(arg)
+        .trim_start_matches('-')
+        .to_ascii_lowercase();
+    CREDENTIAL_MARKERS
+        .iter()
+        .any(|marker| name.contains(marker))
+        || name == "k"
+        || name == "p"
+}
+
 /// Refuses an `extra_args` entry that carries a credential. Arguments are
 /// recorded in launch diagnostics and travel through the process list, so
-/// a key belongs in the agent's own credential store, never here.
+/// a key belongs in the agent's own credential store, never here. A
+/// credential-like option is refused whether its value is attached
+/// (`--api-key=...`) or split (`--api-key ...`), and so is any token that
+/// contains a known secret value.
 pub fn validate_extra_args(settings: &ConnectorSettings, secrets: &[Secret]) -> Result<()> {
-    const MARKERS: [&str; 5] = ["key=", "token=", "secret=", "password=", "credential="];
     for (connector, args) in &settings.extra_args {
         for arg in args {
-            let lower = arg.to_ascii_lowercase();
-            let marked = MARKERS.iter().any(|marker| lower.contains(marker));
             let leaks = secrets
                 .iter()
                 .any(|secret| !secret.is_empty() && arg.contains(secret.expose()));
-            if marked || leaks {
+            if is_credential_option(arg) || leaks {
                 // Only the flag name is worth showing; a bare value is a
                 // secret by construction.
-                let shown = match arg.split_once('=') {
-                    Some((name, _)) => format!("`{name}=...`"),
-                    None => "a bare value".to_owned(),
+                let shown = if is_option(arg) {
+                    format!("`{} ...`", option_name(arg))
+                } else {
+                    "a bare value".to_owned()
                 };
                 return Err(Error::config(format!(
                     "connectors.extra_args.{connector} contains a credential-bearing argument ({shown}); \

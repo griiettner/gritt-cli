@@ -237,6 +237,13 @@ Benchmarks: none required. Test duration for the connector crate is about
 
 ## Updates
 
+- 2026-09-04 second review fix round. Two findings: a credential-like option
+  in `extra_args` is now refused whether its value is attached or split
+  into the next token, and launch diagnostics keep option names only, with
+  every positional token and option value shown as `[value]`; the wrap-up
+  after a terminal event now runs against one absolute deadline, so an
+  agent that keeps printing after finishing is stopped at the bound instead
+  of extending it with every line.
 - 2026-09-04 review fix round. Seven findings: credential values inherited
   from Gritt's environment now join the connector redaction set,
   credential-bearing `extra_args` are refused, and launch diagnostics omit

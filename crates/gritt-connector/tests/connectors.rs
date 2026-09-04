@@ -743,7 +743,7 @@ async fn launch_diagnostics_omit_the_prompt_and_argument_values() {
     let args = serde_json::to_string(&launch["args"]).unwrap();
     assert!(args.contains("[prompt]"), "{args}");
     assert!(!args.contains("private prompt"), "{args}");
-    assert!(args.contains("--sandbox=[redacted]"), "{args}");
+    assert!(args.contains("--sandbox=[value]"), "{args}");
     assert!(!args.contains("workspace-write"), "{args}");
 }
 
@@ -766,6 +766,38 @@ async fn credential_bearing_extra_args_are_refused() {
     };
     let error = validate_extra_args(&settings, &[Secret::new("sk-known")]).unwrap_err();
     assert!(!error.message.contains("sk-known"));
+
+    // A split credential option is refused too, and its value never shows.
+    let settings = ConnectorSettings {
+        extra_args: BTreeMap::from([(
+            "codex".to_owned(),
+            vec!["--api-key".to_owned(), "sk-secret".to_owned()],
+        )]),
+        ..ConnectorSettings::default()
+    };
+    let error = validate_extra_args(&settings, &[]).unwrap_err();
+    assert_eq!(error.kind, gritt_core::ErrorKind::Config);
+    assert!(
+        error.message.contains("`--api-key ...`"),
+        "{}",
+        error.message
+    );
+    assert!(!error.message.contains("sk-secret"));
+
+    let settings = ConnectorSettings {
+        extra_args: BTreeMap::from([("codex".to_owned(), vec!["--token=abc".to_owned()])]),
+        ..ConnectorSettings::default()
+    };
+    assert!(validate_extra_args(&settings, &[]).is_err());
+
+    let settings = ConnectorSettings {
+        extra_args: BTreeMap::from([(
+            "codex".to_owned(),
+            vec!["--model".to_owned(), "gpt".to_owned()],
+        )]),
+        ..ConnectorSettings::default()
+    };
+    assert!(validate_extra_args(&settings, &[]).is_ok());
 
     let settings = ConnectorSettings {
         extra_args: BTreeMap::from([(
@@ -829,4 +861,74 @@ async fn a_pty_agent_that_lingers_after_finishing_is_stopped_within_the_bound() 
             .state,
         TaskState::Completed
     );
+}
+
+#[tokio::test]
+async fn split_option_values_are_placeholders_in_launch_diagnostics() {
+    let fake = Fake::new(&[(
+        "FAKE_AGENT_FIXTURE",
+        fixture("codex", "text").display().to_string(),
+    )]);
+    let mut settings = fake.settings("codex");
+    settings.extra_args = BTreeMap::from([(
+        "codex".to_owned(),
+        vec!["--model".to_owned(), "gpt".to_owned()],
+    )]);
+    let connector = ExternalConnector::new(Codex, &settings);
+    let events = collect(&connector, fake.request("the private prompt")).await;
+    let args = events[0].diagnostic.as_ref().unwrap()["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let model = args
+        .iter()
+        .position(|a| a == "--model")
+        .expect("--model kept");
+    assert_eq!(args[model + 1], "[value]", "{args:?}");
+    assert!(!args.iter().any(|a| a == "gpt"), "{args:?}");
+    assert!(args.iter().any(|a| a == "[prompt]"), "{args:?}");
+    assert!(
+        !args
+            .iter()
+            .any(|a| a.contains(fake.dir.path().to_str().unwrap())),
+        "{args:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_noisy_agent_after_its_terminal_event_is_stopped_at_the_deadline() {
+    let fake = Fake::new(&[
+        (
+            "FAKE_AGENT_FIXTURE",
+            fixture("codex", "text").display().to_string(),
+        ),
+        ("FAKE_AGENT_NOISE", "1".into()),
+    ]);
+    let connector =
+        ExternalConnector::new(Codex, &fake.settings("codex")).with_timeouts(Timeouts {
+            health: Duration::from_secs(5),
+            startup: Duration::from_secs(10),
+            idle: Duration::from_secs(1),
+        });
+    let started = std::time::Instant::now();
+    let events = collect(&connector, fake.request("x")).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "a line every 50 ms kept the wrap-up alive for {:?}",
+        started.elapsed()
+    );
+    assert_eq!(text_of(&events), "PONG");
+    assert!(events.iter().any(|e| matches!(
+        e.kind,
+        EventKind::Completed {
+            stop_reason: StopReason::EndTurn
+        }
+    )));
+    let pid = events[0].diagnostic.as_ref().unwrap()["pid"]
+        .as_u64()
+        .unwrap() as u32;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!is_alive(pid).await, "noisy agent {pid} still alive");
 }

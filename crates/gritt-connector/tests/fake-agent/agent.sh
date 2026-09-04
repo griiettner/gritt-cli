@@ -8,6 +8,7 @@
 #   FAKE_AGENT_STDERR     one line printed to stderr first
 #   FAKE_AGENT_ARGS_FILE  file that receives the arguments, one per line
 #   FAKE_AGENT_AUTH       text printed by the auth probe
+#   FAKE_AGENT_NOISE      when set, print a line every 50 ms forever after the fixture
 case "$1" in
   --version) echo "fake-agent 1.0.0"; exit 0 ;;
   login|auth|status) echo "${FAKE_AGENT_AUTH:-Logged in using fake}"; exit 0 ;;
@@ -22,6 +23,9 @@ if [ -n "$FAKE_AGENT_FIXTURE" ]; then
     printf '%s\n' "$line"
     if [ -n "$FAKE_AGENT_LINE_DELAY" ]; then sleep "$FAKE_AGENT_LINE_DELAY"; fi
   done < "$FAKE_AGENT_FIXTURE"
+fi
+if [ -n "$FAKE_AGENT_NOISE" ]; then
+  while :; do printf '%s\n' '{"type":"noise"}'; sleep 0.05; done
 fi
 if [ -n "$FAKE_AGENT_SLEEP" ]; then sleep "$FAKE_AGENT_SLEEP"; fi
 exit "${FAKE_AGENT_EXIT:-0}"
