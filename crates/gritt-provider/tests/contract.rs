@@ -748,3 +748,99 @@ async fn a_failed_request_does_not_leak_its_capability_warning_into_the_next() {
         );
     }
 }
+
+#[tokio::test]
+async fn overlapping_keys_are_redacted_everywhere() {
+    const SHORT_KEY: &str = "ab1";
+    const LONG_KEY: &str = "xab1yz";
+    for protocol in PROTOCOLS {
+        let body = format!(r#"{{"error":{{"message":"invalid key {LONG_KEY}"}}}}"#);
+        let (mut context, _, _) =
+            make_context(protocol, vec![FixtureResponse::json(401, body)], 16);
+        context.keys = Arc::new(gritt_provider::adapter::StaticKey(
+            gritt_core::secret::Secret::new(LONG_KEY),
+        ));
+        let adapter = adapter_for(context);
+        // Register the shorter secret first so redaction order, not
+        // registration order, decides the outcome.
+        let emitter = gritt_provider::adapter::EventEmitter::new(
+            gritt_core::session::SessionId("overlap".into()),
+            protocol,
+        );
+        emitter.protect(gritt_core::secret::Secret::new(SHORT_KEY));
+        emitter.protect(gritt_core::secret::Secret::new(LONG_KEY));
+        let redacted = gritt_provider::adapter::redact_text(
+            &format!("{LONG_KEY} {SHORT_KEY}"),
+            &emitter.secrets(),
+        );
+        assert_eq!(redacted, "[redacted] [redacted]");
+
+        let error = adapter
+            .send(prompt(protocol, false))
+            .await
+            .err()
+            .expect("expected an error");
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        let diagnostic = serde_json::to_string(&error.diagnostic).unwrap();
+        for text in [&display, &debug, &diagnostic] {
+            // The request key is the long one; no fragment of it may
+            // survive, whichever order the secrets were registered in.
+            assert!(!text.contains(LONG_KEY), "{protocol:?}: long key leaked");
+            assert!(!text.contains("xab1"), "{protocol:?}: key prefix leaked");
+            assert!(!text.contains("1yz"), "{protocol:?}: key suffix leaked");
+            assert!(text.contains("[redacted]"), "{protocol:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn messages_structured_output_refusal_leaves_no_warning_for_the_continuation() {
+    let (context, transport, _) = make_context(
+        Protocol::Messages,
+        vec![
+            sse(Protocol::Messages, "stream-tool-use.sse"),
+            sse(Protocol::Messages, "stream-tool-result.sse"),
+        ],
+        16,
+    );
+    let adapter = adapter_for(context);
+    // Start a tool conversation so a continuation exists.
+    let events = collect(
+        adapter
+            .send(prompt(Protocol::Messages, true))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::ToolCall { .. })));
+    // A request refused for structured output must not queue a warning.
+    let mut refused = prompt(Protocol::Messages, true);
+    refused.options.structured_output = Some(serde_json::json!({ "type": "object" }));
+    let error = adapter
+        .send(refused)
+        .await
+        .err()
+        .expect("expected an error");
+    assert_eq!(error.kind, ErrorKind::UnsupportedCapability);
+    let follow_up = adapter
+        .submit_tool_results(vec![ToolResult {
+            call_id: ToolCallId("toolu_fx_1".into()),
+            name: "file_read".into(),
+            is_error: false,
+            output: "hi".into(),
+        }])
+        .await
+        .unwrap();
+    let events = collect(follow_up).await;
+    assert_eq!(transport.request_count(), 2);
+    assert!(
+        events.iter().all(|event| event
+            .diagnostic
+            .as_ref()
+            .is_none_or(|d| d.get("capability_warning").is_none())),
+        "stale capability warning leaked into the continuation"
+    );
+}

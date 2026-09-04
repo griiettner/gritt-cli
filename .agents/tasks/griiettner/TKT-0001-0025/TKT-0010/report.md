@@ -193,10 +193,10 @@ All run from the worktree root on 2026-09-04:
 
 - `cargo fmt --all --check`: pass.
 - `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test -p gritt-provider`: pass, 49 tests after the second review
+- `cargo test -p gritt-provider`: pass, 52 tests after the second review
   fix round (20 unit, 19 contract, 6 cache, 1 TCP end to end, 3 live tests
   that skip without keys). After the first round: 44. Before: 34.
-- `cargo test --workspace`: pass, 75 tests after the second fix round (70
+- `cargo test --workspace`: pass, 78 tests after the second fix round (70
   after the first, 60 before).
 - `cargo build --release`: pass, 1m 34s.
 - `gritt-agent ticket validate --repo-root .`: `tkt_validate ok (0
@@ -247,6 +247,18 @@ All run from the worktree root on 2026-09-04:
 
 ## Updates
 
+- 2026-09-04 third review fix round. The re-review found two remaining
+  defects: redaction replaced secrets in registration order, so a short
+  secret that is a substring of a longer one could leave the longer one's
+  remainder in an error; and the Messages adapter refused structured output
+  only after the capability check had queued a warning, so the next
+  continuation request could carry that stale warning. Redaction now
+  replaces longer secrets first, and the Messages refusal runs before the
+  capability check. Chat Completions and Responses have no pre-stream
+  return after their capability check other than the key and send paths,
+  which already clear the warning. Three tests cover the two cases. The
+  validation set was rerun: 21 unit, 21 contract, 6 cache, and 1 TCP test
+  pass in the provider crate, 78 across the workspace.
 - 2026-09-04 second review fix round. The re-review found two incomplete
   fixes and one new defect: keys shorter than four characters escaped
   redaction; the refresh throttle applied only when stale fallback was on;

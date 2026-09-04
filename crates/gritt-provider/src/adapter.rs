@@ -174,11 +174,19 @@ const REDACTED: &str = "[redacted]";
 
 /// Replaces every occurrence of each non-empty secret with `[redacted]`.
 /// Length is no exemption: a short credential is still a credential.
+/// Longer secrets are replaced first so a shorter secret that is a
+/// substring of a longer one cannot leave the longer one's remainder behind.
 pub fn redact_text(text: &str, secrets: &[Secret]) -> String {
+    let mut ordered: Vec<&str> = secrets
+        .iter()
+        .map(Secret::expose)
+        .filter(|value| !value.is_empty())
+        .collect();
+    ordered.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    ordered.dedup();
     let mut out = text.to_owned();
-    for secret in secrets {
-        let value = secret.expose();
-        if !value.is_empty() && out.contains(value) {
+    for value in ordered {
+        if out.contains(value) {
             out = out.replace(value, REDACTED);
         }
     }
@@ -546,6 +554,22 @@ mod tests {
         let redacted = serde_json::to_string(&redact_value(value, &secrets)).unwrap();
         assert!(!redacted.contains("sk-live-1234"));
         assert_eq!(redacted.matches("[redacted]").count(), 3);
+    }
+
+    #[test]
+    fn redaction_replaces_longer_secrets_before_their_substrings() {
+        // Registered short first: naive sequential replacement would turn
+        // `xab1yz` into `x[redacted]yz` and leak `x` and `yz`.
+        let secrets = vec![Secret::new("ab1"), Secret::new("xab1yz")];
+        assert_eq!(
+            redact_text("long xab1yz short ab1", &secrets),
+            "long [redacted] short [redacted]"
+        );
+        let reversed = vec![Secret::new("xab1yz"), Secret::new("ab1")];
+        assert_eq!(
+            redact_text("long xab1yz short ab1", &reversed),
+            "long [redacted] short [redacted]"
+        );
     }
 
     #[test]

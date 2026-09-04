@@ -124,15 +124,17 @@ impl ProviderAdapter for MessagesAdapter {
 
     fn send(&self, request: PromptRequest) -> BoxFuture<'_, Result<EventStream<'_>>> {
         Box::pin(async move {
-            self.context.check_capabilities(&request, &self.emitter)?;
             if request.options.structured_output.is_some() {
                 // Messages has no response-format field; the harness must
-                // use a tool for structured output instead.
+                // use a tool for structured output instead. This runs before
+                // the capability check so no request-scoped warning is
+                // queued for a request that never reaches the wire.
                 return Err(Error::unsupported_capability(
                     &request.model,
                     "structured output on the Messages protocol",
                 ));
             }
+            self.context.check_capabilities(&request, &self.emitter)?;
             {
                 let mut state = self.state.lock().expect("messages state");
                 state.model = Some(request.model.clone());
