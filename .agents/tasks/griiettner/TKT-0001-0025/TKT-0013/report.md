@@ -125,6 +125,11 @@ All from the worktree root on 2026-09-04:
 - `cargo test --workspace`: pass, 195 tests after the review fix round,
   including 9 e2e tests and 4 PTY tests; live provider and connector tests
   skipped without their gate.
+- Benchmark ledger, measured by the PM on the integrated branch at
+  `3f3db4d`: `cargo test --workspace` took 80.4 s of wall time including
+  compilation for 196 passing tests; the `gritt-agent` crate passed 97
+  tests; the gated live connector tests passed 3 in 12.9 s. The parent
+  imposes no performance target.
 - `cargo build --release --locked`: pass.
 - `scripts/release/build.sh aarch64-apple-darwin` twice from clean target
   directories, after the toolchain pin: both
@@ -183,8 +188,9 @@ All from the worktree root on 2026-09-04:
 - Windows: `taskkill` tree kill, the PTY path, and the Windows shell path
   remain untested until the CI matrix runs; connector supervision tests are
   Unix-only.
-- The REPL stale-answer window after a cancelled approval and the missing
-  arrow-key line editing stay as recorded in TKT-0011.
+- The missing REPL arrow-key line editing stays as recorded in TKT-0011.
+  The cancelled-approval stale-answer defect is fixed there; only the
+  100 ms poll window after a cancel remains, as that report notes.
 - Claude Code approval relay through its control protocol, and Cursor
   recordings once its CLI is available, stay as recorded in TKT-0012.
 - Replace the hand-authored provider fixtures with redacted live
@@ -198,8 +204,19 @@ All from the worktree root on 2026-09-04:
   covered by `codex_live_resume`. The Claude Code `--resume` path and the
   OpenCode `--session` path have fixture coverage only.
 
+## Reviewer Verdict
+
+Final typed verdict: pass. PR #5 received an initial verdict of needs-fix with six findings. The fix commits bbd8409 and 4c79a07 resolved them and the re-review returned pass. The PR was merged into `feature/tkt-0008-gritt-cli` as 3f3db4d.
+
+The reviewer was Codex `gpt-5.6-sol` at medium effort, the documented
+fallback after the account rejected `gpt-6-astra`, running in a read-only
+sandbox. Before every verdict the PM independently reran `cargo fmt`,
+`cargo clippy`, the workspace tests, `gritt-agent ticket validate`, and
+`gritt-agent ticket chain-check`.
+
 ## Updates
 
+- [2026-09-04 final review hardening](updates/2026-09-04-final-review-hardening.md)
 - 2026-09-04 review fix round. The reviewer found six items: a floating
   `stable` toolchain in the release job, config parse errors that echoed
   the source line, an environment-dependent connector-failure test, an
