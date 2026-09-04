@@ -31,8 +31,10 @@ Chain facts:
 - Worktree: `/Users/griiettner/Projects/grittflow/gritt-cli-tkt-0013`
 - Branch: `tkt-0013-05-release`
 - Base: `feature/tkt-0008-gritt-cli` at `bf6439d` (PR #4 merge)
-- Commits: listed under Validation once pushed
-- PR: recorded under Validation once opened
+- Commits: `afa73fe` (implementation, docs, tests, ticket artifacts) and
+  the report update commit that follows it
+- PR: https://github.com/griiettner/gritt-cli/pull/5 into
+  `feature/tkt-0008-gritt-cli`
 
 What landed:
 
@@ -125,9 +127,12 @@ All from the worktree root on 2026-09-04:
   completed PONG in 7.9 s.
 - `./target/release/gritt doctor` on a scratch workspace: prints every
   section, no secret.
-- `gritt-agent ticket validate --repo-root .`: see below.
-- `gritt-agent ticket chain-check --ticket TKT-0013 --base feature/tkt-0008-gritt-cli`: see below.
-- `gritt-agent ticket chain-check --ticket TKT-0013 --base main`: see below.
+- `gritt-agent ticket validate --repo-root .`: ok, 0 warnings.
+- `gritt-agent ticket chain-check --ticket TKT-0013 --base feature/tkt-0008-gritt-cli`:
+  ok, 0 warnings; merge-base equals the base tip `bf6439d`.
+- `gritt-agent ticket chain-check --ticket TKT-0013 --base main`: ok,
+  9 warnings, all the earlier worker ticket files that reached the
+  integration branch through PRs #1 to #4 and the expected merge-base gap.
 
 ## Completion Gate
 
