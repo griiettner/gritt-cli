@@ -8,11 +8,13 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use gritt_core::config::LoggingConfig;
+use gritt_core::secret::Secret;
 use gritt_core::session::SessionId;
 use gritt_core::telemetry::{AnalyticsRecord, TelemetryEvent};
 use gritt_core::{Error, Result};
 
 use crate::store::{storage_error, Store};
+use gritt_provider::adapter::redact_text;
 
 pub struct Telemetry {
     store: Arc<Store>,
@@ -103,11 +105,19 @@ impl Telemetry {
         .await
     }
 
-    /// Writes a content row only when content logging is on.
-    pub async fn content(&self, session: &SessionId, role: &str, content: &str) -> Result<()> {
+    /// Writes a content row only when content logging is on. Every active
+    /// key in `secrets` is redacted first; the opt-in never lifts ADR-008.
+    pub async fn content(
+        &self,
+        session: &SessionId,
+        role: &str,
+        content: &str,
+        secrets: &[Secret],
+    ) -> Result<()> {
         if !self.logging.content_logging {
             return Ok(());
         }
+        let content = redact_text(content, secrets);
         self.store
             .connection()
             .execute(
@@ -155,6 +165,23 @@ impl Telemetry {
         Ok(out)
     }
 
+    /// Every content row's text, for the redaction test.
+    pub async fn content_text(&self) -> Result<String> {
+        let mut rows = self
+            .store
+            .connection()
+            .query("SELECT content FROM gritt_content_log ORDER BY id", ())
+            .await
+            .map_err(storage_error)?;
+        let mut out = String::new();
+        while let Some(row) = rows.next().await.map_err(storage_error)? {
+            let text: String = row.get(0).map_err(storage_error)?;
+            out.push_str(&text);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
     pub async fn content_rows(&self) -> Result<u64> {
         let mut rows = self
             .store
@@ -196,13 +223,15 @@ mod tests {
     async fn content_is_not_logged_by_default_and_purges_when_on() {
         let (_dir, off) = telemetry(false).await;
         let session = SessionId("s".into());
-        off.content(&session, "user", "secret prompt")
+        off.content(&session, "user", "secret prompt", &[])
             .await
             .unwrap();
         assert_eq!(off.content_rows().await.unwrap(), 0);
 
         let (_dir, on) = telemetry(true).await;
-        on.content(&session, "user", "secret prompt").await.unwrap();
+        on.content(&session, "user", "secret prompt", &[])
+            .await
+            .unwrap();
         assert_eq!(on.content_rows().await.unwrap(), 1);
         let purged = on
             .purge_content(Utc::now() + Duration::days(8))
@@ -210,6 +239,24 @@ mod tests {
             .unwrap();
         assert_eq!(purged, 1);
         assert_eq!(on.content_rows().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn content_rows_are_key_redacted() {
+        let (_dir, on) = telemetry(true).await;
+        let session = SessionId("s".into());
+        let key = Secret::new("sk-sentinel-4471");
+        on.content(
+            &session,
+            "user",
+            "my key is sk-sentinel-4471, use it",
+            std::slice::from_ref(&key),
+        )
+        .await
+        .unwrap();
+        let text = on.content_text().await.unwrap();
+        assert!(!text.contains("sk-sentinel-4471"));
+        assert!(text.contains("my key is [redacted], use it"));
     }
 
     #[tokio::test]

@@ -163,6 +163,10 @@ async fn event_loop(
                 if let Some(handle) = &handle {
                     handle.cancel();
                 }
+                // A pending approval is denied by the loop on cancel; drop
+                // the view and its responder so a late key cannot answer it.
+                app.pending = None;
+                responder = None;
             }
             Action::Approve(decision) => {
                 if let Some(sender) = responder.take() {

@@ -60,6 +60,38 @@ pub fn looks_destructive(command: &str) -> bool {
         .any(|fragment| lower.contains(fragment))
 }
 
+/// True when a shell command names a path outside the workspace: an
+/// absolute path elsewhere, a drive-letter path, or a `..` component. The
+/// shell itself is not confined (ADR-009 runs it under approval, and only
+/// the file tools are workspace-bounded), so such a command gets the
+/// stronger prompt instead of a different outcome. `/dev/null` is exempt.
+pub fn reaches_outside_workspace(command: &str, workspace: &Path) -> bool {
+    let root = workspace.to_string_lossy().replace('\\', "/");
+    let root = root.trim_end_matches('/');
+    command
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '"' | '\'' | '=' | ';' | '|' | '&' | '(' | ')' | '<' | '>' | '`'
+                )
+        })
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            let token = token.replace('\\', "/");
+            if token.split('/').any(|part| part == "..") {
+                return true;
+            }
+            if token == "/dev/null" {
+                return false;
+            }
+            let bytes = token.as_bytes();
+            let absolute = token.starts_with('/')
+                || (bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic());
+            absolute && token != root && !token.starts_with(&format!("{root}/"))
+        })
+}
+
 /// Matches `pattern` against `text` where `*` spans anything except `/`,
 /// `**` spans anything, and `?` is one character.
 pub fn wildcard_match(pattern: &str, text: &str) -> bool {
@@ -136,10 +168,14 @@ impl PolicyEngine {
 
     /// The gate. First matching rule wins; otherwise the fallback.
     pub fn evaluate(&self, tool: &str, resource: &Resource) -> Decision {
-        let destructive = match resource {
-            Resource::Command(command) => looks_destructive(command),
-            _ => false,
+        let (destructive, outside) = match resource {
+            Resource::Command(command) => (
+                looks_destructive(command),
+                reaches_outside_workspace(command, &self.workspace),
+            ),
+            _ => (false, false),
         };
+        let destructive = destructive || outside;
         for (index, rule) in self.config.rules.iter().enumerate() {
             if self.rule_matches(rule, tool, resource) {
                 let reason = if rule.reason.is_empty() {
@@ -147,7 +183,9 @@ impl PolicyEngine {
                 } else {
                     rule.reason.clone()
                 };
-                let reason = if destructive && rule.outcome == PolicyOutcome::Ask {
+                let reason = if rule.outcome == PolicyOutcome::Ask && outside {
+                    format!("{reason}; the command names a path outside the workspace")
+                } else if rule.outcome == PolicyOutcome::Ask && destructive {
                     format!("{reason}; the command looks destructive")
                 } else {
                     reason
@@ -213,6 +251,34 @@ mod tests {
         assert_eq!(scary.outcome, PolicyOutcome::Ask);
         assert!(scary.destructive);
         assert!(scary.reason.contains("destructive"));
+    }
+
+    #[test]
+    fn shell_paths_outside_the_workspace_get_the_stronger_prompt() {
+        let plain = engine().evaluate(native::SHELL, &Resource::Command("cargo test -p x".into()));
+        assert_eq!(plain.outcome, PolicyOutcome::Ask);
+        assert!(!plain.destructive);
+        let inside =
+            engine().evaluate(native::SHELL, &Resource::Command("cat /ws/src/a.rs".into()));
+        assert!(!inside.destructive);
+        let absolute =
+            engine().evaluate(native::SHELL, &Resource::Command("cat /etc/passwd".into()));
+        assert_eq!(absolute.outcome, PolicyOutcome::Ask);
+        assert!(absolute.destructive);
+        assert!(absolute.reason.contains("outside the workspace"));
+        let parent = engine().evaluate(native::SHELL, &Resource::Command("ls ../other".into()));
+        assert!(parent.destructive);
+        let quoted = engine().evaluate(
+            native::SHELL,
+            &Resource::Command("cp \"a/../../b\" c".into()),
+        );
+        assert!(quoted.destructive);
+        let devnull = engine().evaluate(native::SHELL, &Resource::Command("cat /dev/null".into()));
+        assert!(!devnull.destructive);
+        assert!(reaches_outside_workspace(
+            "type C:\\Windows\\x",
+            Path::new("/ws")
+        ));
     }
 
     #[test]

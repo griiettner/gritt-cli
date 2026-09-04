@@ -550,11 +550,15 @@ async fn resume_restores_continuation_and_skips_the_system_prompt() {
     let second = fx.transport.requests()[1].body_json().unwrap();
     let messages = second["messages"].as_array().unwrap();
     // System prompt, first user turn, first assistant turn, second user turn.
+    // The session was switched to coding on resume, so the second user
+    // message carries the phase transition note ahead of the prompt.
     assert_eq!(messages.len(), 4);
     assert_eq!(messages[0]["role"], "system");
     assert_eq!(messages[1]["content"], "first");
     assert_eq!(messages[2]["role"], "assistant");
-    assert_eq!(messages[3]["content"], "second");
+    let second_content = messages[3]["content"].as_str().unwrap();
+    assert!(second_content.starts_with("[Phase changed to coding."));
+    assert!(second_content.ends_with("\n\nsecond"));
     let stored = fx.builder.store.read_events(&id).await.unwrap();
     assert!(stored.len() > events_after_first);
     assert_eq!(stored.first().unwrap().sequence, 0);
@@ -605,4 +609,514 @@ async fn print_mode_writes_text_to_stdout_and_activity_to_stderr() {
     assert!(activity.contains("<- file_read ok"));
     assert_eq!(*asked.lock().unwrap(), 0);
     let _labels: BTreeMap<String, String> = BTreeMap::new();
+}
+
+/// Answers approvals only when told to; otherwise the future stays
+/// pending so the loop's cancellation race can be observed.
+struct HangingUi {
+    events: Vec<Event>,
+}
+
+impl Ui for HangingUi {
+    fn event(&mut self, event: &Event) {
+        self.events.push(event.clone());
+    }
+
+    fn approve<'a>(
+        &'a mut self,
+        _request: &'a ApprovalRequest,
+        _decision: &'a Decision,
+        _preview: Option<&'a str>,
+    ) -> BoxFuture<'a, ApprovalDecision> {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_children_cannot_leak_credentials_and_results_are_redacted() {
+    std::env::set_var("GRITT_SESSION_TEST_API_KEY", "env-secret-value-5150");
+    std::env::set_var("OPENROUTER_API_KEY", "profile-secret-value-5151");
+    let fx = fixture_builder(
+        vec![
+            FixtureResponse::sse(tool_call_sse(
+                native::SHELL,
+                serde_json::json!({"command": "env"}),
+            )),
+            FixtureResponse::sse(tool_call_sse(
+                native::SHELL,
+                serde_json::json!({"command": format!("printf '{KEY}'")}),
+            )),
+            FixtureResponse::sse(tool_call_sse(
+                native::FILE_READ,
+                serde_json::json!({"path": "creds.txt"}),
+            )),
+            FixtureResponse::sse(fixture("stream-text.sse")),
+        ],
+        ApprovalMode::ApproveAll,
+        None,
+    )
+    .await;
+    std::fs::write(
+        fx.builder.workspace_root().join("creds.txt"),
+        format!("token={KEY}\n"),
+    )
+    .unwrap();
+    let mut agent = fx
+        .builder
+        .open(
+            SessionSelector::New { name: None },
+            None,
+            None,
+            Some(Phase::Coding),
+        )
+        .await
+        .unwrap();
+    let mut ui = RecordingUi::default();
+    let outcome = agent.run_turn("show me", &mut ui).await.unwrap();
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    let results = tool_results(&ui.events);
+    assert_eq!(results.len(), 3);
+    assert!(!results[0].1, "{}", results[0].2);
+    assert!(!results[0].2.contains("env-secret-value-5150"));
+    assert!(!results[0].2.contains("profile-secret-value-5151"));
+    assert!(!results[0].2.contains("GRITT_SESSION_TEST_API_KEY="));
+    assert_eq!(results[1].2, "[redacted]");
+    assert_eq!(results[2].2, "token=[redacted]\n");
+    let stored = fx
+        .builder
+        .store
+        .read_events(&agent.session().id)
+        .await
+        .unwrap();
+    let dump = serde_json::to_string(&stored).unwrap();
+    assert!(!dump.contains(KEY));
+    assert!(!dump.contains("env-secret-value-5150"));
+    // Tool results sent back to the provider are the redacted copies. The
+    // model's own tool-call arguments are its content and stay as sent.
+    for request in fx.transport.requests().iter().skip(1) {
+        let body = request.body_json().unwrap();
+        for message in body["messages"].as_array().unwrap() {
+            if message["role"] == "tool" {
+                let content = message["content"].as_str().unwrap_or_default();
+                assert!(!content.contains(KEY), "key reached a tool message");
+                assert!(!content.contains("env-secret-value-5150"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn approval_requests_with_a_key_in_the_command_are_redacted() {
+    let fx = fixture_builder(
+        vec![
+            FixtureResponse::sse(tool_call_sse(
+                native::SHELL,
+                serde_json::json!({"command": format!("curl -H 'Authorization: {KEY}' https://x")}),
+            )),
+            FixtureResponse::sse(fixture("stream-text.sse")),
+        ],
+        ApprovalMode::Ask,
+        None,
+    )
+    .await;
+    let mut agent = fx
+        .builder
+        .open(
+            SessionSelector::New { name: None },
+            None,
+            None,
+            Some(Phase::Coding),
+        )
+        .await
+        .unwrap();
+    let mut ui = RecordingUi {
+        answers: vec![ApprovalDecision::Denied],
+        ..Default::default()
+    };
+    agent.run_turn("call it", &mut ui).await.unwrap();
+    let stored = fx
+        .builder
+        .store
+        .read_events(&agent.session().id)
+        .await
+        .unwrap();
+    let requested = stored
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::ApprovalRequested { request } => Some(request.clone()),
+            _ => None,
+        })
+        .expect("approval requested");
+    assert!(requested.resource.contains("[redacted]"));
+    assert!(!requested.resource.contains(KEY));
+    assert!(!serde_json::to_string(&stored).unwrap().contains(KEY));
+}
+
+#[tokio::test]
+async fn a_phase_change_sends_a_transition_note_on_the_next_turn() {
+    let fx = fixture_builder(
+        vec![
+            FixtureResponse::sse(fixture("stream-text.sse")),
+            FixtureResponse::sse(fixture("stream-text.sse")),
+            FixtureResponse::sse(fixture("stream-text.sse")),
+            FixtureResponse::sse(fixture("stream-text.sse")),
+        ],
+        ApprovalMode::Ask,
+        None,
+    )
+    .await;
+    let mut agent = fx
+        .builder
+        .open(SessionSelector::Named("phased".into()), None, None, None)
+        .await
+        .unwrap();
+    let mut ui = RecordingUi::default();
+    agent.run_turn("plan it", &mut ui).await.unwrap();
+    agent.set_phase(Phase::Coding).await.unwrap();
+    agent.run_turn("now build it", &mut ui).await.unwrap();
+    agent.run_turn("keep going", &mut ui).await.unwrap();
+    let requests = fx.transport.requests();
+    let first = requests[0].body_json().unwrap();
+    assert!(first.get("tools").is_none());
+    let second = requests[1].body_json().unwrap();
+    assert_eq!(second["tools"].as_array().unwrap().len(), 3);
+    let user = second["messages"].as_array().unwrap().last().unwrap();
+    let content = user["content"].as_str().unwrap();
+    assert!(
+        content.starts_with("[Phase changed to coding."),
+        "{content}"
+    );
+    assert!(content.ends_with("now build it"));
+    let third = requests[2].body_json().unwrap();
+    let user = third["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(user["content"], "keep going", "the note is sent once");
+
+    // A resumed session switched to planning gets the planning note.
+    drop(agent);
+    let mut resumed = fx
+        .builder
+        .open(
+            SessionSelector::Named("phased".into()),
+            None,
+            None,
+            Some(Phase::Planning),
+        )
+        .await
+        .unwrap();
+    resumed.run_turn("rethink", &mut ui).await.unwrap();
+    let fourth = fx.transport.requests()[3].body_json().unwrap();
+    assert!(fourth.get("tools").is_none());
+    let user = fourth["messages"].as_array().unwrap().last().unwrap();
+    assert!(user["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("[Phase changed to planning."));
+}
+
+#[tokio::test]
+async fn resume_refuses_a_session_from_another_workspace() {
+    let fx = fixture_builder(
+        vec![FixtureResponse::sse(fixture("stream-text.sse"))],
+        ApprovalMode::Ask,
+        None,
+    )
+    .await;
+    let mut agent = fx
+        .builder
+        .open(SessionSelector::Named("elsewhere".into()), None, None, None)
+        .await
+        .unwrap();
+    agent
+        .run_turn("hi", &mut RecordingUi::default())
+        .await
+        .unwrap();
+    let id = agent.session().id.clone();
+    drop(agent);
+    let other = tempfile::tempdir().unwrap();
+    let mut moved = AgentBuilder {
+        config: fx.builder.config.clone(),
+        store: Arc::clone(&fx.builder.store),
+        telemetry: Arc::clone(&fx.builder.telemetry),
+        keys: Arc::clone(&fx.builder.keys),
+        transport: Arc::clone(&fx.builder.transport),
+        catalog: Arc::clone(&fx.builder.catalog),
+        cache: None,
+        workspace: Workspace::open(other.path()).unwrap(),
+        approval: ApprovalMode::Ask,
+    };
+    for selector in [
+        SessionSelector::Named("elsewhere".into()),
+        SessionSelector::Id(id),
+    ] {
+        let error = match moved.open(selector, None, None, None).await {
+            Ok(_) => panic!("a session from another workspace was resumed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.message.contains("belongs to workspace"),
+            "{}",
+            error.message
+        );
+        assert!(error
+            .message
+            .contains(&fx.builder.workspace_root().display().to_string()));
+        assert!(error.message.contains("--workspace"));
+    }
+    // Pointing the builder back at the recorded workspace resumes it.
+    moved.workspace = Workspace::open(fx.builder.workspace_root()).unwrap();
+    assert!(moved
+        .open(SessionSelector::Named("elsewhere".into()), None, None, None)
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn cancelling_during_a_pending_approval_denies_and_ends_the_turn() {
+    let fx = fixture_builder(
+        vec![FixtureResponse::sse(tool_call_sse(
+            native::FILE_WRITE,
+            serde_json::json!({"path": "late.txt", "content": "x\n"}),
+        ))],
+        ApprovalMode::Ask,
+        None,
+    )
+    .await;
+    let mut agent = fx
+        .builder
+        .open(
+            SessionSelector::New { name: None },
+            None,
+            None,
+            Some(Phase::Coding),
+        )
+        .await
+        .unwrap();
+    let handle = agent.handle();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        handle.cancel();
+    });
+    let mut ui = HangingUi { events: Vec::new() };
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        agent.run_turn("write late", &mut ui),
+    )
+    .await
+    .expect("the approval wait observed cancellation")
+    .unwrap();
+    assert_eq!(outcome.status, TurnStatus::Cancelled);
+    let k = kinds(&ui.events);
+    assert!(k.contains(&"approval_requested"));
+    assert!(k.contains(&"cancelled"));
+    assert!(ui.events.iter().any(|event| matches!(
+        event.kind,
+        EventKind::ApprovalDecided {
+            decision: ApprovalDecision::Denied,
+            ..
+        }
+    )));
+    assert!(!fx.builder.workspace_root().join("late.txt").exists());
+    assert_eq!(fx.transport.request_count(), 1);
+}
+
+/// Fails every write after the first `limit` bytes, like a closed pipe.
+#[derive(Clone)]
+struct FailingWriter {
+    written: Arc<Mutex<usize>>,
+    limit: usize,
+}
+
+impl std::io::Write for FailingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut written = self.written.lock().unwrap();
+        if *written >= self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken pipe",
+            ));
+        }
+        *written += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn print_mode_stops_the_turn_when_stdout_breaks() {
+    let fx = fixture_builder(
+        vec![
+            FixtureResponse::sse(fixture("stream-tool-call.sse")),
+            FixtureResponse::sse(fixture("stream-tool-result.sse")),
+        ],
+        ApprovalMode::ApproveAll,
+        None,
+    )
+    .await;
+    let mut agent = fx
+        .builder
+        .open(
+            SessionSelector::New { name: None },
+            None,
+            None,
+            Some(Phase::Coding),
+        )
+        .await
+        .unwrap();
+    let out = FailingWriter {
+        written: Arc::new(Mutex::new(0)),
+        limit: 0,
+    };
+    let err = SharedBuffer::default();
+    let mut ui = PrintUi::new(
+        out,
+        err.clone(),
+        PrintUiOptions {
+            verbose: false,
+            prompter: Arc::new(|_, _, _| ApprovalDecision::Approved),
+        },
+    );
+    let error = agent.run_turn("read it", &mut ui).await.unwrap_err();
+    assert!(error.message.contains("output failed"), "{}", error.message);
+    assert!(error.message.contains("broken pipe"));
+    assert!(agent.handle().is_cancelled());
+    // The first stream produced a tool call; the text that would have
+    // followed the tool result never went out, so no continuation ran.
+    assert!(fx.transport.request_count() <= 2);
+    let stored = fx
+        .builder
+        .store
+        .read_events(&agent.session().id)
+        .await
+        .unwrap();
+    // The turn never reached its final status: the failing text delta was
+    // not persisted and nothing after it ran.
+    assert!(!stored.iter().any(|event| matches!(
+        event.kind,
+        EventKind::StatusChanged {
+            status: gritt_core::event::SessionStatus::Finished
+        }
+    )));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn repl_runs_a_scripted_session_end_to_end() {
+    use gritt_harness::modes::repl::{run_repl, CancelSlot};
+
+    let marker = format!("gritt-repl-cancel-{}", std::process::id());
+    let fx = fixture_builder(
+        vec![
+            // 1. planning prompt
+            FixtureResponse::sse(fixture("stream-text.sse")),
+            // 2. coding prompt: a write that needs approval, then text
+            FixtureResponse::sse(tool_call_sse(
+                native::FILE_WRITE,
+                serde_json::json!({"path": "repl.txt", "content": "from repl\n"}),
+            )),
+            FixtureResponse::sse(fixture("stream-text.sse")),
+            // 3. a long shell command that gets cancelled
+            FixtureResponse::sse(tool_call_sse(
+                native::SHELL,
+                serde_json::json!({"command": format!("sleep 30 # {marker}")}),
+            )),
+            // 4. after /resume of the first session
+            FixtureResponse::sse(fixture("stream-text.sse")),
+        ],
+        ApprovalMode::Ask,
+        None,
+    )
+    .await;
+    let agent = fx
+        .builder
+        .open(SessionSelector::Named("first".into()), None, None, None)
+        .await
+        .unwrap();
+    let script = "plan this\n/code\nwrite the file\nrun the long thing\n/sessions\n/resume first\nback again\n/history\n/quit\n";
+    let mut input = std::io::Cursor::new(script.as_bytes().to_vec());
+    let out = SharedBuffer::default();
+    let err = SharedBuffer::default();
+    let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = Arc::clone(&asked);
+    let slot: CancelSlot = Arc::new(Mutex::new(None));
+    // Approving the shell command also schedules a cancel through the
+    // slot half a second later, the way the binary's Ctrl-C handler does,
+    // so the third turn is cancelled while its child is running.
+    let canceller = Arc::clone(&slot);
+    let runtime = tokio::runtime::Handle::current();
+    let options = PrintUiOptions {
+        verbose: false,
+        prompter: Arc::new(move |request, _, _| {
+            seen.lock().unwrap().push(request.tool.clone());
+            if request.tool == native::SHELL {
+                let slot = Arc::clone(&canceller);
+                runtime.spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if let Some(handle) = slot.lock().unwrap().clone() {
+                        handle.cancel();
+                    }
+                });
+            }
+            ApprovalDecision::Approved
+        }),
+    };
+    let agent = run_repl(
+        &fx.builder,
+        agent,
+        &mut input,
+        out.clone(),
+        err.clone(),
+        options,
+        slot,
+    )
+    .await
+    .unwrap();
+    let stdout = out.contents();
+    let stderr = err.contents();
+    assert!(stdout.contains("[first plan] > "));
+    assert!(stdout.contains("phase: coding"));
+    assert!(stdout.contains("[first code] > "));
+    assert_eq!(stdout.matches("Hello, world").count(), 3, "{stdout}");
+    assert!(stdout.contains("resumed `first`"));
+    assert!(stdout.contains("  1  plan this"));
+    assert_eq!(
+        asked.lock().unwrap().as_slice(),
+        [native::FILE_WRITE, native::SHELL]
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.builder.workspace_root().join("repl.txt")).unwrap(),
+        "from repl\n"
+    );
+    assert!(stderr.contains("cancelled"), "{stderr}");
+    assert!(stderr.contains("turn Cancelled"), "{stderr}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let ps = std::process::Command::new("ps")
+        .args(["-eo", "args"])
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&ps.stdout);
+    assert!(
+        !listing
+            .lines()
+            .any(|line| line.contains(&marker) && !line.contains("ps ")),
+        "child survived the REPL cancel"
+    );
+    assert_eq!(agent.session().name, "first");
+    assert_eq!(agent.phase(), Phase::Coding);
+    let requests = fx.transport.requests();
+    assert_eq!(requests.len(), 5);
+    assert!(requests[0].body_json().unwrap().get("tools").is_none());
+    assert!(requests[1].body_json().unwrap()["tools"].is_array());
+    let stored = fx
+        .builder
+        .store
+        .read_events(&agent.session().id)
+        .await
+        .unwrap();
+    let k = kinds(&stored);
+    assert!(k.contains(&"cancelled"));
+    assert!(k.contains(&"approval_decided"));
 }

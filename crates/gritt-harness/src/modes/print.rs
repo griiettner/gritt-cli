@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use gritt_core::event::{ApprovalDecision, ApprovalRequest, Event, EventKind, SessionStatus};
 use gritt_core::session::BoxFuture;
+use gritt_core::tool::native;
 
 use crate::agent::Ui;
 use crate::policy::Decision;
@@ -38,6 +39,10 @@ pub struct PrintUi<O: Write + Send, E: Write + Send> {
     err: E,
     options: PrintUiOptions,
     wrote_text: bool,
+    /// The first write or flush failure on either stream. A closed pipe
+    /// must stop the turn instead of letting it consume tokens and run
+    /// tools nobody can see.
+    failure: Option<String>,
 }
 
 impl<O: Write + Send, E: Write + Send> PrintUi<O, E> {
@@ -47,14 +52,35 @@ impl<O: Write + Send, E: Write + Send> PrintUi<O, E> {
             err,
             options,
             wrote_text: false,
+            failure: None,
         }
+    }
+
+    fn note(&mut self, result: std::io::Result<()>) {
+        if let Err(error) = result {
+            if self.failure.is_none() {
+                self.failure = Some(error.to_string());
+            }
+        }
+    }
+
+    fn out(&mut self, text: &str) {
+        let result = self
+            .out
+            .write_all(text.as_bytes())
+            .and_then(|()| self.out.flush());
+        self.note(result);
+    }
+
+    fn err_line(&mut self, text: &str) {
+        let result = writeln!(self.err, "{text}");
+        self.note(result);
     }
 
     /// Ends the streamed text with a newline when any was written.
     pub fn finish(&mut self) {
         if self.wrote_text {
-            let _ = writeln!(self.out);
-            let _ = self.out.flush();
+            self.out("\n");
             self.wrote_text = false;
         }
     }
@@ -106,6 +132,11 @@ pub fn approval_text(
         "approval needed: {} on {}\n  reason: {}\n",
         request.tool, request.resource, decision.reason
     ));
+    if request.tool == native::SHELL {
+        text.push_str(
+            "  the command runs with your authority and may reach outside the workspace\n",
+        );
+    }
     if let Some(diff) = preview {
         text.push_str(diff);
         if !diff.ends_with('\n') {
@@ -119,57 +150,53 @@ impl<O: Write + Send, E: Write + Send> Ui for PrintUi<O, E> {
     fn event(&mut self, event: &Event) {
         match &event.kind {
             EventKind::TextDelta { text } => {
-                let _ = self.out.write_all(text.as_bytes());
-                let _ = self.out.flush();
+                self.out(text);
                 self.wrote_text = true;
             }
             EventKind::ReasoningSummary { text } if self.options.verbose => {
-                let _ = writeln!(self.err, "[reasoning] {text}");
+                self.err_line(&format!("[reasoning] {text}"));
             }
             EventKind::ToolCall { call } => {
                 self.finish();
-                let _ = writeln!(
-                    self.err,
-                    "-> {}",
-                    describe_call(&call.name, &call.arguments)
-                );
+                let line = format!("-> {}", describe_call(&call.name, &call.arguments));
+                self.err_line(&line);
             }
             EventKind::ToolResult { result } => {
-                let _ = writeln!(
-                    self.err,
+                let line = format!(
                     "<- {} {} ({} bytes)",
                     result.name,
                     if result.is_error { "error" } else { "ok" },
                     result.output.len()
                 );
+                self.err_line(&line);
                 if result.is_error {
-                    let first = result.output.lines().next().unwrap_or_default();
-                    let _ = writeln!(self.err, "   {first}");
+                    let first = result.output.lines().next().unwrap_or_default().to_owned();
+                    self.err_line(&format!("   {first}"));
                 }
             }
             EventKind::ApprovalDecided { decision, .. } => {
-                let _ = writeln!(self.err, "   {decision:?}");
+                self.err_line(&format!("   {decision:?}"));
             }
             EventKind::StatusChanged { status } => {
                 if self.options.verbose || *status == SessionStatus::WaitingForApproval {
-                    let _ = writeln!(self.err, "[status] {status:?}");
+                    self.err_line(&format!("[status] {status:?}"));
                 }
             }
             EventKind::Error { message, .. } => {
                 self.finish();
-                let _ = writeln!(self.err, "error: {message}");
+                self.err_line(&format!("error: {message}"));
             }
             EventKind::Cancelled => {
                 self.finish();
-                let _ = writeln!(self.err, "cancelled");
+                self.err_line("cancelled");
             }
             EventKind::Usage { usage } if self.options.verbose => {
-                let _ = writeln!(
-                    self.err,
+                let line = format!(
                     "[usage] in={} out={}",
                     usage.input_tokens.unwrap_or(0),
                     usage.output_tokens.unwrap_or(0)
                 );
+                self.err_line(&line);
             }
             _ => {}
         }
@@ -182,13 +209,14 @@ impl<O: Write + Send, E: Write + Send> Ui for PrintUi<O, E> {
                 .get("features")
                 .map(|f| f.to_string())
                 .unwrap_or_default();
-            let _ = writeln!(
-                self.err,
+            self.err_line(&format!(
                 "warning: the provider did not report support for {features}"
-            );
+            ));
         }
     }
 
+    /// The prompt text goes out first; the answer is read on a blocking
+    /// thread so the loop can race it against cancellation.
     fn approve<'a>(
         &'a mut self,
         request: &'a ApprovalRequest,
@@ -196,12 +224,23 @@ impl<O: Write + Send, E: Write + Send> Ui for PrintUi<O, E> {
         preview: Option<&'a str>,
     ) -> BoxFuture<'a, ApprovalDecision> {
         self.finish();
-        let _ = self
+        let text = approval_text(request, decision, preview);
+        let result = self
             .err
-            .write_all(approval_text(request, decision, preview).as_bytes());
-        let _ = self.err.flush();
-        let answer = (self.options.prompter)(request, decision, preview);
-        Box::pin(async move { answer })
+            .write_all(text.as_bytes())
+            .and_then(|()| self.err.flush());
+        self.note(result);
+        let prompter = Arc::clone(&self.options.prompter);
+        let request = request.clone();
+        let decision = decision.clone();
+        let preview = preview.map(str::to_owned);
+        let handle =
+            tokio::task::spawn_blocking(move || prompter(&request, &decision, preview.as_deref()));
+        Box::pin(async move { handle.await.unwrap_or(ApprovalDecision::Denied) })
+    }
+
+    fn output_error(&self) -> Option<String> {
+        self.failure.clone()
     }
 }
 

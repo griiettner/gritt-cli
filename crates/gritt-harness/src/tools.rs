@@ -4,6 +4,7 @@
 //! without that gate in the agent loop.
 
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -167,6 +168,29 @@ pub struct ShellOutput {
     pub cancelled: bool,
 }
 
+/// Environment variable name suffixes that mark a credential. Variables
+/// with these suffixes, plus every configured profile key variable and
+/// `AGENT_MEMORY_API_KEY`, are removed from the shell child's environment
+/// so an approved command cannot hand a key back to the model.
+pub const SECRET_ENV_SUFFIXES: [&str; 3] = ["_API_KEY", "_TOKEN", "_SECRET"];
+
+pub fn is_secret_env_name(name: &str, blocked: &[String]) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper == "AGENT_MEMORY_API_KEY"
+        || blocked.iter().any(|known| known.eq_ignore_ascii_case(name))
+        || SECRET_ENV_SUFFIXES
+            .iter()
+            .any(|suffix| upper.ends_with(suffix))
+}
+
+/// The names in the current environment a shell child must not inherit.
+pub fn secret_env_names(blocked: &[String]) -> Vec<OsString> {
+    std::env::vars_os()
+        .map(|(name, _)| name)
+        .filter(|name| is_secret_env_name(&name.to_string_lossy(), blocked))
+        .collect()
+}
+
 fn shell_command(command: &str) -> tokio::process::Command {
     #[cfg(unix)]
     {
@@ -201,8 +225,13 @@ pub async fn run_shell(
     command: &str,
     registry: &ProcessRegistry,
     cancel: &CancellationToken,
+    blocked_env: &[String],
 ) -> Result<ShellOutput> {
-    let mut child = shell_command(command)
+    let mut command = shell_command(command);
+    for name in secret_env_names(blocked_env) {
+        command.env_remove(name);
+    }
+    let mut child = command
         .current_dir(workspace.root())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -216,13 +245,20 @@ pub async fn run_shell(
     let mut stderr_pipe = child.stderr.take();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
+    // Both pipes drain concurrently: a child that fills stderr before it
+    // closes stdout would otherwise block forever on a full pipe.
     let read = async {
-        if let Some(pipe) = stdout_pipe.as_mut() {
-            let _ = pipe.read_to_end(&mut stdout).await;
-        }
-        if let Some(pipe) = stderr_pipe.as_mut() {
-            let _ = pipe.read_to_end(&mut stderr).await;
-        }
+        let drain_stdout = async {
+            if let Some(pipe) = stdout_pipe.as_mut() {
+                let _ = pipe.read_to_end(&mut stdout).await;
+            }
+        };
+        let drain_stderr = async {
+            if let Some(pipe) = stderr_pipe.as_mut() {
+                let _ = pipe.read_to_end(&mut stderr).await;
+            }
+        };
+        tokio::join!(drain_stdout, drain_stderr);
         child.wait().await
     };
     let outcome = tokio::select! {
@@ -274,6 +310,7 @@ pub fn unified_diff(path_label: &str, old: &str, new: &str) -> String {
 pub struct NativeTools {
     workspace: Workspace,
     registry: Arc<ProcessRegistry>,
+    blocked_env: Vec<String>,
 }
 
 impl NativeTools {
@@ -281,7 +318,16 @@ impl NativeTools {
         Self {
             workspace,
             registry,
+            blocked_env: Vec::new(),
         }
+    }
+
+    /// Names of environment variables (the configured profile key
+    /// variables) that shell children must not inherit, on top of the
+    /// suffix rule.
+    pub fn with_blocked_env(mut self, names: Vec<String>) -> Self {
+        self.blocked_env = names;
+        self
     }
 
     pub fn workspace(&self) -> &Workspace {
@@ -361,7 +407,13 @@ impl NativeTools {
         let label = Self::argument(call, "path")?;
         let path = self.workspace.resolve(label)?;
         let content = Self::argument(call, "content")?;
-        let current = std::fs::read_to_string(&path).unwrap_or_default();
+        // Only a missing file is a new file. Any other failure, including
+        // invalid UTF-8, would otherwise show a misleading whole-file diff.
+        let current = match std::fs::read_to_string(&path) {
+            Ok(current) => current,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(Error::config(format!("cannot preview `{label}`: {error}"))),
+        };
         Ok(Some(unified_diff(label, &current, content)))
     }
 
@@ -413,7 +465,14 @@ impl NativeTools {
             }
             native::SHELL => {
                 let command = Self::argument(call, "command")?;
-                let output = run_shell(&self.workspace, command, &self.registry, cancel).await?;
+                let output = run_shell(
+                    &self.workspace,
+                    command,
+                    &self.registry,
+                    cancel,
+                    &self.blocked_env,
+                )
+                .await?;
                 if output.cancelled {
                     return Err(Error::cancelled());
                 }
@@ -518,12 +577,95 @@ mod tests {
     async fn shell_runs_in_the_workspace() {
         let (_dir, ws) = workspace();
         let registry = ProcessRegistry::new();
-        let output = run_shell(&ws, "echo hi && pwd", &registry, &CancellationToken::new())
-            .await
-            .unwrap();
+        let output = run_shell(
+            &ws,
+            "echo hi && pwd",
+            &registry,
+            &CancellationToken::new(),
+            &[],
+        )
+        .await
+        .unwrap();
         assert_eq!(output.status, Some(0));
         assert!(output.stdout.starts_with("hi\n"));
         assert!(registry.tracked().is_empty());
+    }
+
+    #[test]
+    fn preview_propagates_read_errors_other_than_not_found() {
+        let (_dir, ws) = workspace();
+        let tools = NativeTools::new(ws.clone(), ProcessRegistry::new());
+        std::fs::write(ws.root().join("bin.dat"), [0xff, 0xfe, 0x00, 0x80]).unwrap();
+        let call = ToolCall {
+            id: ToolCallId("p".into()),
+            name: native::FILE_WRITE.into(),
+            arguments: serde_json::json!({"path": "bin.dat", "content": "text\n"}),
+        };
+        let error = tools.preview(&call).unwrap_err();
+        assert!(
+            error.message.contains("cannot preview"),
+            "{}",
+            error.message
+        );
+        let fresh = ToolCall {
+            id: ToolCallId("n".into()),
+            name: native::FILE_WRITE.into(),
+            arguments: serde_json::json!({"path": "new.txt", "content": "text\n"}),
+        };
+        assert!(tools.preview(&fresh).unwrap().unwrap().contains("+text"));
+    }
+
+    #[test]
+    fn secret_env_names_follow_the_suffix_and_profile_rules() {
+        let blocked = vec!["MY_PROVIDER_CREDENTIAL".to_string()];
+        assert!(is_secret_env_name("OPENAI_API_KEY", &blocked));
+        assert!(is_secret_env_name("gh_token", &blocked));
+        assert!(is_secret_env_name("APP_SECRET", &blocked));
+        assert!(is_secret_env_name("AGENT_MEMORY_API_KEY", &blocked));
+        assert!(is_secret_env_name("my_provider_credential", &blocked));
+        assert!(!is_secret_env_name("PATH", &blocked));
+        assert!(!is_secret_env_name("HOME", &blocked));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_children_do_not_inherit_credentials() {
+        let (_dir, ws) = workspace();
+        std::env::set_var("GRITT_TEST_SHELL_API_KEY", "shell-env-secret-8841");
+        std::env::set_var("GRITT_TEST_PROFILE_CRED", "profile-env-secret-8842");
+        std::env::set_var("GRITT_TEST_PLAIN", "plain-value-8843");
+        let registry = ProcessRegistry::new();
+        let output = run_shell(
+            &ws,
+            "env",
+            &registry,
+            &CancellationToken::new(),
+            &["GRITT_TEST_PROFILE_CRED".to_string()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.status, Some(0));
+        assert!(!output.stdout.contains("shell-env-secret-8841"));
+        assert!(!output.stdout.contains("profile-env-secret-8842"));
+        assert!(output.stdout.contains("plain-value-8843"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_that_floods_stderr_first_does_not_deadlock() {
+        let (_dir, ws) = workspace();
+        let registry = ProcessRegistry::new();
+        let command = "head -c 300000 /dev/zero | tr '\\0' x >&2; echo done";
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_shell(&ws, command, &registry, &CancellationToken::new(), &[]),
+        )
+        .await
+        .expect("shell drained both pipes")
+        .unwrap();
+        assert_eq!(output.status, Some(0));
+        assert_eq!(output.stdout, "done\n");
+        assert!(output.stderr.len() >= 300_000 || output.stderr.contains("[output truncated]"));
     }
 
     #[cfg(unix)]
@@ -539,7 +681,9 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             canceller.cancel();
         });
-        let output = run_shell(&ws, &command, &registry, &cancel).await.unwrap();
+        let output = run_shell(&ws, &command, &registry, &cancel, &[])
+            .await
+            .unwrap();
         assert!(output.cancelled);
         assert!(registry.tracked().is_empty());
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;

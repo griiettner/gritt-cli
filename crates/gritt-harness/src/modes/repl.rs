@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use gritt_core::session::{Phase, SessionStore};
 use gritt_core::Result;
 
-use crate::agent::{AgentBuilder, CancelHandle, NativeAgent, SessionSelector, TurnStatus};
+use crate::agent::{AgentBuilder, CancelHandle, NativeAgent, SessionSelector, TurnStatus, Ui};
 use crate::modes::print::{PrintUi, PrintUiOptions};
 
 /// Where the binary's Ctrl-C handler finds the running turn, if any.
@@ -159,8 +159,11 @@ pub async fn run_repl<I: BufRead, O: Write + Send, E: Write + Send>(
                     }
                     Err(error) => {
                         ui.finish();
-                        let (_, err) = ui.parts_mut();
-                        let _ = writeln!(err, "error: {error}");
+                        // A failed turn already showed its error event;
+                        // only an output failure has nothing on screen yet.
+                        if ui.output_error().is_some() {
+                            return Err(error);
+                        }
                     }
                 }
             }

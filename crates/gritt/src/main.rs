@@ -154,9 +154,9 @@ async fn builder(
     let config = config::load(workspace, std::env::vars())?;
     let store = open_store(workspace, database).await?;
     let telemetry = Arc::new(Telemetry::new(Arc::clone(&store), config.logging.clone()));
-    if telemetry.content_logging() {
-        telemetry.purge_content(chrono::Utc::now()).await?;
-    }
+    // Retention applies whether or not logging is still on: turning it off
+    // must not preserve old content past the window.
+    telemetry.purge_content(chrono::Utc::now()).await?;
     let approval = if args.approve_all {
         ApprovalMode::ApproveAll
     } else if args.deny_all {
@@ -384,6 +384,10 @@ async fn session_command(
     command: SessionCommand,
 ) -> Result<ExitCode> {
     let store = open_store(workspace, database).await?;
+    let config = config::load(workspace, std::env::vars())?;
+    Telemetry::new(Arc::clone(&store), config.logging.clone())
+        .purge_content(chrono::Utc::now())
+        .await?;
     match command {
         SessionCommand::List => {
             for session in store.list().await? {

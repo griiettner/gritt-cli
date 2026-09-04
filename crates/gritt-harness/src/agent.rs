@@ -18,10 +18,11 @@ use gritt_core::event::{
 };
 use gritt_core::policy::PolicyOutcome;
 use gritt_core::provider::{Message, PromptRequest, RequestOptions, Role};
+use gritt_core::secret::Secret;
 use gritt_core::session::{BoxFuture, Phase, Session, SessionId, SessionKind, SessionStore};
 use gritt_core::tool::{ToolCall, ToolResult};
 use gritt_core::{Error, ErrorKind, Result};
-use gritt_provider::adapter::{CapabilitySource, KeyProvider};
+use gritt_provider::adapter::{redact_text, redact_value, CapabilitySource, KeyProvider};
 use gritt_provider::alias;
 use gritt_provider::models::{load_models, ModelCache, ModelCatalog};
 use gritt_provider::transport::HttpTransport;
@@ -49,12 +50,19 @@ pub trait Ui: Send {
     /// Every persisted event, in order.
     fn event(&mut self, event: &Event);
     /// Answer an `ask` outcome. `preview` is the unified diff for a write.
+    /// The loop races this against cancellation, so the future must not
+    /// block the thread.
     fn approve<'a>(
         &'a mut self,
         request: &'a ApprovalRequest,
         decision: &'a Decision,
         preview: Option<&'a str>,
     ) -> BoxFuture<'a, ApprovalDecision>;
+    /// The first output failure, when the interface can no longer deliver
+    /// events (a closed pipe, for example). The loop stops the turn on it.
+    fn output_error(&self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +112,61 @@ pub struct NativeAgent {
     approval: ApprovalMode,
     next_sequence: u64,
     started: bool,
+    /// The phase the model was last told about, so a phase change sends a
+    /// transition note on the next turn.
+    sent_phase: Option<Phase>,
+    /// Active credentials, redacted out of every event, tool result, and
+    /// content-log row the harness produces.
+    secrets: Vec<Secret>,
     labels: BTreeMap<String, String>,
+}
+
+/// Redacts every registered secret out of an event's text, arguments,
+/// results, approval fields, error message, and diagnostic.
+fn redact_event(mut event: Event, secrets: &[Secret]) -> Event {
+    if secrets.is_empty() {
+        return event;
+    }
+    match &mut event.kind {
+        EventKind::TextDelta { text } | EventKind::ReasoningSummary { text } => {
+            *text = redact_text(text, secrets);
+        }
+        EventKind::ToolCall { call } => {
+            call.arguments = redact_value(call.arguments.take(), secrets);
+        }
+        EventKind::ToolResult { result } => {
+            result.output = redact_text(&result.output, secrets);
+        }
+        EventKind::ApprovalRequested { request } => {
+            request.resource = redact_text(&request.resource, secrets);
+            request.reason = redact_text(&request.reason, secrets);
+        }
+        EventKind::Error { message, .. } => {
+            *message = redact_text(message, secrets);
+        }
+        EventKind::ApprovalDecided { .. }
+        | EventKind::Usage { .. }
+        | EventKind::StatusChanged { .. }
+        | EventKind::Completed { .. }
+        | EventKind::Cancelled => {}
+    }
+    if let Some(diagnostic) = event.diagnostic.take() {
+        event.diagnostic = Some(redact_value(diagnostic, secrets));
+    }
+    event
+}
+
+/// The note prepended to the first user message after a phase change.
+pub fn phase_transition_note(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Planning => {
+            "[Phase changed to planning. No tools are available now; discuss the task and propose a plan.]"
+        }
+        Phase::Coding => {
+            "[Phase changed to coding. The tools file_read, file_write, and shell are now available. \
+             Paths are relative to the workspace root and the user approves writes and commands.]"
+        }
+    }
 }
 
 impl NativeAgent {
@@ -187,8 +249,17 @@ impl NativeAgent {
         event
     }
 
+    /// Redacts, shows, and persists one event. An interface that can no
+    /// longer deliver output ends the turn: the request is cancelled and
+    /// every child process stopped before the error is returned.
     async fn emit(&mut self, ui: &mut dyn Ui, event: Event) -> Result<()> {
+        let event = redact_event(event, &self.secrets);
         ui.event(&event);
+        if let Some(message) = ui.output_error() {
+            self.cancel.cancel();
+            self.tools.registry().kill_all().await;
+            return Err(Error::config(format!("output failed: {message}")));
+        }
         self.store.append_events(vec![event]).await
     }
 
@@ -214,15 +285,25 @@ impl NativeAgent {
             SessionKind::Connector { .. } => String::new(),
         };
         let mut messages = Vec::new();
+        let mut content = prompt.to_owned();
         if !self.started {
             messages.push(Message {
                 role: Role::System,
                 content: self.system_prompt(),
             });
+        } else if self.sent_phase != Some(self.session.phase) {
+            // The system prompt went out under the old phase; tell the
+            // model what changed rather than leaving it believing tools
+            // are absent (or present).
+            content = format!(
+                "{}\n\n{}",
+                phase_transition_note(self.session.phase),
+                prompt
+            );
         }
         messages.push(Message {
             role: Role::User,
-            content: prompt.to_owned(),
+            content,
         });
         PromptRequest {
             model,
@@ -240,7 +321,7 @@ impl NativeAgent {
         let started_at = Utc::now();
         self.cancel.reset();
         self.telemetry
-            .content(&self.session.id, "user", prompt)
+            .content(&self.session.id, "user", prompt, &self.secrets)
             .await?;
         let request = self.request(prompt);
         let adapter = Arc::clone(&self.adapter);
@@ -265,6 +346,7 @@ impl NativeAgent {
             }
         };
         self.started = true;
+        self.sent_phase = Some(self.session.phase);
         loop {
             let mut pending_calls: Vec<ToolCall> = Vec::new();
             let mut wants_tools = false;
@@ -352,7 +434,7 @@ impl NativeAgent {
         }
         if !outcome.text.is_empty() {
             self.telemetry
-                .content(&self.session.id, "assistant", &outcome.text)
+                .content(&self.session.id, "assistant", &outcome.text, &self.secrets)
                 .await?;
         }
         let final_status = match outcome.status {
@@ -421,6 +503,30 @@ impl NativeAgent {
             .await
     }
 
+    /// Records a call that never ran: a bad argument, a path outside the
+    /// workspace, or a preview that could not be built.
+    async fn refuse_call(
+        &mut self,
+        ui: &mut dyn Ui,
+        call: &ToolCall,
+        message: String,
+    ) -> Result<ToolResult> {
+        let result = ToolResult {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            is_error: true,
+            output: redact_text(&message, &self.secrets),
+        };
+        let event = self.harness_event(
+            EventKind::ToolResult {
+                result: result.clone(),
+            },
+            None,
+        );
+        self.emit(ui, event).await?;
+        Ok(result)
+    }
+
     /// Policy, approval, execution, and the events for one call.
     async fn handle_call(&mut self, ui: &mut dyn Ui, call: &ToolCall) -> Result<ToolResult> {
         let resource = match self.tools.resource_for(call) {
@@ -428,20 +534,7 @@ impl NativeAgent {
             Err(error) => {
                 // A bad argument or a path outside the workspace never
                 // reaches the policy; the refusal is still recorded.
-                let result = ToolResult {
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    is_error: true,
-                    output: error.message,
-                };
-                let event = self.harness_event(
-                    EventKind::ToolResult {
-                        result: result.clone(),
-                    },
-                    None,
-                );
-                self.emit(ui, event).await?;
-                return Ok(result);
+                return self.refuse_call(ui, call, error.message).await;
             }
         };
         let decision = self.policy.evaluate(&call.name, &resource);
@@ -485,8 +578,23 @@ impl NativeAgent {
                     ApprovalMode::ApproveAll => ApprovalDecision::Approved,
                     ApprovalMode::DenyAll => ApprovalDecision::Denied,
                     ApprovalMode::Ask => {
-                        let preview = self.tools.preview(call).ok().flatten();
-                        ui.approve(&request, &decision, preview.as_deref()).await
+                        // A preview that cannot be built (unreadable or
+                        // non-UTF-8 target) refuses the call rather than
+                        // showing a misleading new-file diff.
+                        let preview = match self.tools.preview(call) {
+                            Ok(preview) => preview,
+                            Err(error) => {
+                                return self.refuse_call(ui, call, error.message).await;
+                            }
+                        };
+                        // The wait races cancellation so Ctrl-C or Esc
+                        // during a pending approval ends the turn.
+                        let cancel = self.cancel.clone();
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => ApprovalDecision::Denied,
+                            answer = ui.approve(&request, &decision, preview.as_deref()) => answer,
+                        }
                     }
                 };
                 let event = self.harness_event(
@@ -508,7 +616,11 @@ impl NativeAgent {
                 Some(serde_json::json!({ "tool": call.name })),
             );
             self.emit(ui, event).await?;
-            self.tools.execute(call, &self.cancel).await
+            let mut result = self.tools.execute(call, &self.cancel).await;
+            // Redacted before it reaches the model, the store, or the
+            // interface; the emitter above only covers adapter events.
+            result.output = redact_text(&result.output, &self.secrets);
+            result
         } else {
             ToolResult {
                 call_id: call.id.clone(),
@@ -631,8 +743,26 @@ impl AgentBuilder {
             SessionSelector::Named(name) => self.store.find_by_name(name).await?,
             SessionSelector::Id(id) => self.store.get(id).await?,
         };
+        let mut previous_phase = None;
         let session = match existing {
             Some(mut session) => {
+                // Policy and tools use the current workspace, so a session
+                // recorded elsewhere must not silently run here.
+                let recorded = session
+                    .workspace
+                    .canonicalize()
+                    .unwrap_or_else(|_| session.workspace.clone());
+                if recorded != self.workspace.root() {
+                    return Err(Error::config(format!(
+                        "session `{}` belongs to workspace {} but the current workspace is {}; \
+                         run with --workspace {} to resume it",
+                        session.name,
+                        session.workspace.display(),
+                        self.workspace.root().display(),
+                        session.workspace.display()
+                    )));
+                }
+                previous_phase = Some(session.phase);
                 if let Some(phase) = phase {
                     if session.phase != phase {
                         self.store.set_phase(&session.id, phase).await?;
@@ -667,10 +797,23 @@ impl AgentBuilder {
                 session
             }
         };
-        self.agent_for(session).await
+        self.agent_for_with(session, previous_phase).await
     }
 
+    /// Builds the agent for a stored session. The model is assumed to have
+    /// been told about the session's current phase.
     pub async fn agent_for(&self, session: Session) -> Result<NativeAgent> {
+        let phase = session.phase;
+        self.agent_for_with(session, Some(phase)).await
+    }
+
+    /// `told_phase` is the phase the model last heard about; a resumed
+    /// session whose phase was just switched sends a transition note.
+    async fn agent_for_with(
+        &self,
+        session: Session,
+        told_phase: Option<Phase>,
+    ) -> Result<NativeAgent> {
         let SessionKind::Native {
             provider_profile,
             model,
@@ -688,6 +831,14 @@ impl AgentBuilder {
             .ok_or_else(|| Error::config(format!("unknown profile `{provider_profile}`")))?;
         let cancel = CancellationToken::new();
         let capabilities: Arc<dyn CapabilitySource> = self.catalog.clone();
+        // The active key is the one secret the harness can know about; a
+        // missing key is reported by the adapter on the first request.
+        let secrets: Vec<Secret> = self
+            .keys
+            .key(provider_profile, &profile.key)
+            .ok()
+            .into_iter()
+            .collect();
         let adapter = adapter_for(AdapterContext {
             profile,
             session_id: session.id.clone(),
@@ -703,7 +854,15 @@ impl AgentBuilder {
         }
         let next_sequence = self.store.next_sequence(&session.id).await?;
         let policy = PolicyEngine::new(self.config.policy.clone(), self.workspace.root());
-        let tools = NativeTools::new(self.workspace.clone(), ProcessRegistry::new());
+        let blocked_env: Vec<String> = self
+            .config
+            .profiles
+            .values()
+            .map(|profile| profile.key.env_var_name.clone())
+            .collect();
+        let tools = NativeTools::new(self.workspace.clone(), ProcessRegistry::new())
+            .with_blocked_env(blocked_env);
+        let sent_phase = if started { told_phase } else { None };
         let labels = BTreeMap::from([
             ("profile".to_string(), provider_profile.clone()),
             ("model".to_string(), model.clone()),
@@ -719,6 +878,8 @@ impl AgentBuilder {
             approval: self.approval,
             next_sequence,
             started,
+            sent_phase,
+            secrets,
             labels,
         })
     }

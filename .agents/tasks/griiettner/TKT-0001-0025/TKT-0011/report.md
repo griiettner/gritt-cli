@@ -94,6 +94,33 @@ it is not. Ctrl-C cancels a running turn and exits when nothing runs.
   covers every outcome the harness skill lists.
 - The system prompt is sent once per session. A resumed session restores
   the adapter's continuation state and sends only the new user message.
+  When the phase changes after that, the next user message is prefixed
+  with a phase transition note naming the tools that are now available or
+  withdrawn, so the retained system instruction cannot mislead the model.
+- Recorded exception, shell confinement: ADR-009 runs shell under approval
+  and bounds only the file tools to the workspace. No operating-system
+  sandbox is built. Instead the shell child runs in the workspace root,
+  the approval prompt states that the command runs with the user's
+  authority and may reach outside the workspace, and a command that names
+  an absolute path outside the workspace, a drive path, or a `..`
+  component gets the stronger prompt. TKT-0013 documents this boundary
+  in the tool and privacy docs.
+- Shell children never inherit credentials. Every configured profile key
+  variable, `AGENT_MEMORY_API_KEY`, and any variable ending in `_API_KEY`,
+  `_TOKEN`, or `_SECRET` is removed from the child environment.
+- Session events keep tool arguments and outputs because resume and the
+  transcript need them, but every event, tool result, approval resource,
+  and content-log row is redacted against the active key before it is
+  shown, stored, or sent back to the provider. Approval events record the
+  tool, the resource, the reason, and the decision; the diff preview is
+  shown and never stored.
+- A session resumes only in the workspace it was recorded in. Canonical
+  paths are compared and a mismatch names both paths and the
+  `--workspace` flag that resolves it.
+- Approval waits are raced against cancellation in every mode. Print and
+  REPL read the answer on a blocking thread so Ctrl-C can end the turn;
+  the full-screen mode drops the approval view on Esc. A cancel during a
+  pending approval denies the tool and ends the turn as cancelled.
 - Tool calls whose arguments fail to resolve, including paths outside the
   workspace, never reach the policy; the refusal is still recorded as an
   error tool result and returned to the model.
@@ -120,7 +147,8 @@ it is not. Ctrl-C cancels a running turn and exits when nothing runs.
   group kill on Unix runs `kill -KILL -- -<pid>` followed by a direct kill.
 - The destructive command list is a heuristic for the stronger prompt
   only; it never changes an outcome.
-- Content logging retention purges on open, not on a timer.
+- Content logging retention purges whenever the database opens, whether
+  or not content logging is currently enabled, not on a timer.
 - Live provider calls were not exercised because no key exists on this
   machine; every session test replays the TKT-0010 chat fixtures.
 
@@ -134,7 +162,17 @@ it is not. Ctrl-C cancels a running turn and exits when nothing runs.
 - Clippy rejected a large variant size difference in the TUI message
   enum; the returned agent is boxed.
 - Print mode showed a failed turn's error twice, once from the interface
-  and once from `main`. The binary now relies on the interface's event.
+  and once from `main`. The binary now relies on the interface's event,
+  and the REPL does the same.
+- A child that filled stderr before closing stdout deadlocked the
+  sequential pipe drain. Both pipes now drain concurrently; a test floods
+  stderr with 300 KB first.
+- A write preview treated every read error as an empty file, so an
+  unreadable or non-UTF-8 target showed a misleading new-file diff. Only
+  `NotFound` means a new file now; other errors refuse the call.
+- Print mode ignored write and flush failures, so a closed pipe let the
+  turn keep consuming tokens and running tools. The first output error
+  now cancels the request, kills child processes, and fails the turn.
 
 ## Validation
 
@@ -142,8 +180,10 @@ All run from the worktree root on 2026-09-04:
 
 - `cargo fmt --all --check`: pass.
 - `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test -p gritt-harness`: pass, 39 tests (30 unit, 9 integration).
-- `cargo test --workspace`: pass, 114 tests.
+- `cargo test -p gritt-harness`: pass, 52 tests (36 unit, 16 integration)
+  after the review fix round; 39 before it.
+- `cargo test --workspace`: pass, 127 tests after the fix round; 114
+  before it.
 - `cargo build --release`: pass, 1m 40s cold.
 - Manual terminal pass with `target/release/gritt` in a scratch workspace
   with a profile whose key is absent: `config` reports the profile with
@@ -152,7 +192,10 @@ All run from the worktree root on 2026-09-04:
   `session show` work and refuse an unknown name; `repl` over piped input
   handles `/help`, `/code`, `/sessions`, `/history`, an unknown command,
   and `/quit`; `tui` without a terminal exits 1 with a clean message
-  instead of a panic. Resize, keyboard-only navigation, and the approval
+  instead of a panic. The scripted REPL integration test
+  `repl_runs_a_scripted_session_end_to_end` drives `run_repl` through a
+  planning turn, `/code`, an approved write, a cancelled shell command,
+  `/sessions`, `/resume`, `/history`, and `/quit` against fixtures. Resize, keyboard-only navigation, and the approval
   and diff views could not be exercised without an interactive terminal;
   the state reducer and renderer are covered by unit tests through
   ratatui's `TestBackend`, and the manual TTY pass is a follow-up for
@@ -173,7 +216,8 @@ crossterm 0.29.0 (MIT), diffy 0.5.2 (MIT OR Apache-2.0), uuid 1.26.0
 ## Completion Gate
 
 - Acceptance: yes. Print and REPL sessions plan, approve, execute, cancel,
-  and resume against fixtures. Full-screen mode renders the transcript,
+  and resume against fixtures, including a fixture-backed REPL run and a
+  cancel during a pending approval. Full-screen mode renders the transcript,
   approvals, tool activity, status, multiline input, and diff review on
   Ratatui 0.30.2 and Crossterm 0.29. File and shell tools cannot escape
   the workspace and every execution passes the policy first. Telemetry
@@ -182,13 +226,16 @@ crossterm 0.29.0 (MIT), diffy 0.5.2 (MIT OR Apache-2.0), uuid 1.26.0
   cloud code was added. The one core change is an additive default rule.
 - Validation: yes for the automated set and the non-interactive manual
   pass. Interactive TTY behavior is not verified here.
-- Security and safety: workspace boundary enforced before policy, policy
-  before execution, child processes tracked and killed on cancel, no key
-  or prompt content in telemetry, content logging off by default.
+- Security and safety: file tools bounded before policy, policy before
+  execution, shell children stripped of credential variables, every
+  event and tool result and content-log row key-redacted, child processes
+  tracked and killed on cancel, no key or prompt content in telemetry,
+  content logging off by default with unconditional retention purge.
+  Shell commands are not sandboxed; see the recorded exception above.
 - Regression risk: low. TKT-0009 and TKT-0010 tests still pass; the core
   default rule change adds a `network` entry before the catch-all.
-- Follow-up: interactive TTY pass, Windows process kill path, and REPL
-  line editing.
+- Follow-up: interactive TTY pass, Windows process kill path, REPL line
+  editing, and TKT-0013 documentation of the shell authority boundary.
 - Assumptions: recorded above.
 
 ## Follow-up
@@ -198,6 +245,27 @@ crossterm 0.29.0 (MIT), diffy 0.5.2 (MIT OR Apache-2.0), uuid 1.26.0
 - The Windows shell path (`cmd /C` plus `taskkill /T`) is untested here.
 - The REPL reads plain lines; arrow-key history editing would need a line
   editor crate.
+- TKT-0013 must document in the tool and privacy docs that shell commands
+  run with the user's authority and are not confined to the workspace,
+  and that the stronger prompt is the only guard for paths outside it.
+- After a cancel during a print or REPL approval, the blocking stdin read
+  that was waiting for the answer lingers until the next line arrives, so
+  the next typed line may be consumed as that stale answer.
+
+## Updates
+
+- 2026-09-04 review fix round. The chain reviewer returned twelve
+  findings. Resolved: shell approval wording and outside-workspace
+  stronger prompt with the recorded exception; credential variables
+  stripped from shell children and every tool result redacted; session
+  events redacted before persistence; phase transition note after
+  `/plan` and `/code`; workspace check on resume; cancellation-aware
+  approval waits in all modes; concurrent stdout and stderr draining;
+  redacted content-log rows; unconditional retention purge; preview read
+  errors propagated; print output failures stop the turn; and a scripted
+  REPL integration test. The earlier claims that content is purged only
+  while logging is on and that the REPL had fixture coverage were
+  corrected above.
 - TKT-0012 can implement `Ui` for connector sessions and reuse the store,
   telemetry, and modes without changes to the native loop.
 
