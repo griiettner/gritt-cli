@@ -24,4 +24,6 @@ turso = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# Test-only: the fake external agent drives the control plane.
+gritt-connector = { workspace = true }
 tempfile = { workspace = true }

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::event::{ApprovalDecision, ApprovalId};
 use crate::provider::EventStream;
-use crate::session::{BoxFuture, SessionId};
+use crate::session::{BoxFuture, ContinuationState, SessionId};
 use crate::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -112,6 +112,11 @@ pub struct TaskRequest {
     pub session_id: SessionId,
     pub prompt: String,
     pub workspace: PathBuf,
+    /// State a previous turn left behind the session interface, so a
+    /// connector can pick its external thread back up after a restart.
+    /// Opaque to everything above the connector that wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<ContinuationState>,
 }
 
 pub trait Connector: Send + Sync {

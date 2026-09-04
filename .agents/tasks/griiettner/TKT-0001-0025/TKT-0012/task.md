@@ -3,7 +3,7 @@ id: TKT-0012
 namespace: griiettner
 title: Implement supervised native and external connectors with PTY fallback, live Codex and Claude Code tests, and normalized events
 artifact: task
-status: planning
+status: done
 owner: griiettner
 created: 2026-09-04
 updated: 2026-09-04

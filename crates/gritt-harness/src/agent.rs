@@ -90,6 +90,10 @@ pub struct CancelHandle {
 }
 
 impl CancelHandle {
+    pub fn new(token: CancellationToken, registry: Arc<ProcessRegistry>) -> Self {
+        Self { token, registry }
+    }
+
     pub fn cancel(&self) {
         self.token.cancel();
         let registry = Arc::clone(&self.registry);
@@ -772,6 +776,56 @@ impl AgentBuilder {
         Ok((resolved.profile, resolved.model))
     }
 
+    /// Finds the session a selector names, checking that it belongs to
+    /// the current workspace and applying a requested phase. `None` when
+    /// the selector names nothing yet.
+    pub async fn find_session(
+        &self,
+        selector: &SessionSelector,
+        phase: Option<Phase>,
+    ) -> Result<Option<Session>> {
+        let existing = match selector {
+            SessionSelector::New { .. } => None,
+            SessionSelector::Named(name) => self.store.find_by_name(name).await?,
+            SessionSelector::Id(id) => self.store.get(id).await?,
+        };
+        let Some(mut session) = existing else {
+            return Ok(None);
+        };
+        // Policy and tools use the current workspace, so a session
+        // recorded elsewhere must not silently run here.
+        let recorded = session
+            .workspace
+            .canonicalize()
+            .unwrap_or_else(|_| session.workspace.clone());
+        if recorded != self.workspace.root() {
+            return Err(Error::config(format!(
+                "session `{}` belongs to workspace {} but the current workspace is {}; \
+                 run with --workspace {} to resume it",
+                session.name,
+                session.workspace.display(),
+                self.workspace.root().display(),
+                session.workspace.display()
+            )));
+        }
+        if let Some(phase) = phase {
+            if session.phase != phase {
+                self.store.set_phase(&session.id, phase).await?;
+                session.phase = phase;
+            }
+        }
+        Ok(Some(session))
+    }
+
+    /// The name a selector gives a new session.
+    pub fn session_name(selector: &SessionSelector, id: &SessionId) -> String {
+        match selector {
+            SessionSelector::Named(name) => name.clone(),
+            SessionSelector::New { name: Some(name) } => name.clone(),
+            _ => format!("session-{}", &id.0[..8]),
+        }
+    }
+
     /// Opens or creates the session and builds its agent.
     pub async fn open(
         &self,
@@ -780,46 +834,13 @@ impl AgentBuilder {
         model: Option<&str>,
         phase: Option<Phase>,
     ) -> Result<NativeAgent> {
-        let existing = match &selector {
-            SessionSelector::New { .. } => None,
-            SessionSelector::Named(name) => self.store.find_by_name(name).await?,
-            SessionSelector::Id(id) => self.store.get(id).await?,
-        };
-        let session = match existing {
-            Some(mut session) => {
-                // Policy and tools use the current workspace, so a session
-                // recorded elsewhere must not silently run here.
-                let recorded = session
-                    .workspace
-                    .canonicalize()
-                    .unwrap_or_else(|_| session.workspace.clone());
-                if recorded != self.workspace.root() {
-                    return Err(Error::config(format!(
-                        "session `{}` belongs to workspace {} but the current workspace is {}; \
-                         run with --workspace {} to resume it",
-                        session.name,
-                        session.workspace.display(),
-                        self.workspace.root().display(),
-                        session.workspace.display()
-                    )));
-                }
-                if let Some(phase) = phase {
-                    if session.phase != phase {
-                        self.store.set_phase(&session.id, phase).await?;
-                        session.phase = phase;
-                    }
-                }
-                session
-            }
+        let session = match self.find_session(&selector, phase).await? {
+            Some(session) => session,
             None => {
                 let (profile_name, model_id) = self.resolve_model(model, profile)?;
                 let now = Utc::now();
                 let id = SessionId(uuid::Uuid::new_v4().to_string());
-                let name = match &selector {
-                    SessionSelector::Named(name) => name.clone(),
-                    SessionSelector::New { name: Some(name) } => name.clone(),
-                    _ => format!("session-{}", &id.0[..8]),
-                };
+                let name = Self::session_name(&selector, &id);
                 let session = Session {
                     id,
                     name,
@@ -922,6 +943,10 @@ impl AgentBuilder {
     /// Reads the workspace root back for callers that need it.
     pub fn workspace_root(&self) -> &Path {
         self.workspace.root()
+    }
+
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
     }
 }
 

@@ -53,6 +53,14 @@ pub struct ConnectorSettings {
     pub executables: BTreeMap<String, String>,
     pub health_check_timeout_secs: Option<u64>,
     pub task_timeout_secs: Option<u64>,
+    /// Connector names launched through a PTY instead of pipes. The
+    /// machine-readable interface stays the default (ADR-010).
+    #[serde(default)]
+    pub pty: Vec<String>,
+    /// Extra command-line arguments per connector, passed through verbatim
+    /// so the user can select the external agent's own permission mode.
+    #[serde(default)]
+    pub extra_args: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

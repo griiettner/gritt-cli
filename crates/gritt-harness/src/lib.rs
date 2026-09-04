@@ -6,7 +6,11 @@
 //! mode uses Ratatui 0.30 with its Crossterm 0.29 backend.
 
 pub mod agent;
+pub mod connector_session;
+pub mod control;
+pub mod driver;
 pub mod modes;
+pub mod native_connector;
 pub mod policy;
 pub mod store;
 pub mod telemetry;

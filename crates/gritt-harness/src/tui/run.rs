@@ -14,7 +14,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::app::{Action, App, PendingApproval, StatusBar};
 use super::render::draw;
-use crate::agent::{AgentBuilder, CancelHandle, NativeAgent, SessionSelector, TurnOutcome, Ui};
+use crate::agent::{CancelHandle, SessionSelector, TurnOutcome, Ui};
+use crate::control::ControlPlane;
+use crate::driver::Driver;
 use crate::policy::Decision;
 
 enum UiMsg {
@@ -24,7 +26,7 @@ enum UiMsg {
         responder: oneshot::Sender<ApprovalDecision>,
     },
     Finished {
-        agent: Box<NativeAgent>,
+        agent: Box<dyn Driver>,
         result: Result<TurnOutcome>,
     },
 }
@@ -77,19 +79,21 @@ fn spawn_key_reader(stop: Arc<AtomicBool>) -> mpsc::UnboundedReceiver<TerminalEv
     rx
 }
 
-fn status_for(agent: &NativeAgent) -> StatusBar {
+fn status_for(agent: &dyn Driver) -> StatusBar {
     let mut status = StatusBar::default();
     let mut app = App::new(StatusBar::default(), true);
     app.set_session(agent.session());
-    status.profile = app.status.profile;
-    status.model = app.status.model;
+    let info = agent.info();
+    status.profile = info.backend;
+    status.model = info.detail;
     status.session = app.status.session;
     status.phase = app.status.phase;
     status
 }
 
-/// Runs the full-screen mode until the user quits.
-pub async fn run_tui(builder: &AgentBuilder, agent: NativeAgent) -> Result<()> {
+/// Runs the full-screen mode until the user quits. Native and connector
+/// sessions share the loop, the approval view, and the transcript.
+pub async fn run_tui(plane: &ControlPlane, agent: Box<dyn Driver>) -> Result<()> {
     let color = std::env::var_os("NO_COLOR").is_none();
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -98,22 +102,22 @@ pub async fn run_tui(builder: &AgentBuilder, agent: NativeAgent) -> Result<()> {
     }));
     let mut terminal = ratatui::try_init()
         .map_err(|error| Error::config(format!("cannot start the full-screen mode: {error}")))?;
-    let result = event_loop(builder, agent, &mut terminal, color).await;
+    let result = event_loop(plane, agent, &mut terminal, color).await;
     ratatui::restore();
     let _ = std::panic::take_hook();
     result
 }
 
 async fn event_loop(
-    builder: &AgentBuilder,
-    agent: NativeAgent,
+    plane: &ControlPlane,
+    agent: Box<dyn Driver>,
     terminal: &mut ratatui::DefaultTerminal,
     color: bool,
 ) -> Result<()> {
-    let mut app = App::new(status_for(&agent), color);
-    let history = builder.store.read_events(&agent.session().id).await?;
+    let mut app = App::new(status_for(agent.as_ref()), color);
+    let history = plane.builder.store.read_events(&agent.session().id).await?;
     app.load_history(&history);
-    let mut idle_agent: Option<NativeAgent> = Some(agent);
+    let mut idle_agent: Option<Box<dyn Driver>> = Some(agent);
     let mut handle: Option<CancelHandle> = None;
     let mut responder: Option<oneshot::Sender<ApprovalDecision>> = None;
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
@@ -142,7 +146,7 @@ async fn event_loop(
                         if let Err(error) = result {
                             app.push(super::app::EntryKind::Error, error.message);
                         }
-                        idle_agent = Some(*agent);
+                        idle_agent = Some(agent);
                         Action::None
                     }
                 }
@@ -180,10 +184,7 @@ async fn event_loop(
                     tokio::spawn(async move {
                         let mut ui = ChannelUi { tx: tx.clone() };
                         let result = agent.run_turn(&prompt, &mut ui).await;
-                        let _ = tx.send(UiMsg::Finished {
-                            agent: Box::new(agent),
-                            result,
-                        });
+                        let _ = tx.send(UiMsg::Finished { agent, result });
                     });
                 } else {
                     app.running = false;
@@ -194,23 +195,29 @@ async fn event_loop(
                 if let Some(agent) = idle_agent.as_mut() {
                     agent.set_phase(phase).await?;
                     app.set_session(agent.session());
+                    let info = agent.info();
+                    app.status.profile = info.backend;
+                    app.status.model = info.detail;
                 } else {
                     app.notice = Some("finish the running turn first".into());
                 }
             }
             Action::RefreshSessions => {
-                app.sessions = builder.store.list().await.unwrap_or_default();
+                app.sessions = plane.builder.store.list().await.unwrap_or_default();
             }
             Action::Resume(id) => {
-                match builder
-                    .open(SessionSelector::Id(id), None, None, None)
+                match plane
+                    .open(SessionSelector::Id(id), None, None, None, None)
                     .await
                 {
                     Ok(agent) => {
                         app.entries.clear();
-                        let history = builder.store.read_events(&agent.session().id).await?;
+                        let history = plane.builder.store.read_events(&agent.session().id).await?;
                         app.load_history(&history);
                         app.set_session(agent.session());
+                        let info = agent.info();
+                        app.status.profile = info.backend;
+                        app.status.model = info.detail;
                         idle_agent = Some(agent);
                     }
                     Err(error) => app.push(super::app::EntryKind::Error, error.message),

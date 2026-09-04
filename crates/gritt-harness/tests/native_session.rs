@@ -13,6 +13,7 @@ use gritt_core::secret::{Secret, SecretRef};
 use gritt_core::session::{BoxFuture, Phase, SessionStore};
 use gritt_core::tool::native;
 use gritt_harness::agent::{AgentBuilder, ApprovalMode, SessionSelector, TurnStatus, Ui};
+use gritt_harness::control::ControlPlane;
 use gritt_harness::modes::print::{PrintUi, PrintUiOptions, SharedBuffer};
 use gritt_harness::policy::Decision;
 use gritt_harness::store::{DatabaseLocation, Store};
@@ -69,7 +70,7 @@ fn config(policy: Option<PolicyConfig>) -> Config {
 
 struct Fixture {
     _dir: tempfile::TempDir,
-    builder: AgentBuilder,
+    plane: ControlPlane,
     transport: Arc<FixtureTransport>,
 }
 
@@ -101,7 +102,7 @@ async fn fixture_builder(
     };
     Fixture {
         _dir: dir,
-        builder,
+        plane: ControlPlane::native(Arc::new(builder)),
         transport,
     }
 }
@@ -179,6 +180,7 @@ async fn planning_turn_streams_text_without_tools_and_keeps_telemetry_content_fr
     )
     .await;
     let mut agent = fx
+        .plane
         .builder
         .open(SessionSelector::Named("plan".into()), None, None, None)
         .await
@@ -201,6 +203,7 @@ async fn planning_turn_streams_text_without_tools_and_keeps_telemetry_content_fr
     assert_eq!(body["messages"][1]["content"], prompt);
 
     let stored = fx
+        .plane
         .builder
         .store
         .read_events(&agent.session().id)
@@ -211,13 +214,13 @@ async fn planning_turn_streams_text_without_tools_and_keeps_telemetry_content_fr
         assert!(pair[1].sequence > pair[0].sequence);
     }
     assert!(kinds(&stored).contains(&"completed"));
-    let telemetry_text = fx.builder.telemetry.dump_text().await.unwrap();
+    let telemetry_text = fx.plane.builder.telemetry.dump_text().await.unwrap();
     assert!(telemetry_text.contains("turn"));
     assert!(telemetry_text.contains("completed"));
     assert!(!telemetry_text.contains("zebra-quilt-9931"));
     assert!(!telemetry_text.contains("Hello, world"));
     assert!(!telemetry_text.contains(KEY));
-    assert_eq!(fx.builder.telemetry.content_rows().await.unwrap(), 0);
+    assert_eq!(fx.plane.builder.telemetry.content_rows().await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -232,6 +235,7 @@ async fn coding_turn_reads_a_file_under_the_allow_rule_and_continues() {
     )
     .await;
     let mut agent = fx
+        .plane
         .builder
         .open(
             SessionSelector::New { name: None },
@@ -288,6 +292,7 @@ async fn ask_approve_writes_the_file_after_showing_a_diff() {
     )
     .await;
     let mut agent = fx
+        .plane
         .builder
         .open(
             SessionSelector::New { name: None },
@@ -308,7 +313,8 @@ async fn ask_approve_writes_the_file_after_showing_a_diff() {
     assert_eq!(request.tool, native::FILE_WRITE);
     assert_eq!(decision.outcome, PolicyOutcome::Ask);
     assert!(preview.as_deref().unwrap().contains("+hello"));
-    let written = std::fs::read_to_string(fx.builder.workspace_root().join("notes.txt")).unwrap();
+    let written =
+        std::fs::read_to_string(fx.plane.builder.workspace_root().join("notes.txt")).unwrap();
     assert_eq!(written, "hello\n");
     let k = kinds(&ui.events);
     assert!(k.contains(&"approval_requested"));
@@ -332,6 +338,7 @@ async fn ask_deny_reports_the_refusal_to_the_model() {
     )
     .await;
     let mut agent = fx
+        .plane
         .builder
         .open(
             SessionSelector::New { name: None },
@@ -362,7 +369,7 @@ async fn ask_deny_reports_the_refusal_to_the_model() {
         .as_str()
         .unwrap()
         .contains("declined"));
-    assert!(!fx.builder.workspace_root().join("build").exists());
+    assert!(!fx.plane.builder.workspace_root().join("build").exists());
 }
 
 #[tokio::test]
@@ -392,6 +399,7 @@ async fn deny_all_mode_and_policy_deny_never_ask() {
     )
     .await;
     let mut agent = fx
+        .plane
         .builder
         .open(
             SessionSelector::New { name: None },
@@ -436,6 +444,7 @@ async fn approve_all_runs_shell_and_workspace_escapes_are_rejected() {
     )
     .await;
     let mut agent = fx
+        .plane
         .builder
         .open(
             SessionSelector::New { name: None },
@@ -471,6 +480,7 @@ async fn cancellation_stops_the_stream_and_the_child_process() {
     )
     .await;
     let mut agent = fx
+        .plane
         .builder
         .open(
             SessionSelector::New { name: None },
@@ -506,7 +516,7 @@ async fn cancellation_stops_the_stream_and_the_child_process() {
             .any(|line| line.contains(&marker) && !line.contains("ps ")),
         "child survived cancellation"
     );
-    let telemetry_text = fx.builder.telemetry.dump_text().await.unwrap();
+    let telemetry_text = fx.plane.builder.telemetry.dump_text().await.unwrap();
     assert!(telemetry_text.contains("cancelled"));
 }
 
@@ -522,6 +532,7 @@ async fn resume_restores_continuation_and_skips_the_system_prompt() {
     )
     .await;
     let mut first = fx
+        .plane
         .builder
         .open(SessionSelector::Named("work".into()), None, None, None)
         .await
@@ -533,6 +544,7 @@ async fn resume_restores_continuation_and_skips_the_system_prompt() {
     drop(first);
 
     let mut resumed = fx
+        .plane
         .builder
         .open(
             SessionSelector::Named("work".into()),
@@ -559,11 +571,11 @@ async fn resume_restores_continuation_and_skips_the_system_prompt() {
     let second_content = messages[3]["content"].as_str().unwrap();
     assert!(second_content.starts_with("[Phase changed to coding."));
     assert!(second_content.ends_with("\n\nsecond"));
-    let stored = fx.builder.store.read_events(&id).await.unwrap();
+    let stored = fx.plane.builder.store.read_events(&id).await.unwrap();
     assert!(stored.len() > events_after_first);
     assert_eq!(stored.first().unwrap().sequence, 0);
     assert_eq!(stored.last().unwrap().sequence as usize, stored.len() - 1);
-    let sessions = fx.builder.store.list().await.unwrap();
+    let sessions = fx.plane.builder.store.list().await.unwrap();
     assert_eq!(sessions.len(), 1);
 }
 
@@ -579,6 +591,7 @@ async fn print_mode_writes_text_to_stdout_and_activity_to_stderr() {
     )
     .await;
     let mut agent = fx
+        .plane
         .builder
         .open(
             SessionSelector::New { name: None },
@@ -658,11 +671,12 @@ async fn shell_children_cannot_leak_credentials_and_results_are_redacted() {
     )
     .await;
     std::fs::write(
-        fx.builder.workspace_root().join("creds.txt"),
+        fx.plane.builder.workspace_root().join("creds.txt"),
         format!("token={KEY}\n"),
     )
     .unwrap();
     let mut agent = fx
+        .plane
         .builder
         .open(
             SessionSelector::New { name: None },
@@ -684,6 +698,7 @@ async fn shell_children_cannot_leak_credentials_and_results_are_redacted() {
     assert_eq!(results[1].2, "[redacted]");
     assert_eq!(results[2].2, "token=[redacted]\n");
     let stored = fx
+        .plane
         .builder
         .store
         .read_events(&agent.session().id)
@@ -721,6 +736,7 @@ async fn approval_requests_with_a_key_in_the_command_are_redacted() {
     )
     .await;
     let mut agent = fx
+        .plane
         .builder
         .open(
             SessionSelector::New { name: None },
@@ -736,6 +752,7 @@ async fn approval_requests_with_a_key_in_the_command_are_redacted() {
     };
     agent.run_turn("call it", &mut ui).await.unwrap();
     let stored = fx
+        .plane
         .builder
         .store
         .read_events(&agent.session().id)
@@ -759,6 +776,7 @@ async fn approval_requests_with_a_key_in_the_command_are_redacted() {
     // The adapter's continuation state holds the model's tool call with
     // the key in its arguments; it is stored redacted too.
     let continuation = fx
+        .plane
         .builder
         .store
         .load_continuation(&agent.session().id)
@@ -785,11 +803,12 @@ async fn diff_previews_and_stored_approvals_never_carry_the_key() {
     )
     .await;
     std::fs::write(
-        fx.builder.workspace_root().join("creds.txt"),
+        fx.plane.builder.workspace_root().join("creds.txt"),
         format!("token={KEY}\n"),
     )
     .unwrap();
     let mut agent = fx
+        .plane
         .builder
         .open(
             SessionSelector::New { name: None },
@@ -813,6 +832,7 @@ async fn diff_previews_and_stored_approvals_never_carry_the_key() {
     assert!(!decision.reason.is_empty());
     assert!(!request.reason.is_empty());
     let stored = fx
+        .plane
         .builder
         .store
         .read_events(&agent.session().id)
@@ -848,11 +868,12 @@ async fn a_preview_that_cannot_be_built_leaves_no_approval_request_behind() {
     )
     .await;
     std::fs::write(
-        fx.builder.workspace_root().join("bin.dat"),
+        fx.plane.builder.workspace_root().join("bin.dat"),
         [0xff, 0xfe, 0x00, 0x80],
     )
     .unwrap();
     let mut agent = fx
+        .plane
         .builder
         .open(
             SessionSelector::New { name: None },
@@ -874,6 +895,7 @@ async fn a_preview_that_cannot_be_built_leaves_no_approval_request_behind() {
     assert!(results[0].1);
     assert!(results[0].2.contains("cannot preview"), "{}", results[0].2);
     let stored = fx
+        .plane
         .builder
         .store
         .read_events(&agent.session().id)
@@ -883,7 +905,7 @@ async fn a_preview_that_cannot_be_built_leaves_no_approval_request_behind() {
     assert!(!k.contains(&"approval_requested"), "{k:?}");
     assert!(!k.contains(&"approval_decided"));
     assert_eq!(
-        std::fs::read(fx.builder.workspace_root().join("bin.dat")).unwrap(),
+        std::fs::read(fx.plane.builder.workspace_root().join("bin.dat")).unwrap(),
         [0xff, 0xfe, 0x00, 0x80]
     );
 }
@@ -902,6 +924,7 @@ async fn a_phase_change_sends_a_transition_note_on_the_next_turn() {
     )
     .await;
     let mut agent = fx
+        .plane
         .builder
         .open(SessionSelector::Named("phased".into()), None, None, None)
         .await
@@ -930,6 +953,7 @@ async fn a_phase_change_sends_a_transition_note_on_the_next_turn() {
     // A resumed session switched to planning gets the planning note.
     drop(agent);
     let mut resumed = fx
+        .plane
         .builder
         .open(
             SessionSelector::Named("phased".into()),
@@ -962,6 +986,7 @@ async fn a_phase_change_survives_exit_before_the_next_turn() {
     )
     .await;
     let mut agent = fx
+        .plane
         .builder
         .open(SessionSelector::Named("later".into()), None, None, None)
         .await
@@ -973,11 +998,12 @@ async fn a_phase_change_survives_exit_before_the_next_turn() {
     let id = agent.session().id.clone();
     drop(agent);
     assert_eq!(
-        fx.builder.store.told_phase(&id).await.unwrap(),
+        fx.plane.builder.store.told_phase(&id).await.unwrap(),
         Some(Phase::Planning)
     );
 
     let mut resumed = fx
+        .plane
         .builder
         .open(SessionSelector::Named("later".into()), None, None, None)
         .await
@@ -993,13 +1019,14 @@ async fn a_phase_change_survives_exit_before_the_next_turn() {
         "the model was never told about coding: {content}"
     );
     assert_eq!(
-        fx.builder.store.told_phase(&id).await.unwrap(),
+        fx.plane.builder.store.told_phase(&id).await.unwrap(),
         Some(Phase::Coding)
     );
     drop(resumed);
 
     // Once told, a later resume in the same phase sends no note.
     let mut again = fx
+        .plane
         .builder
         .open(SessionSelector::Named("later".into()), None, None, None)
         .await
@@ -1011,9 +1038,15 @@ async fn a_phase_change_survives_exit_before_the_next_turn() {
 
     // An unknown told phase (a session from before the column existed)
     // is treated conservatively: the note goes out.
-    fx.builder.store.set_told_phase(&id, None).await.unwrap();
+    fx.plane
+        .builder
+        .store
+        .set_told_phase(&id, None)
+        .await
+        .unwrap();
     drop(again);
     let legacy = fx
+        .plane
         .builder
         .open(SessionSelector::Named("later".into()), None, None, None)
         .await
@@ -1032,6 +1065,7 @@ async fn resume_refuses_a_session_from_another_workspace() {
     )
     .await;
     let mut agent = fx
+        .plane
         .builder
         .open(SessionSelector::Named("elsewhere".into()), None, None, None)
         .await
@@ -1044,12 +1078,12 @@ async fn resume_refuses_a_session_from_another_workspace() {
     drop(agent);
     let other = tempfile::tempdir().unwrap();
     let mut moved = AgentBuilder {
-        config: fx.builder.config.clone(),
-        store: Arc::clone(&fx.builder.store),
-        telemetry: Arc::clone(&fx.builder.telemetry),
-        keys: Arc::clone(&fx.builder.keys),
-        transport: Arc::clone(&fx.builder.transport),
-        catalog: Arc::clone(&fx.builder.catalog),
+        config: fx.plane.builder.config.clone(),
+        store: Arc::clone(&fx.plane.builder.store),
+        telemetry: Arc::clone(&fx.plane.builder.telemetry),
+        keys: Arc::clone(&fx.plane.builder.keys),
+        transport: Arc::clone(&fx.plane.builder.transport),
+        catalog: Arc::clone(&fx.plane.builder.catalog),
         cache: None,
         workspace: Workspace::open(other.path()).unwrap(),
         approval: ApprovalMode::Ask,
@@ -1069,11 +1103,11 @@ async fn resume_refuses_a_session_from_another_workspace() {
         );
         assert!(error
             .message
-            .contains(&fx.builder.workspace_root().display().to_string()));
+            .contains(&fx.plane.builder.workspace_root().display().to_string()));
         assert!(error.message.contains("--workspace"));
     }
     // Pointing the builder back at the recorded workspace resumes it.
-    moved.workspace = Workspace::open(fx.builder.workspace_root()).unwrap();
+    moved.workspace = Workspace::open(fx.plane.builder.workspace_root()).unwrap();
     assert!(moved
         .open(SessionSelector::Named("elsewhere".into()), None, None, None)
         .await
@@ -1092,6 +1126,7 @@ async fn cancelling_during_a_pending_approval_denies_and_ends_the_turn() {
     )
     .await;
     let mut agent = fx
+        .plane
         .builder
         .open(
             SessionSelector::New { name: None },
@@ -1125,7 +1160,7 @@ async fn cancelling_during_a_pending_approval_denies_and_ends_the_turn() {
             ..
         }
     )));
-    assert!(!fx.builder.workspace_root().join("late.txt").exists());
+    assert!(!fx.plane.builder.workspace_root().join("late.txt").exists());
     assert_eq!(fx.transport.request_count(), 1);
 }
 
@@ -1166,6 +1201,7 @@ async fn print_mode_stops_the_turn_when_stdout_breaks() {
     )
     .await;
     let mut agent = fx
+        .plane
         .builder
         .open(
             SessionSelector::New { name: None },
@@ -1196,6 +1232,7 @@ async fn print_mode_stops_the_turn_when_stdout_breaks() {
     // followed the tool result never went out, so no continuation ran.
     assert!(fx.transport.request_count() <= 2);
     let stored = fx
+        .plane
         .builder
         .store
         .read_events(&agent.session().id)
@@ -1252,6 +1289,7 @@ async fn a_failed_approval_prompt_denies_and_ends_the_turn() {
     )
     .await;
     let mut agent = fx
+        .plane
         .builder
         .open(
             SessionSelector::New { name: None },
@@ -1283,13 +1321,19 @@ async fn a_failed_approval_prompt_denies_and_ends_the_turn() {
     let error = agent.run_turn("write it", &mut ui).await.unwrap_err();
     assert!(error.message.contains("output failed"), "{}", error.message);
     assert_eq!(*asked.lock().unwrap(), 0, "no one waited for an answer");
-    assert!(!fx.builder.workspace_root().join("unseen.txt").exists());
+    assert!(!fx
+        .plane
+        .builder
+        .workspace_root()
+        .join("unseen.txt")
+        .exists());
     assert!(err.inner.contents().contains("-> file_write unseen.txt"));
     // The turn stopped at the failed prompt: cancelled, and nothing after
     // the approval request was persisted.
     assert!(agent.handle().is_cancelled());
     assert_eq!(fx.transport.request_count(), 1);
     let stored = fx
+        .plane
         .builder
         .store
         .read_events(&agent.session().id)
@@ -1309,6 +1353,7 @@ async fn finishing_the_output_reports_a_failure_on_the_last_write() {
     )
     .await;
     let mut agent = fx
+        .plane
         .builder
         .open(SessionSelector::New { name: None }, None, None, None)
         .await
@@ -1359,6 +1404,7 @@ async fn repl_runs_a_scripted_session_end_to_end() {
     )
     .await;
     let agent = fx
+        .plane
         .builder
         .open(SessionSelector::Named("first".into()), None, None, None)
         .await
@@ -1410,8 +1456,8 @@ async fn repl_runs_a_scripted_session_end_to_end() {
         }),
     };
     let agent = run_repl(
-        &fx.builder,
-        agent,
+        &fx.plane,
+        Box::new(agent),
         &input,
         out.clone(),
         err.clone(),
@@ -1433,7 +1479,7 @@ async fn repl_runs_a_scripted_session_end_to_end() {
         [native::FILE_WRITE, native::SHELL]
     );
     assert_eq!(
-        std::fs::read_to_string(fx.builder.workspace_root().join("repl.txt")).unwrap(),
+        std::fs::read_to_string(fx.plane.builder.workspace_root().join("repl.txt")).unwrap(),
         "from repl\n"
     );
     assert!(stderr.contains("cancelled"), "{stderr}");
@@ -1457,6 +1503,7 @@ async fn repl_runs_a_scripted_session_end_to_end() {
     assert!(requests[0].body_json().unwrap().get("tools").is_none());
     assert!(requests[1].body_json().unwrap()["tools"].is_array());
     let stored = fx
+        .plane
         .builder
         .store
         .read_events(&agent.session().id)
@@ -1494,6 +1541,7 @@ async fn repl_recovers_after_cancelling_a_pending_approval() {
     )
     .await;
     let agent = fx
+        .plane
         .builder
         .open(SessionSelector::Named("recover".into()), None, None, None)
         .await
@@ -1538,8 +1586,8 @@ async fn repl_recovers_after_cancelling_a_pending_approval() {
     let agent = tokio::time::timeout(
         std::time::Duration::from_secs(20),
         run_repl(
-            &fx.builder,
-            agent,
+            &fx.plane,
+            Box::new(agent),
             &input,
             out.clone(),
             err.clone(),
@@ -1559,7 +1607,7 @@ async fn repl_recovers_after_cancelling_a_pending_approval() {
     assert!(stderr.contains("turn Cancelled"), "{stderr}");
     let stdout = out.contents();
     assert_eq!(stdout.matches("Hello, world").count(), 1, "{stdout}");
-    let root = fx.builder.workspace_root();
+    let root = fx.plane.builder.workspace_root();
     assert!(!root.join("first.txt").exists());
     assert_eq!(
         std::fs::read_to_string(root.join("second.txt")).unwrap(),
