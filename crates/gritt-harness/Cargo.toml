@@ -11,9 +11,17 @@ publish.workspace = true
 [dependencies]
 gritt-core = { workspace = true }
 gritt-provider = { workspace = true }
+chrono = { workspace = true }
+crossterm = { workspace = true }
+diffy = { workspace = true }
 dirs = { workspace = true }
+futures = { workspace = true }
+ratatui = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 turso = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

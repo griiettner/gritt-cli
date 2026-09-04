@@ -5,14 +5,22 @@
 //! `gritt_schema_migrations`, so the two namespaces evolve independently in
 //! one file (ADR-005, TKT-0008 plan).
 
+mod session_store;
+
 use std::path::{Path, PathBuf};
 
 use gritt_core::{Error, Result};
 use turso::{Builder, Connection};
 
 /// Ordered product migrations. Append; never edit an applied entry.
-pub const MIGRATIONS: [(&str, &str); 1] =
-    [("0001_product_tables", include_str!("product_schema.sql"))];
+pub const MIGRATIONS: [(&str, &str); 3] = [
+    ("0001_product_tables", include_str!("product_schema.sql")),
+    ("0002_content_log", include_str!("content_log.sql")),
+    (
+        "0003_session_told_phase",
+        include_str!("session_told_phase.sql"),
+    ),
+];
 
 /// Tables and indexes owned by `gritt-agent`. The store must never touch
 /// them.
@@ -181,7 +189,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = Store::open(temp_location(&dir)).await.unwrap();
         let applied = first.applied_migrations().await.unwrap();
-        assert_eq!(applied, vec!["0001_product_tables".to_string()]);
+        assert_eq!(
+            applied,
+            vec![
+                "0001_product_tables".to_string(),
+                "0002_content_log".to_string(),
+                "0003_session_told_phase".to_string()
+            ]
+        );
         drop(first);
         let second = Store::open(temp_location(&dir)).await.unwrap();
         assert_eq!(second.applied_migrations().await.unwrap(), applied);

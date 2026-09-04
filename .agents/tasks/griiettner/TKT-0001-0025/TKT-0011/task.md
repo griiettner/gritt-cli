@@ -3,7 +3,7 @@ id: TKT-0011
 namespace: griiettner
 title: Implement sessions, planning and coding phases, permissions, workspace-bounded tools, terminal modes, approvals, cancellation, and telemetry
 artifact: task
-status: planning
+status: done
 owner: griiettner
 created: 2026-09-04
 updated: 2026-09-04

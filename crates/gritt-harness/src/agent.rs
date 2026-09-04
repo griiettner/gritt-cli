@@ -1,0 +1,931 @@
+//! The native agent loop (ADR-007, ADR-009). Drives one provider adapter
+//! through a session: stream events, persist them, gate every tool call
+//! through the policy engine, ask the interface when the policy says so,
+//! execute, submit results, and continue until the turn completes, fails,
+//! or is cancelled. Planning turns carry no tools; coding turns carry the
+//! native tools.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use chrono::Utc;
+use futures::StreamExt;
+use gritt_core::config::Config;
+use gritt_core::event::{
+    ApprovalDecision, ApprovalId, ApprovalRequest, Event, EventKind, EventSource, SessionStatus,
+    StopReason, Usage,
+};
+use gritt_core::policy::PolicyOutcome;
+use gritt_core::provider::{Message, PromptRequest, RequestOptions, Role};
+use gritt_core::secret::Secret;
+use gritt_core::session::{BoxFuture, Phase, Session, SessionId, SessionKind, SessionStore};
+use gritt_core::tool::{ToolCall, ToolResult};
+use gritt_core::{Error, ErrorKind, Result};
+use gritt_provider::adapter::{redact_text, redact_value, CapabilitySource, KeyProvider};
+use gritt_provider::alias;
+use gritt_provider::models::{load_models, ModelCache, ModelCatalog};
+use gritt_provider::transport::HttpTransport;
+use gritt_provider::{adapter_for, AdapterContext, CancellationToken};
+
+use crate::policy::{Decision, PolicyEngine};
+use crate::store::Store;
+use crate::telemetry::Telemetry;
+use crate::tools::{NativeTools, ProcessRegistry, Workspace};
+
+/// How approvals are answered when the policy says `ask`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalMode {
+    /// Ask the interface.
+    Ask,
+    /// Approve without asking. For scripts that accept the risk.
+    ApproveAll,
+    /// Deny without asking. The default when no terminal can answer.
+    DenyAll,
+}
+
+/// What an interface must provide to the loop. Print, REPL, and the
+/// full-screen mode all implement it.
+pub trait Ui: Send {
+    /// Every persisted event, in order.
+    fn event(&mut self, event: &Event);
+    /// Answer an `ask` outcome. `preview` is the unified diff for a write.
+    /// The loop races this against cancellation, so the future must not
+    /// block the thread.
+    fn approve<'a>(
+        &'a mut self,
+        request: &'a ApprovalRequest,
+        decision: &'a Decision,
+        preview: Option<&'a str>,
+    ) -> BoxFuture<'a, ApprovalDecision>;
+    /// The first output failure, when the interface can no longer deliver
+    /// events (a closed pipe, for example). The loop stops the turn on it.
+    fn output_error(&self) -> Option<String> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnStatus {
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnOutcome {
+    pub status: TurnStatus,
+    pub text: String,
+    pub usage: Usage,
+    pub tool_calls: u64,
+    pub error: Option<String>,
+}
+
+/// Lets another task stop a running turn: the request, the stream, and any
+/// child process.
+#[derive(Clone)]
+pub struct CancelHandle {
+    token: CancellationToken,
+    registry: Arc<ProcessRegistry>,
+}
+
+impl CancelHandle {
+    pub fn cancel(&self) {
+        self.token.cancel();
+        let registry = Arc::clone(&self.registry);
+        tokio::spawn(async move { registry.kill_all().await });
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+}
+
+pub struct NativeAgent {
+    session: Session,
+    adapter: Arc<dyn gritt_core::provider::ProviderAdapter>,
+    store: Arc<Store>,
+    policy: PolicyEngine,
+    tools: NativeTools,
+    telemetry: Arc<Telemetry>,
+    cancel: CancellationToken,
+    approval: ApprovalMode,
+    next_sequence: u64,
+    started: bool,
+    /// The phase the model was last told about, so a phase change sends a
+    /// transition note on the next turn.
+    sent_phase: Option<Phase>,
+    /// Active credentials, redacted out of every event, tool result, and
+    /// content-log row the harness produces.
+    secrets: Vec<Secret>,
+    labels: BTreeMap<String, String>,
+}
+
+/// Redacts every registered secret out of an event's text, arguments,
+/// results, approval fields, error message, and diagnostic.
+fn redact_event(mut event: Event, secrets: &[Secret]) -> Event {
+    if secrets.is_empty() {
+        return event;
+    }
+    match &mut event.kind {
+        EventKind::TextDelta { text } | EventKind::ReasoningSummary { text } => {
+            *text = redact_text(text, secrets);
+        }
+        EventKind::ToolCall { call } => {
+            call.arguments = redact_value(call.arguments.take(), secrets);
+        }
+        EventKind::ToolResult { result } => {
+            result.output = redact_text(&result.output, secrets);
+        }
+        EventKind::ApprovalRequested { request } => {
+            request.resource = redact_text(&request.resource, secrets);
+            request.reason = redact_text(&request.reason, secrets);
+        }
+        EventKind::Error { message, .. } => {
+            *message = redact_text(message, secrets);
+        }
+        EventKind::ApprovalDecided { .. }
+        | EventKind::Usage { .. }
+        | EventKind::StatusChanged { .. }
+        | EventKind::Completed { .. }
+        | EventKind::Cancelled => {}
+    }
+    if let Some(diagnostic) = event.diagnostic.take() {
+        event.diagnostic = Some(redact_value(diagnostic, secrets));
+    }
+    event
+}
+
+/// The copy of an event that is persisted while content logging is off.
+/// An approval request keeps the tool, the resource, and the call id (an
+/// identifier, not content); the reason and the destructive diagnostic
+/// are shown to the interface and not stored. Every other event is
+/// stored as shown.
+pub fn persisted_projection(mut event: Event) -> Event {
+    if let EventKind::ApprovalRequested { request } = &mut event.kind {
+        request.reason = String::new();
+        event.diagnostic = None;
+    }
+    event
+}
+
+/// The note prepended to the first user message after a phase change.
+pub fn phase_transition_note(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Planning => {
+            "[Phase changed to planning. No tools are available now; discuss the task and propose a plan.]"
+        }
+        Phase::Coding => {
+            "[Phase changed to coding. The tools file_read, file_write, and shell are now available. \
+             Paths are relative to the workspace root and the user approves writes and commands.]"
+        }
+    }
+}
+
+impl NativeAgent {
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
+    pub fn phase(&self) -> Phase {
+        self.session.phase
+    }
+
+    pub fn approval_mode(&self) -> ApprovalMode {
+        self.approval
+    }
+
+    pub fn set_approval_mode(&mut self, mode: ApprovalMode) {
+        self.approval = mode;
+    }
+
+    pub fn handle(&self) -> CancelHandle {
+        CancelHandle {
+            token: self.cancel.clone(),
+            registry: Arc::clone(self.tools.registry()),
+        }
+    }
+
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+
+    /// Switches phase and records the transition as a status event.
+    pub async fn set_phase(&mut self, phase: Phase) -> Result<()> {
+        if self.session.phase == phase {
+            return Ok(());
+        }
+        self.session.phase = phase;
+        self.store.set_phase(&self.session.id, phase).await?;
+        let status = match phase {
+            Phase::Planning => SessionStatus::Idle,
+            Phase::Coding => SessionStatus::Idle,
+        };
+        let event = self.harness_event(
+            EventKind::StatusChanged { status },
+            Some(serde_json::json!({ "phase": phase })),
+        );
+        self.store.append_events(vec![event]).await
+    }
+
+    fn harness_event(&mut self, kind: EventKind, diagnostic: Option<serde_json::Value>) -> Event {
+        let event = Event {
+            session_id: self.session.id.clone(),
+            sequence: self.next_sequence,
+            source: EventSource::Native,
+            timestamp: Utc::now(),
+            kind,
+            diagnostic,
+        };
+        self.next_sequence += 1;
+        event
+    }
+
+    /// Renumbers an adapter event into the session sequence, keeping the
+    /// adapter's own number in the diagnostic.
+    fn renumber(&mut self, mut event: Event) -> Event {
+        let adapter_sequence = event.sequence;
+        event.session_id = self.session.id.clone();
+        event.sequence = self.next_sequence;
+        self.next_sequence += 1;
+        let extra = serde_json::json!({ "adapter_sequence": adapter_sequence });
+        event.diagnostic = Some(match event.diagnostic.take() {
+            Some(serde_json::Value::Object(mut map)) => {
+                map.insert("adapter_sequence".into(), extra["adapter_sequence"].clone());
+                serde_json::Value::Object(map)
+            }
+            Some(other) => {
+                serde_json::json!({ "raw": other, "adapter_sequence": adapter_sequence })
+            }
+            None => extra,
+        });
+        event
+    }
+
+    /// Redacts, shows, and persists one event. An interface that can no
+    /// longer deliver output ends the turn: the request is cancelled and
+    /// every child process stopped before the error is returned.
+    async fn emit(&mut self, ui: &mut dyn Ui, event: Event) -> Result<()> {
+        let event = redact_event(event, &self.secrets);
+        ui.event(&event);
+        if let Some(message) = ui.output_error() {
+            self.cancel.cancel();
+            self.tools.registry().kill_all().await;
+            return Err(Error::config(format!("output failed: {message}")));
+        }
+        let stored = if self.telemetry.content_logging() {
+            event
+        } else {
+            persisted_projection(event)
+        };
+        self.store.append_events(vec![stored]).await
+    }
+
+    fn system_prompt(&self) -> String {
+        match self.session.phase {
+            Phase::Planning => format!(
+                "You are Gritt, a coding agent working in {}. This is the planning phase: \
+                 discuss the task, ask questions, and propose a plan. No tools are available.",
+                self.tools.workspace().root().display()
+            ),
+            Phase::Coding => format!(
+                "You are Gritt, a coding agent working in {}. This is the coding phase. \
+                 Use file_read, file_write, and shell to do the work. Paths are relative to the \
+                 workspace root. The user approves writes and commands.",
+                self.tools.workspace().root().display()
+            ),
+        }
+    }
+
+    fn request(&self, prompt: &str) -> PromptRequest {
+        let model = match &self.session.kind {
+            SessionKind::Native { model, .. } => model.clone(),
+            SessionKind::Connector { .. } => String::new(),
+        };
+        let mut messages = Vec::new();
+        let mut content = prompt.to_owned();
+        if !self.started {
+            messages.push(Message {
+                role: Role::System,
+                content: self.system_prompt(),
+            });
+        } else if self.sent_phase != Some(self.session.phase) {
+            // The system prompt went out under the old phase; tell the
+            // model what changed rather than leaving it believing tools
+            // are absent (or present).
+            content = format!(
+                "{}\n\n{}",
+                phase_transition_note(self.session.phase),
+                prompt
+            );
+        }
+        messages.push(Message {
+            role: Role::User,
+            content,
+        });
+        PromptRequest {
+            model,
+            messages,
+            tools: match self.session.phase {
+                Phase::Planning => Vec::new(),
+                Phase::Coding => NativeTools::definitions(),
+            },
+            options: RequestOptions::default(),
+        }
+    }
+
+    /// The request the next turn would send for `prompt`, without sending
+    /// it. Tests use it to inspect the phase note and tool list.
+    pub fn request_preview(&self, prompt: &str) -> PromptRequest {
+        self.request(prompt)
+    }
+
+    /// Runs one user turn to completion.
+    pub async fn run_turn(&mut self, prompt: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
+        let started_at = Utc::now();
+        self.cancel.reset();
+        self.telemetry
+            .content(&self.session.id, "user", prompt, &self.secrets)
+            .await?;
+        let request = self.request(prompt);
+        let adapter = Arc::clone(&self.adapter);
+        let status = self.harness_event(
+            EventKind::StatusChanged {
+                status: SessionStatus::Connecting,
+            },
+            None,
+        );
+        self.emit(ui, status).await?;
+        let mut outcome = TurnOutcome {
+            status: TurnStatus::Completed,
+            text: String::new(),
+            usage: Usage::default(),
+            tool_calls: 0,
+            error: None,
+        };
+        let mut stream = match adapter.send(request).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                return self.fail(ui, error, started_at, outcome).await;
+            }
+        };
+        self.started = true;
+        if self.sent_phase != Some(self.session.phase) {
+            self.sent_phase = Some(self.session.phase);
+            self.store
+                .set_told_phase(&self.session.id, self.sent_phase)
+                .await?;
+        }
+        loop {
+            let mut pending_calls: Vec<ToolCall> = Vec::new();
+            let mut wants_tools = false;
+            let mut terminal = false;
+            while let Some(item) = stream.next().await {
+                let event = match item {
+                    Ok(event) => event,
+                    Err(error) => {
+                        let event = self.harness_event(
+                            EventKind::Error {
+                                error_kind: error.kind,
+                                message: error.message.clone(),
+                            },
+                            error.diagnostic.clone(),
+                        );
+                        self.emit(ui, event).await?;
+                        outcome.status = TurnStatus::Failed;
+                        outcome.error = Some(error.message);
+                        break;
+                    }
+                };
+                let event = self.renumber(event);
+                match &event.kind {
+                    EventKind::TextDelta { text } => outcome.text.push_str(text),
+                    EventKind::ToolCall { call } => pending_calls.push(call.clone()),
+                    EventKind::Usage { usage } => add_usage(&mut outcome.usage, usage),
+                    EventKind::Completed { stop_reason } => {
+                        wants_tools = *stop_reason == StopReason::ToolUse;
+                        terminal = true;
+                    }
+                    EventKind::Error { message, .. } => {
+                        outcome.status = TurnStatus::Failed;
+                        outcome.error = Some(message.clone());
+                        terminal = true;
+                    }
+                    EventKind::Cancelled => {
+                        outcome.status = TurnStatus::Cancelled;
+                        terminal = true;
+                    }
+                    _ => {}
+                }
+                self.emit(ui, event).await?;
+                if terminal {
+                    break;
+                }
+            }
+            drop(stream);
+            if outcome.status != TurnStatus::Completed || (!wants_tools && pending_calls.is_empty())
+            {
+                break;
+            }
+            if pending_calls.is_empty() {
+                break;
+            }
+            // Tool phase: gate, ask, execute, then continue the conversation.
+            let mut results = Vec::with_capacity(pending_calls.len());
+            for call in pending_calls {
+                outcome.tool_calls += 1;
+                let result = self.handle_call(ui, &call).await?;
+                results.push(result);
+                if self.cancel.is_cancelled() {
+                    outcome.status = TurnStatus::Cancelled;
+                    break;
+                }
+            }
+            if outcome.status == TurnStatus::Cancelled {
+                let event = self.harness_event(EventKind::Cancelled, None);
+                self.emit(ui, event).await?;
+                break;
+            }
+            stream = match adapter.submit_tool_results(results).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    return self.fail(ui, error, started_at, outcome).await;
+                }
+            };
+        }
+        if outcome.status == TurnStatus::Cancelled {
+            self.tools.registry().kill_all().await;
+        }
+        if let Some(mut state) = adapter.continuation().await? {
+            // The adapter's state carries the conversation, tool results
+            // included; it is stored redacted like every other row.
+            state.state = redact_value(state.state, &self.secrets);
+            self.store
+                .save_continuation(&self.session.id, state)
+                .await?;
+        }
+        if !outcome.text.is_empty() {
+            self.telemetry
+                .content(&self.session.id, "assistant", &outcome.text, &self.secrets)
+                .await?;
+        }
+        let final_status = match outcome.status {
+            TurnStatus::Completed => SessionStatus::Finished,
+            TurnStatus::Cancelled => SessionStatus::Idle,
+            TurnStatus::Failed => SessionStatus::Failed,
+        };
+        let event = self.harness_event(
+            EventKind::StatusChanged {
+                status: final_status,
+            },
+            None,
+        );
+        self.emit(ui, event).await?;
+        self.record_turn(started_at, &outcome).await?;
+        Ok(outcome)
+    }
+
+    async fn fail(
+        &mut self,
+        ui: &mut dyn Ui,
+        error: Error,
+        started_at: chrono::DateTime<Utc>,
+        mut outcome: TurnOutcome,
+    ) -> Result<TurnOutcome> {
+        let event = self.harness_event(
+            EventKind::Error {
+                error_kind: error.kind,
+                message: error.message.clone(),
+            },
+            error.diagnostic.clone(),
+        );
+        self.emit(ui, event).await?;
+        outcome.status = TurnStatus::Failed;
+        outcome.error = Some(error.message.clone());
+        self.record_turn(started_at, &outcome).await?;
+        Err(error)
+    }
+
+    async fn record_turn(
+        &self,
+        started_at: chrono::DateTime<Utc>,
+        outcome: &TurnOutcome,
+    ) -> Result<()> {
+        let mut counters = BTreeMap::new();
+        counters.insert("tool_calls".to_string(), outcome.tool_calls);
+        if let Some(value) = outcome.usage.input_tokens {
+            counters.insert("input_tokens".to_string(), value);
+        }
+        if let Some(value) = outcome.usage.output_tokens {
+            counters.insert("output_tokens".to_string(), value);
+        }
+        let status = match outcome.status {
+            TurnStatus::Completed => "completed",
+            TurnStatus::Cancelled => "cancelled",
+            TurnStatus::Failed => "failed",
+        };
+        self.telemetry
+            .turn(
+                &self.session.id,
+                started_at,
+                status,
+                counters,
+                self.labels.clone(),
+            )
+            .await
+    }
+
+    /// Records a call that never ran: a bad argument, a path outside the
+    /// workspace, or a preview that could not be built.
+    async fn refuse_call(
+        &mut self,
+        ui: &mut dyn Ui,
+        call: &ToolCall,
+        message: String,
+    ) -> Result<ToolResult> {
+        let result = ToolResult {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            is_error: true,
+            output: redact_text(&message, &self.secrets),
+        };
+        let event = self.harness_event(
+            EventKind::ToolResult {
+                result: result.clone(),
+            },
+            None,
+        );
+        self.emit(ui, event).await?;
+        Ok(result)
+    }
+
+    /// Policy, approval, execution, and the events for one call.
+    async fn handle_call(&mut self, ui: &mut dyn Ui, call: &ToolCall) -> Result<ToolResult> {
+        let resource = match self.tools.resource_for(call) {
+            Ok(resource) => resource,
+            Err(error) => {
+                // A bad argument or a path outside the workspace never
+                // reaches the policy; the refusal is still recorded.
+                return self.refuse_call(ui, call, error.message).await;
+            }
+        };
+        let decision = self.policy.evaluate(&call.name, &resource);
+        let approved = match decision.outcome {
+            PolicyOutcome::Allow => true,
+            PolicyOutcome::Deny => {
+                let event = self.harness_event(
+                    EventKind::StatusChanged {
+                        status: SessionStatus::Idle,
+                    },
+                    Some(serde_json::json!({
+                        "policy": "deny", "tool": call.name, "reason": decision.reason
+                    })),
+                );
+                self.emit(ui, event).await?;
+                false
+            }
+            PolicyOutcome::Ask => {
+                // The preview is built before anything is recorded: a
+                // preview that cannot be built (unreadable or non-UTF-8
+                // target) refuses the call, leaving no unmatched request.
+                let preview = if self.approval == ApprovalMode::Ask {
+                    match self.tools.preview(call) {
+                        Ok(preview) => preview.map(|text| redact_text(&text, &self.secrets)),
+                        Err(error) => {
+                            return self.refuse_call(ui, call, error.message).await;
+                        }
+                    }
+                } else {
+                    None
+                };
+                // One redacted request serves the interface, the events,
+                // and the transcript; the raw resource never leaves here.
+                let request = ApprovalRequest {
+                    id: ApprovalId(uuid::Uuid::new_v4().to_string()),
+                    tool: call.name.clone(),
+                    resource: redact_text(&resource.display(), &self.secrets),
+                    reason: redact_text(&decision.reason, &self.secrets),
+                    call_id: Some(call.id.clone()),
+                };
+                let decision = Decision {
+                    reason: request.reason.clone(),
+                    ..decision.clone()
+                };
+                let event = self.harness_event(
+                    EventKind::StatusChanged {
+                        status: SessionStatus::WaitingForApproval,
+                    },
+                    None,
+                );
+                self.emit(ui, event).await?;
+                let event = self.harness_event(
+                    EventKind::ApprovalRequested {
+                        request: request.clone(),
+                    },
+                    Some(serde_json::json!({ "destructive": decision.destructive })),
+                );
+                self.emit(ui, event).await?;
+                let answer = match self.approval {
+                    ApprovalMode::ApproveAll => ApprovalDecision::Approved,
+                    ApprovalMode::DenyAll => ApprovalDecision::Denied,
+                    ApprovalMode::Ask => {
+                        // The wait races cancellation so Ctrl-C or Esc
+                        // during a pending approval ends the turn.
+                        let cancel = self.cancel.clone();
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => ApprovalDecision::Denied,
+                            answer = ui.approve(&request, &decision, preview.as_deref()) => answer,
+                        }
+                    }
+                };
+                let event = self.harness_event(
+                    EventKind::ApprovalDecided {
+                        request_id: request.id.clone(),
+                        decision: answer,
+                    },
+                    None,
+                );
+                self.emit(ui, event).await?;
+                answer == ApprovalDecision::Approved
+            }
+        };
+        let result = if approved {
+            let event = self.harness_event(
+                EventKind::StatusChanged {
+                    status: SessionStatus::RunningTool,
+                },
+                Some(serde_json::json!({ "tool": call.name })),
+            );
+            self.emit(ui, event).await?;
+            let mut result = self.tools.execute(call, &self.cancel).await;
+            // Redacted before it reaches the model, the store, or the
+            // interface; the emitter above only covers adapter events.
+            result.output = redact_text(&result.output, &self.secrets);
+            result
+        } else {
+            ToolResult {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                is_error: true,
+                output: format!(
+                    "{} was not permitted: {}",
+                    call.name,
+                    if decision.outcome == PolicyOutcome::Deny {
+                        "denied by policy"
+                    } else {
+                        "the user declined"
+                    }
+                ),
+            }
+        };
+        let event = self.harness_event(
+            EventKind::ToolResult {
+                result: result.clone(),
+            },
+            None,
+        );
+        self.emit(ui, event).await?;
+        Ok(result)
+    }
+}
+
+fn add_usage(total: &mut Usage, usage: &Usage) {
+    fn add(slot: &mut Option<u64>, value: Option<u64>) {
+        if let Some(value) = value {
+            *slot = Some(slot.unwrap_or(0) + value);
+        }
+    }
+    add(&mut total.input_tokens, usage.input_tokens);
+    add(&mut total.output_tokens, usage.output_tokens);
+    add(&mut total.reasoning_tokens, usage.reasoning_tokens);
+    add(&mut total.cached_input_tokens, usage.cached_input_tokens);
+}
+
+/// Which session a turn runs in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSelector {
+    /// Create a new session, optionally named.
+    New { name: Option<String> },
+    /// Resume the named session, or create it when it does not exist.
+    Named(String),
+    /// Resume by id.
+    Id(SessionId),
+}
+
+/// Everything needed to build agents: config, store, keys, transport, and
+/// the model catalog. The binary owns the concrete key source.
+pub struct AgentBuilder {
+    pub config: Config,
+    pub store: Arc<Store>,
+    pub telemetry: Arc<Telemetry>,
+    pub keys: Arc<dyn KeyProvider>,
+    pub transport: Arc<dyn HttpTransport>,
+    pub catalog: Arc<ModelCatalog>,
+    pub cache: Option<ModelCache>,
+    pub workspace: Workspace,
+    pub approval: ApprovalMode,
+}
+
+impl AgentBuilder {
+    /// Loads the profile's model list into the catalog, refreshing at most
+    /// daily. A missing list is reported, not fatal: capabilities then
+    /// come back unreported.
+    pub async fn load_catalog(&self, profile: &str) -> Result<Option<Error>> {
+        let Some(cache) = &self.cache else {
+            return Ok(None);
+        };
+        let Some(definition) = self.config.profiles.get(profile) else {
+            return Err(Error::config(format!("unknown profile `{profile}`")));
+        };
+        match load_models(
+            cache,
+            self.transport.as_ref(),
+            self.keys.as_ref(),
+            definition,
+            &self.config.model_list,
+            Utc::now(),
+            false,
+        )
+        .await
+        {
+            Ok(list) => {
+                self.catalog.insert(list);
+                Ok(None)
+            }
+            Err(error) => Ok(Some(error)),
+        }
+    }
+
+    /// Resolves `model` (alias, qualified, or bare) against the config and
+    /// catalog. Bare names use `profile_hint`, then the default profile.
+    pub fn resolve_model(
+        &self,
+        model: Option<&str>,
+        profile_hint: Option<&str>,
+    ) -> Result<(String, String)> {
+        let name = model
+            .map(str::to_owned)
+            .or_else(|| self.config.default_model.clone())
+            .ok_or_else(|| Error::config("no model given and no default_model configured"))?;
+        let resolved = alias::resolve(&self.config, &self.catalog, &name, profile_hint)?;
+        Ok((resolved.profile, resolved.model))
+    }
+
+    /// Opens or creates the session and builds its agent.
+    pub async fn open(
+        &self,
+        selector: SessionSelector,
+        profile: Option<&str>,
+        model: Option<&str>,
+        phase: Option<Phase>,
+    ) -> Result<NativeAgent> {
+        let existing = match &selector {
+            SessionSelector::New { .. } => None,
+            SessionSelector::Named(name) => self.store.find_by_name(name).await?,
+            SessionSelector::Id(id) => self.store.get(id).await?,
+        };
+        let session = match existing {
+            Some(mut session) => {
+                // Policy and tools use the current workspace, so a session
+                // recorded elsewhere must not silently run here.
+                let recorded = session
+                    .workspace
+                    .canonicalize()
+                    .unwrap_or_else(|_| session.workspace.clone());
+                if recorded != self.workspace.root() {
+                    return Err(Error::config(format!(
+                        "session `{}` belongs to workspace {} but the current workspace is {}; \
+                         run with --workspace {} to resume it",
+                        session.name,
+                        session.workspace.display(),
+                        self.workspace.root().display(),
+                        session.workspace.display()
+                    )));
+                }
+                if let Some(phase) = phase {
+                    if session.phase != phase {
+                        self.store.set_phase(&session.id, phase).await?;
+                        session.phase = phase;
+                    }
+                }
+                session
+            }
+            None => {
+                let (profile_name, model_id) = self.resolve_model(model, profile)?;
+                let now = Utc::now();
+                let id = SessionId(uuid::Uuid::new_v4().to_string());
+                let name = match &selector {
+                    SessionSelector::Named(name) => name.clone(),
+                    SessionSelector::New { name: Some(name) } => name.clone(),
+                    _ => format!("session-{}", &id.0[..8]),
+                };
+                let session = Session {
+                    id,
+                    name,
+                    kind: SessionKind::Native {
+                        provider_profile: profile_name,
+                        model: model_id,
+                    },
+                    phase: phase.unwrap_or(Phase::Planning),
+                    workspace: self.workspace.root().to_path_buf(),
+                    created_at: now,
+                    updated_at: now,
+                    parent_id: None,
+                };
+                self.store.create(session.clone()).await?;
+                session
+            }
+        };
+        self.agent_for(session).await
+    }
+
+    /// Builds the agent for a stored session. The phase the model was last
+    /// told about is read from the store; when it differs from the
+    /// session's phase, or is unknown, the next turn sends the transition
+    /// note rather than assuming the model already heard it.
+    pub async fn agent_for(&self, session: Session) -> Result<NativeAgent> {
+        let SessionKind::Native {
+            provider_profile,
+            model,
+        } = &session.kind
+        else {
+            return Err(Error::config(
+                "connector sessions are driven by their connector, not the native loop",
+            ));
+        };
+        let profile = self
+            .config
+            .profiles
+            .get(provider_profile)
+            .cloned()
+            .ok_or_else(|| Error::config(format!("unknown profile `{provider_profile}`")))?;
+        let cancel = CancellationToken::new();
+        let capabilities: Arc<dyn CapabilitySource> = self.catalog.clone();
+        // The active key is the one secret the harness can know about; a
+        // missing key is reported by the adapter on the first request.
+        let secrets: Vec<Secret> = self
+            .keys
+            .key(provider_profile, &profile.key)
+            .ok()
+            .into_iter()
+            .collect();
+        let adapter = adapter_for(AdapterContext {
+            profile,
+            session_id: session.id.clone(),
+            transport: Arc::clone(&self.transport),
+            keys: Arc::clone(&self.keys),
+            capabilities,
+            cancel: cancel.clone(),
+        });
+        let mut started = false;
+        if let Some(state) = self.store.load_continuation(&session.id).await? {
+            adapter.restore(state).await?;
+            started = true;
+        }
+        let next_sequence = self.store.next_sequence(&session.id).await?;
+        let policy = PolicyEngine::new(self.config.policy.clone(), self.workspace.root());
+        let blocked_env: Vec<String> = self
+            .config
+            .profiles
+            .values()
+            .map(|profile| profile.key.env_var_name.clone())
+            .collect();
+        let tools = NativeTools::new(self.workspace.clone(), ProcessRegistry::new())
+            .with_blocked_env(blocked_env);
+        let sent_phase = if started {
+            self.store.told_phase(&session.id).await?
+        } else {
+            None
+        };
+        let labels = BTreeMap::from([
+            ("profile".to_string(), provider_profile.clone()),
+            ("model".to_string(), model.clone()),
+        ]);
+        Ok(NativeAgent {
+            session,
+            adapter,
+            store: Arc::clone(&self.store),
+            policy,
+            tools,
+            telemetry: Arc::clone(&self.telemetry),
+            cancel,
+            approval: self.approval,
+            next_sequence,
+            started,
+            sent_phase,
+            secrets,
+            labels,
+        })
+    }
+
+    /// Reads the workspace root back for callers that need it.
+    pub fn workspace_root(&self) -> &Path {
+        self.workspace.root()
+    }
+}
+
+/// True when the error means the turn was cancelled rather than failed.
+pub fn is_cancelled(error: &Error) -> bool {
+    error.kind == ErrorKind::Cancelled
+}
