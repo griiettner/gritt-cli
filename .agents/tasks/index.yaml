@@ -4,10 +4,9 @@
   count: 14
   updated: 2026-09-04
   statuses:
-    - done: 7
+    - done: 8
     - in_progress: 1
     - planning: 5
-    - ready: 1
   areas:
     - .agents/cli
     - .agents/memory
