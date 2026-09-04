@@ -168,13 +168,14 @@ tickets:
   - id: TKT-0010
     namespace: griiettner
     title: Implement provider adapters, streaming normalizers, model caching, capability checks, opt-in embeddings and reranking
-    status: planning
+    status: done
     owner: griiettner
     priority: normal
     created: 2026-09-04
     updated: 2026-09-04
     artifacts:
       task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0010/task.md
+      report: .agents/tasks/griiettner/TKT-0001-0025/TKT-0010/report.md
     dependencies:
       - TKT-0009
     areas:

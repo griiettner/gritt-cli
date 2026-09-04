@@ -1,0 +1,24 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_fx2","status":"in_progress"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"rs_fx2","type":"reasoning","summary":[]}}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","sequence_number":2,"item_id":"rs_fx2","output_index":0,"summary_index":0,"delta":"Plan: answer briefly."}
+
+event: response.reasoning_summary_text.done
+data: {"type":"response.reasoning_summary_text.done","sequence_number":3,"item_id":"rs_fx2","output_index":0,"summary_index":0,"text":"Plan: answer briefly."}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":4,"output_index":0,"item":{"id":"rs_fx2","type":"reasoning","summary":[{"type":"summary_text","text":"Plan: answer briefly."}]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":5,"output_index":1,"item":{"id":"msg_fx2","type":"message","role":"assistant","content":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":6,"item_id":"msg_fx2","output_index":1,"content_index":0,"delta":"Brief answer."}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":7,"response":{"id":"resp_fx2","status":"completed","usage":{"input_tokens":8,"output_tokens":6,"output_tokens_details":{"reasoning_tokens":4}}}}
+

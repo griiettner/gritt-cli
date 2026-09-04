@@ -1,0 +1,8 @@
+data: {"id":"chatcmpl-fx4","object":"chat.completion.chunk","model":"openai/gpt-5-nano","choices":[{"index":0,"delta":{"role":"assistant","content":"The README says hi."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fx4","object":"chat.completion.chunk","model":"openai/gpt-5-nano","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-fx4","object":"chat.completion.chunk","model":"openai/gpt-5-nano","choices":[],"usage":{"prompt_tokens":40,"completion_tokens":5,"total_tokens":45}}
+
+data: [DONE]
+
