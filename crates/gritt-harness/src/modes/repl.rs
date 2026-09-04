@@ -7,11 +7,12 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use gritt_core::event::ApprovalDecision;
 use gritt_core::session::{Phase, SessionStore};
 use gritt_core::Result;
 
 use crate::agent::{AgentBuilder, CancelHandle, NativeAgent, SessionSelector, TurnStatus, Ui};
-use crate::modes::print::{PrintUi, PrintUiOptions};
+use crate::modes::print::{read_yes_no, PrintUi, PrintUiOptions, Prompter};
 
 /// Where the binary's Ctrl-C handler finds the running turn, if any.
 pub type CancelSlot = Arc<Mutex<Option<CancelHandle>>>;
@@ -69,6 +70,30 @@ impl LineInput {
             }
         }
     }
+}
+
+/// Answers approvals from the shared line input. `prompt` shows the
+/// question first. The running turn's cancel handle is captured when the
+/// question is asked, not read from the slot while waiting: the loop
+/// clears the slot as soon as a cancelled turn returns, and a reader that
+/// only consulted the slot could miss the cancellation and hold the input
+/// for good. No handle at all means the turn is already over, so the
+/// answer is a denial without waiting.
+pub fn line_prompter(
+    input: LineInput,
+    slot: CancelSlot,
+    prompt: impl Fn() + Send + Sync + 'static,
+) -> Prompter {
+    Arc::new(move |_, _, _| {
+        prompt();
+        let Some(handle) = slot.lock().expect("cancel slot").clone() else {
+            return ApprovalDecision::Denied;
+        };
+        match input.next_line_until(|| handle.is_cancelled()) {
+            Some(line) => read_yes_no(&mut std::io::Cursor::new(line.into_bytes())),
+            None => ApprovalDecision::Denied,
+        }
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

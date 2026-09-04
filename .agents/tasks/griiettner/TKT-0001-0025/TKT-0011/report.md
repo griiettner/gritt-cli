@@ -286,6 +286,15 @@ crossterm 0.29.0 (MIT), diffy 0.5.2 (MIT OR Apache-2.0), uuid 1.26.0
 
 ## Updates
 
+- 2026-09-04 third review fix round. The re-review kept one finding: the
+  stdin approval prompter polled the shared cancel slot, which the loop
+  clears as soon as a cancelled turn returns, so a reader that checked
+  after the clear missed the cancellation and held the input for good.
+  `line_prompter` in the harness now captures the turn's cancel handle
+  when the question is asked and waits on that; the binary uses it. Test
+  `repl_recovers_after_cancelling_a_pending_approval` drives the REPL
+  through a pipe, cancels a pending approval, then runs another command
+  and approval.
 - 2026-09-04 second review fix round. The re-review kept nine findings.
   Resolved: shell commands that reach outside the workspace, including
   `~` and variable expansions, are forced to `ask` with the stronger

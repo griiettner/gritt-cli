@@ -1466,3 +1466,104 @@ async fn repl_runs_a_scripted_session_end_to_end() {
     assert!(k.contains(&"cancelled"));
     assert!(k.contains(&"approval_decided"));
 }
+
+/// A cancelled approval must not wedge the REPL. The loop clears the
+/// cancel slot as soon as the cancelled turn returns; a prompter that only
+/// consulted the slot while waiting could miss that and hold the shared
+/// input forever. The prompter here is the one the binary uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repl_recovers_after_cancelling_a_pending_approval() {
+    use gritt_harness::modes::repl::{line_prompter, run_repl, CancelSlot, LineInput};
+
+    let fx = fixture_builder(
+        vec![
+            // 1. a write whose approval is cancelled while pending
+            FixtureResponse::sse(tool_call_sse(
+                native::FILE_WRITE,
+                serde_json::json!({"path": "first.txt", "content": "one\n"}),
+            )),
+            // 2. a second write, approved, then text
+            FixtureResponse::sse(tool_call_sse(
+                native::FILE_WRITE,
+                serde_json::json!({"path": "second.txt", "content": "two\n"}),
+            )),
+            FixtureResponse::sse(fixture("stream-text.sse")),
+        ],
+        ApprovalMode::Ask,
+        None,
+    )
+    .await;
+    let agent = fx
+        .builder
+        .open(SessionSelector::Named("recover".into()), None, None, None)
+        .await
+        .unwrap();
+    // A pipe, so the answer to the first approval is genuinely absent
+    // while the prompter waits.
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    let input = LineInput::from_reader(std::io::BufReader::new(reader));
+    let slot: CancelSlot = Arc::new(Mutex::new(None));
+    let (asked_tx, asked_rx) = std::sync::mpsc::channel::<String>();
+    let inner = line_prompter(input.clone(), Arc::clone(&slot), || {});
+    let prompter: gritt_harness::modes::print::Prompter =
+        Arc::new(move |request, decision, preview| {
+            asked_tx.send(request.tool.clone()).unwrap();
+            inner(request, decision, preview)
+        });
+    let runtime = tokio::runtime::Handle::current();
+    let driver_slot = Arc::clone(&slot);
+    let driver = std::thread::spawn(move || {
+        use std::io::Write as _;
+        writer.write_all(b"/code\nwrite first\n").unwrap();
+        let first = asked_rx.recv().unwrap();
+        // The prompter is now waiting on the pipe with nothing to read.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let handle = driver_slot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a turn is running");
+        let _guard = runtime.enter();
+        handle.cancel();
+        // Give the cancelled prompter its poll interval to let go of the
+        // input before the next command arrives.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        writer.write_all(b"write second\ny\n/quit\n").unwrap();
+        drop(writer);
+        let second = asked_rx.recv().unwrap();
+        vec![first, second]
+    });
+    let out = SharedBuffer::default();
+    let err = SharedBuffer::default();
+    let agent = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        run_repl(
+            &fx.builder,
+            agent,
+            &input,
+            out.clone(),
+            err.clone(),
+            PrintUiOptions {
+                verbose: false,
+                prompter,
+            },
+            slot,
+        ),
+    )
+    .await
+    .expect("the REPL must not hang after a cancelled approval")
+    .unwrap();
+    let asked = driver.join().unwrap();
+    assert_eq!(asked, [native::FILE_WRITE, native::FILE_WRITE]);
+    let stderr = err.contents();
+    assert!(stderr.contains("turn Cancelled"), "{stderr}");
+    let stdout = out.contents();
+    assert_eq!(stdout.matches("Hello, world").count(), 1, "{stdout}");
+    let root = fx.builder.workspace_root();
+    assert!(!root.join("first.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join("second.txt")).unwrap(),
+        "two\n"
+    );
+    assert_eq!(agent.session().name, "recover");
+}

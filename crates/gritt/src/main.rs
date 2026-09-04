@@ -11,8 +11,8 @@ use gritt_core::event::{ApprovalDecision, EventKind};
 use gritt_core::session::{Phase, SessionStore};
 use gritt_core::{Error, Result};
 use gritt_harness::agent::{AgentBuilder, ApprovalMode, SessionSelector, TurnStatus, Ui};
-use gritt_harness::modes::print::{read_yes_no, PrintUi, PrintUiOptions};
-use gritt_harness::modes::repl::{run_repl, CancelSlot, LineInput};
+use gritt_harness::modes::print::{PrintUi, PrintUiOptions};
+use gritt_harness::modes::repl::{line_prompter, run_repl, CancelSlot, LineInput};
 use gritt_harness::store::{resolve_location, Store};
 use gritt_harness::telemetry::Telemetry;
 use gritt_harness::tools::Workspace;
@@ -226,23 +226,13 @@ async fn warm_catalog(builder: &AgentBuilder, args: &SessionArgs) {
     }
 }
 
-/// Answers approvals from the shared stdin owner. The wait gives up as
-/// soon as the running turn is cancelled, so the next typed line is a
-/// command for the loop, not a stale answer.
+/// Answers approvals from the shared stdin owner. The harness prompter
+/// captures the running turn's cancel handle up front, so a cancelled
+/// approval gives up and the next typed line reaches the loop.
 fn stdin_prompter(input: LineInput, slot: CancelSlot) -> gritt_harness::modes::print::Prompter {
-    Arc::new(move |_, _, _| {
+    line_prompter(input, slot, || {
         eprint!("approve? [y/N] ");
         let _ = std::io::stderr().flush();
-        let cancelled = || {
-            slot.lock()
-                .expect("cancel slot")
-                .as_ref()
-                .is_some_and(|handle| handle.is_cancelled())
-        };
-        match input.next_line_until(cancelled) {
-            Some(line) => read_yes_no(&mut std::io::Cursor::new(line.into_bytes())),
-            None => ApprovalDecision::Denied,
-        }
     })
 }
 
