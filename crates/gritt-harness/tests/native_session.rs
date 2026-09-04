@@ -1615,3 +1615,97 @@ async fn repl_recovers_after_cancelling_a_pending_approval() {
     );
     assert_eq!(agent.session().name, "recover");
 }
+
+/// A builder with a second profile and a global alias onto it, for the
+/// catalog-warming profile resolution.
+async fn two_profile_builder(dir: &std::path::Path) -> AgentBuilder {
+    let store = Arc::new(
+        Store::open(DatabaseLocation::Explicit(dir.join("gritt.db")))
+            .await
+            .unwrap(),
+    );
+    let mut config = config(None);
+    config.profiles.insert(
+        "other".into(),
+        ProviderProfile {
+            name: "other".into(),
+            protocol: Protocol::ChatCompletions,
+            base_url: "https://other.example/v1".into(),
+            key: SecretRef::for_profile("other", "OTHER_API_KEY"),
+            aliases: Default::default(),
+        },
+    );
+    config.aliases.insert("fast".into(), "other/model-x".into());
+    let telemetry = Arc::new(Telemetry::new(Arc::clone(&store), config.logging.clone()));
+    AgentBuilder {
+        config,
+        store,
+        telemetry,
+        keys: Arc::new(StaticKey(Secret::new(KEY))),
+        transport: Arc::new(FixtureTransport::new(Vec::new(), 17)),
+        catalog: ModelCatalog::new(),
+        cache: None,
+        workspace: Workspace::open(dir).unwrap(),
+        approval: ApprovalMode::DenyAll,
+    }
+}
+
+#[tokio::test]
+async fn catalog_warming_uses_the_profile_the_session_will_run_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let builder = two_profile_builder(dir.path()).await;
+    // A global alias onto the non-default profile.
+    assert_eq!(
+        builder
+            .session_profile(&SessionSelector::New { name: None }, None, Some("fast"))
+            .await
+            .unwrap(),
+        "other"
+    );
+    // A qualified name.
+    assert_eq!(
+        builder
+            .session_profile(
+                &SessionSelector::New { name: None },
+                None,
+                Some("other/model-y")
+            )
+            .await
+            .unwrap(),
+        "other"
+    );
+    // The default when nothing narrows it.
+    assert_eq!(
+        builder
+            .session_profile(&SessionSelector::New { name: None }, None, None)
+            .await
+            .unwrap(),
+        "openrouter"
+    );
+    // A resumed session keeps its own profile even when the flags say
+    // nothing, or name the default profile's model.
+    let agent = builder
+        .open(
+            SessionSelector::Named("on-other".into()),
+            None,
+            Some("fast"),
+            None,
+        )
+        .await
+        .unwrap();
+    drop(agent);
+    assert_eq!(
+        builder
+            .session_profile(&SessionSelector::Named("on-other".into()), None, None)
+            .await
+            .unwrap(),
+        "other"
+    );
+    let stored = builder
+        .store
+        .find_by_name("on-other")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.phase, Phase::Planning);
+}

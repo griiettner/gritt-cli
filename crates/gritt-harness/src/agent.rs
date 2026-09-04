@@ -776,6 +776,30 @@ impl AgentBuilder {
         Ok((resolved.profile, resolved.model))
     }
 
+    /// The provider profile a session will actually run on: the resumed
+    /// session's own profile when the selector names an existing native
+    /// session, else the profile the model name resolves to (qualified
+    /// name, alias, hint, or default). Callers warm the catalog for this
+    /// profile before opening, so capability and deprecation data belong
+    /// to the right provider. No side effects: the phase is left alone.
+    pub async fn session_profile(
+        &self,
+        selector: &SessionSelector,
+        profile_hint: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<String> {
+        if let Some(session) = self.find_session(selector, None).await? {
+            if let SessionKind::Native {
+                provider_profile, ..
+            } = session.kind
+            {
+                return Ok(provider_profile);
+            }
+        }
+        let (profile, _) = self.resolve_model(model, profile_hint)?;
+        Ok(profile)
+    }
+
     /// Finds the session a selector names, checking that it belongs to
     /// the current workspace and applying a requested phase. `None` when
     /// the selector names nothing yet.

@@ -279,15 +279,22 @@ fn selector(args: &SessionArgs) -> SessionSelector {
     }
 }
 
-/// Loads the model list for the profile the session will use, reporting
-/// a stale or missing list on stderr without stopping.
+/// Loads the model list for the profile the session will actually use
+/// (a resumed session's own profile, or the one the alias or qualified
+/// model resolves to), reporting a stale or missing list on stderr
+/// without stopping.
 async fn warm_catalog(builder: &AgentBuilder, args: &SessionArgs) {
-    let profile = args
-        .profile
-        .clone()
-        .or_else(|| builder.config.default_profile.clone());
-    let Some(profile) = profile else {
-        return;
+    let profile = match builder
+        .session_profile(
+            &selector(args),
+            args.profile.as_deref(),
+            args.model.as_deref(),
+        )
+        .await
+    {
+        Ok(profile) => profile,
+        // `open` reports the same problem with its full context.
+        Err(_) => return,
     };
     match builder.load_catalog(&profile).await {
         Ok(None) => {
