@@ -23,12 +23,35 @@ fn load_file(path: &Path) -> Result<Option<ConfigLayer>> {
     parse_toml(&text, &hint).map(Some)
 }
 
+/// Parses one config file. A parse error names the file, line, and column
+/// with the parser's message only; the offending source line is never
+/// repeated, because a malformed file may hold a key value.
 pub fn parse_toml(text: &str, hint: &str) -> Result<ConfigLayer> {
-    let value: toml::Value = toml::from_str(text)
-        .map_err(|error| Error::config(format!("invalid TOML in {hint}: {error}")))?;
+    let value: toml::Value = toml::from_str(text).map_err(|error| {
+        let at = error
+            .span()
+            .map(|span| line_column(text, span.start))
+            .map(|(line, column)| format!(" at line {line}, column {column}"))
+            .unwrap_or_default();
+        Error::config(format!("invalid TOML in {hint}{at}: {}", error.message()))
+    })?;
     let json = serde_json::to_value(value)
         .map_err(|error| Error::config(format!("cannot convert {hint}: {error}")))?;
     layer_from_value(json, hint)
+}
+
+fn line_column(text: &str, offset: usize) -> (usize, usize) {
+    let offset = offset.min(text.len());
+    let before = &text[..offset];
+    let line = before.matches('\n').count() + 1;
+    let column = before
+        .rsplit('\n')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .count()
+        + 1;
+    (line, column)
 }
 
 /// Environment overrides. `GRITT_DEFAULT_PROFILE` and `GRITT_DEFAULT_MODEL`
@@ -109,6 +132,19 @@ mod tests {
         let error = parse_toml(text, "test").unwrap_err();
         assert_eq!(error.kind, ErrorKind::SecretInConfig);
         assert!(!error.message.contains("sk-literal"));
+    }
+
+    #[test]
+    fn malformed_toml_never_echoes_the_source_line() {
+        let text = "[profiles.openai]\nname = \"openai\"\napi_key = \"sk-leak\n";
+        let error = parse_toml(text, "project config").unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Config);
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(!display.contains("sk-leak"), "{display}");
+        assert!(!debug.contains("sk-leak"), "{debug}");
+        assert!(display.contains("line 3"), "{display}");
+        assert!(display.contains("project config"), "{display}");
     }
 
     #[test]

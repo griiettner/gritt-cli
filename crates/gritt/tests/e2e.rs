@@ -332,8 +332,16 @@ fn ctrl_c_cancels_a_running_turn_with_exit_130() {
 fn a_missing_connector_fails_alone_and_native_keeps_working() {
     let provider = serve(vec![text_sse("Native is fine.")], false);
     let space = Space::new(provider.port);
-    // Cursor's CLI is not installed on the machines this test runs on; the
-    // control plane refuses before creating a session.
+    // Point Cursor at an executable that cannot exist, so the test proves
+    // the missing-executable path on every machine, installed CLI or not.
+    let missing = space.path().join("no-such-cursor-agent");
+    let config = space.path().join(".gritt/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "[connectors.executables]\ncursor = \"{}\"\n",
+        missing.display()
+    ));
+    std::fs::write(&config, text).unwrap();
     let failed = space.run(&[
         "run",
         "--no-models",
@@ -412,6 +420,22 @@ fn an_old_database_upgrades_in_place_and_keeps_its_rows() {
         stdout(&list),
         stderr(&list)
     );
+}
+
+#[test]
+fn doctor_never_echoes_a_malformed_config_line() {
+    let provider = serve(Vec::new(), false);
+    let space = Space::new(provider.port);
+    std::fs::write(
+        space.path().join(".gritt/config.toml"),
+        "[profiles.broken]\nname = \"broken\"\napi_key = \"sk-leak\n",
+    )
+    .unwrap();
+    let doctor = space.run(&["doctor"]);
+    let text = format!("{}{}", stdout(&doctor), stderr(&doctor));
+    assert!(text.contains("config error"), "{text}");
+    assert!(text.contains("invalid TOML"), "{text}");
+    assert!(!text.contains("sk-leak"), "{text}");
 }
 
 #[test]

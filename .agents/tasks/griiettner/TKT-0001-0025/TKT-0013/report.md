@@ -84,6 +84,14 @@ What landed:
 - The PTY pass is a committed test rather than a manual note, so it runs
   on every Unix CI run.
 
+- The compiler is pinned by `rust-toolchain.toml` (1.93.1). The verify
+  and release jobs install that exact version, both release scripts refuse
+  any other `rustc`, and every build writes a `BUILD-INFO` file beside
+  `SHA256SUMS` so a later rebuild can select the same toolchain.
+- Config parse errors report file, line, column, and the parser message
+  only. The offending source line is never echoed, because a malformed
+  file may hold a key value.
+
 ## Assumptions
 
 - The `release` job's Linux aarch64 runner is `ubuntu-24.04-arm`; if the
@@ -112,19 +120,25 @@ All from the worktree root on 2026-09-04:
 
 - `cargo fmt --all --check`: pass.
 - `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test --workspace`: pass, 189 tests, including the 8 e2e and 1
-  PTY tests; live provider and connector tests skipped without their gate.
+- `cargo test --workspace`: pass, 195 tests after the review fix round,
+  including 9 e2e tests and 4 PTY tests; live provider and connector tests
+  skipped without their gate.
 - `cargo build --release --locked`: pass.
-- `scripts/release/build.sh aarch64-apple-darwin` twice from a clean
-  target directory: both `fae1fa2953e8e7796893e6eb4f5ba6bec97d813496c36f87827fdc342993d064  gritt`;
-  `cmp` exit 0. Rust 1.93.1.
+- `scripts/release/build.sh aarch64-apple-darwin` twice from clean target
+  directories, after the toolchain pin: both
+  `fae1fa2953e8e7796893e6eb4f5ba6bec97d813496c36f87827fdc342993d064  gritt`,
+  identical `BUILD-INFO` (`rustc 1.93.1`, `toolchain 1.93.1`); `cmp` exit 0
+  for both files.
 - `cargo check --workspace --target x86_64-unknown-linux-gnu`: fails,
   environment limitation above.
 - `cargo check --workspace --target x86_64-pc-windows-msvc`: fails,
   environment limitation above.
 - `GRITT_LIVE_CONNECTOR_TESTS=1 cargo test -p gritt-connector --test live`:
-  pass. Claude Code 2.1.260 completed PONG in 4.6 s; Codex 0.153.2
-  completed PONG in 7.9 s.
+  pass, 3 tests. Claude Code 2.1.260 completed PONG in 4.1 s; Codex 0.153.2
+  completed PONG in 7.5 s; the new Codex resume smoke ran a first turn,
+  passed the recorded thread id back through the connector's continuation
+  path (`codex exec resume <thread_id>`), and the resumed turn returned the
+  remembered code word in 13.8 s for both turns.
 - `./target/release/gritt doctor` on a scratch workspace: prints every
   section, no secret.
 - `gritt-agent ticket validate --repo-root .`: ok, 0 warnings.
@@ -173,7 +187,27 @@ All from the worktree root on 2026-09-04:
   recordings once its CLI is available, stay as recorded in TKT-0012.
 - Replace the hand-authored provider fixtures with redacted live
   recordings when a key is available.
+- Carried forward from TKT-0011: the PTY test now covers the approval
+  view, the diff view, the command palette, the session list, `NO_COLOR`,
+  resize, and quit. Not verified in a real terminal: scrolling the diff
+  with `j`/`k`, multiline prompt editing with Ctrl-J, and resuming a
+  session from the list with Enter. These remain a manual check.
+- Carried forward from TKT-0012: the live Codex resume check is now
+  covered by `codex_live_resume`. The Claude Code `--resume` path and the
+  OpenCode `--session` path have fixture coverage only.
 
 ## Updates
 
-- None.
+- 2026-09-04 review fix round. The reviewer found six items: a floating
+  `stable` toolchain in the release job, config parse errors that echoed
+  the source line, an environment-dependent connector-failure test, an
+  incomplete follow-up ledger, and two documentation errors (`doctor`
+  inspecting pending migrations, `ring` called pure Rust). Fixes:
+  `rust-toolchain.toml` plus pinned installs, a version check, and
+  `BUILD-INFO` in both scripts and the workflow; `parse_toml` renders
+  line and column with the parser message only, with a unit test and an
+  e2e `doctor` test that plant a key in a malformed file; the Cursor test
+  points at a nonexistent executable inside its workspace; the PTY test
+  drives approval, diff, palette, sessions, and `NO_COLOR`, and a live
+  Codex resume smoke was added and run; the follow-up ledger names every
+  carried-forward item with its ticket; both docs corrected.

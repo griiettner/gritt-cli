@@ -4,7 +4,8 @@
 #
 # Mirrors build.sh: locked dependencies, SOURCE_DATE_EPOCH from the last
 # commit, and remapped source and cargo paths, so two builds of one commit on
-# one toolchain match byte for byte.
+# one toolchain match byte for byte. The toolchain is pinned by
+# rust-toolchain.toml and recorded in BUILD-INFO beside the checksum.
 param(
   [string]$Target = (rustc -vV | Select-String '^host: ' | ForEach-Object { $_.Line.Substring(6) }),
   [string]$Out = ''
@@ -23,14 +24,20 @@ $env:RUSTFLAGS = "$($env:RUSTFLAGS) --remap-path-prefix=$Root=/build --remap-pat
 
 Push-Location $Root
 try {
+  $Pinned = (Get-Content (Join-Path $Root 'rust-toolchain.toml') | Select-String '^channel = "(.*)"').Matches[0].Groups[1].Value
+  $RustcVersion = (rustc -vV | Select-String '^release: ' | ForEach-Object { $_.Line.Substring(9) })
+  if ($RustcVersion -ne $Pinned) { throw "rust-toolchain.toml pins $Pinned but rustc is $RustcVersion; run: rustup toolchain install $Pinned" }
+  $Commit = try { (git -C $Root rev-parse HEAD) } catch { 'unknown' }
   cargo build --release --locked --bin gritt --target $Target
   if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
   New-Item -ItemType Directory -Force -Path $Out | Out-Null
   $Bin = if ($Target -like '*windows*') { 'gritt.exe' } else { 'gritt' }
   Copy-Item (Join-Path $Root "target\$Target\release\$Bin") (Join-Path $Out $Bin) -Force
   $Hash = (Get-FileHash -Algorithm SHA256 (Join-Path $Out $Bin)).Hash.ToLower()
-  "$Hash  $Bin" | Set-Content -NoNewline -Path (Join-Path $Out 'SHA256SUMS')
+  "$Hash  $Bin`n" | Set-Content -NoNewline -Path (Join-Path $Out 'SHA256SUMS')
+  @("rustc $RustcVersion", "toolchain $Pinned", "target $Target", "commit $Commit", "source_date_epoch $($env:SOURCE_DATE_EPOCH)") -join "`n" | Set-Content -Path (Join-Path $Out 'BUILD-INFO')
   Get-Content (Join-Path $Out 'SHA256SUMS')
+  Get-Content (Join-Path $Out 'BUILD-INFO')
 } finally {
   Pop-Location
 }

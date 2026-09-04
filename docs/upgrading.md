@@ -13,16 +13,19 @@ a new version opens the database. Each is recorded once in
 or drops existing rows. An end-to-end test opens a database created by the
 first release schema, upgrades it, and checks that its sessions survive.
 
-Inspect the state before and after:
+Inspect the resulting state:
 
 ```bash
 gritt doctor
 ```
 
-The `database` section lists every known migration as applied or pending
-and reports whether the `gritt-agent` memory namespace is present. The
-memory namespace is owned by `gritt-agent` and is never migrated by
-`gritt`.
+Opening the database is what applies pending migrations, so `doctor`
+upgrades first and then reports. Its `database` section lists every known
+migration as applied after that upgrade and reports whether the
+`gritt-agent` memory namespace is present. To see the state before an
+upgrade, run the older binary's `doctor` or read `gritt_schema_migrations`
+directly. The memory namespace is owned by `gritt-agent` and is never
+migrated by `gritt`.
 
 ## Rolling back
 
