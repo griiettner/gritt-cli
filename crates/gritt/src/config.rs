@@ -112,6 +112,32 @@ mod tests {
     }
 
     #[test]
+    fn toml_embeddings_section_is_rejected() {
+        let text = "[embeddings]\nmodel = \"text-embedding-3-small\"\n";
+        let error = parse_toml(text, "project config").unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Config);
+        assert!(error.message.contains("embeddings"));
+    }
+
+    #[test]
+    fn env_layer_enables_embeddings_and_reranking() {
+        let vars = [
+            (
+                "AGENT_EMBEDDING_PROVIDER".to_string(),
+                "text-embedding-3-small".to_string(),
+            ),
+            (
+                "AGENT_RERANK_PROVIDER".to_string(),
+                "rerank-3.5".to_string(),
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let config = load_with(dir.path(), None, vars, ConfigLayer::default()).unwrap();
+        assert!(config.embeddings.as_ref().is_some_and(|e| e.is_enabled()));
+        assert!(config.rerank.as_ref().is_some_and(|r| r.is_enabled()));
+    }
+
+    #[test]
     fn profile_with_key_reference_parses() {
         let text = "[profiles.openrouter]\nname = \"openrouter\"\nprotocol = \"chat_completions\"\nbase_url = \"https://openrouter.ai/api/v1\"\n[profiles.openrouter.key]\nkeychain_service_entry = \"gritt/openrouter\"\nenv_var_name = \"OPENROUTER_API_KEY\"\n";
         let layer = parse_toml(text, "test").unwrap();

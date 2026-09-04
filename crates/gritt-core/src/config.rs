@@ -158,9 +158,32 @@ pub fn reject_literal_secrets(raw: &serde_json::Value, path_hint: &str) -> Resul
     walk(raw, "", path_hint)
 }
 
-/// Parses a layer from a JSON-shaped value after rejecting literal secrets.
+/// Sections that only the environment layer may populate. Embedding and
+/// reranking are opt-in through `AGENT_*` variables (TKT-0008 plan), so a
+/// config file must not be able to switch them on.
+pub const ENV_ONLY_SECTIONS: [&str; 2] = ["embeddings", "rerank"];
+
+/// Fails when a file layer tries to set an environment-only section.
+pub fn reject_env_only_sections(raw: &serde_json::Value, path_hint: &str) -> Result<()> {
+    if let serde_json::Value::Object(map) = raw {
+        if let Some(section) = ENV_ONLY_SECTIONS
+            .iter()
+            .find(|name| map.contains_key(**name))
+        {
+            return Err(Error::config(format!(
+                "config {path_hint} sets `{section}`, which is enabled only through the \
+                 AGENT_EMBEDDING_PROVIDER and AGENT_RERANK_PROVIDER environment variables"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Parses a file layer from a JSON-shaped value after rejecting literal
+/// secrets and environment-only sections.
 pub fn layer_from_value(raw: serde_json::Value, path_hint: &str) -> Result<ConfigLayer> {
     reject_literal_secrets(&raw, path_hint)?;
+    reject_env_only_sections(&raw, path_hint)?;
     serde_json::from_value(raw)
         .map_err(|error| Error::config(format!("invalid config {path_hint}: {error}")))
 }
@@ -254,6 +277,40 @@ mod tests {
         assert_eq!(error.kind, ErrorKind::SecretInConfig);
         assert!(error.message.contains("profiles.openai.api_key"));
         assert!(!error.message.contains("sk-literal"));
+    }
+
+    #[test]
+    fn file_layer_cannot_enable_embeddings_or_reranking() {
+        for section in ENV_ONLY_SECTIONS {
+            let raw = serde_json::json!({
+                section: {"model": "text-embedding-3-small",
+                    "gateway": {"base_url": null,
+                        "key": {"keychain_service_entry": "gritt/memory-gateway",
+                            "env_var_name": "AGENT_MEMORY_API_KEY"}}}
+            });
+            let error = layer_from_value(raw, "project config").unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Config);
+            assert!(error.message.contains(section));
+            assert!(error.message.contains("AGENT_EMBEDDING_PROVIDER"));
+        }
+    }
+
+    #[test]
+    fn environment_layer_still_enables_embeddings() {
+        let env: std::collections::HashMap<String, String> = [(
+            "AGENT_EMBEDDING_PROVIDER".to_string(),
+            "text-embedding-3-small".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let embedding = crate::embeddings::embedding_config(&env);
+        let layer = ConfigLayer {
+            embeddings: Some(embedding),
+            ..ConfigLayer::default()
+        };
+        let config = merge([layer]);
+        assert!(config.embeddings.as_ref().is_some_and(|e| e.is_enabled()));
+        assert!(config.rerank.is_none());
     }
 
     #[test]

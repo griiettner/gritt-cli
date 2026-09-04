@@ -79,6 +79,34 @@ pub struct ConnectorInfo {
     pub auth: AuthState,
 }
 
+/// Coarse task state a connector reports through [`Connector::inspect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    Idle,
+    Running,
+    AwaitingApproval,
+    AwaitingInput,
+    Completed,
+    Failed,
+    Cancelled,
+    Unknown,
+}
+
+/// Provider-neutral snapshot of a connector session. Raw connector detail
+/// travels only in `diagnostic`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorInspection {
+    pub session_id: SessionId,
+    /// The external agent's own task or thread identifier, when it has one.
+    pub external_id: Option<String>,
+    pub state: TaskState,
+    pub version: Option<String>,
+    pub auth: AuthState,
+    pub capabilities: ConnectorCapabilities,
+    pub diagnostic: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskRequest {
     pub session_id: SessionId,
@@ -101,4 +129,8 @@ pub trait Connector: Send + Sync {
     /// Resumes a session when the connector supports it; otherwise returns a
     /// connector error naming the missing capability.
     fn resume(&self, session_id: &SessionId) -> BoxFuture<'_, Result<EventStream<'_>>>;
+    /// Reports the current state of a session when
+    /// [`ConnectorCapabilities::inspect`] is set; otherwise returns a
+    /// connector error naming the missing capability.
+    fn inspect(&self, session_id: &SessionId) -> BoxFuture<'_, Result<ConnectorInspection>>;
 }

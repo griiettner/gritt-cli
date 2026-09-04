@@ -33,7 +33,10 @@ The root `LICENSE` is MIT. Every later worker builds on these seams.
 - Base branch: `feature/tkt-0008-gritt-cli` at `ab3e34a`.
 - Worktree: `/Users/griiettner/Projects/grittflow/gritt-cli-tkt-0009`.
 - Branch: `tkt-0009-01-contracts`.
-- Commit and PR: recorded in the PM handoff and the PR description.
+- Commits: `f6165bd` (initial delivery) and the review fix commit listed
+  under Updates.
+- PR: https://github.com/griiettner/gritt-cli/pull/1 into
+  `feature/tkt-0008-gritt-cli`.
 
 ## Key Decisions
 
@@ -58,6 +61,14 @@ The root `LICENSE` is MIT. Every later worker builds on these seams.
   reference is a table, so it passes.
 - `Secret` prints `[redacted]` for Debug and Display and has no Serialize
   impl. `SecretRef` is the only persisted form.
+- The `embeddings` and `rerank` sections are environment-only. A project or
+  user file that sets either fails to load with a `Config` error naming the
+  `AGENT_EMBEDDING_PROVIDER` and `AGENT_RERANK_PROVIDER` variables.
+- `Connector::inspect` returns a `ConnectorInspection` snapshot (session id,
+  external id, task state, version, auth, capabilities, diagnostic) so the
+  plan's "resume or inspect when supported" contract has a seam for
+  TKT-0012. Connectors without the `inspect` capability return a connector
+  error.
 - Keys resolve keychain first, environment second, through `Keychain` and
   `EnvSource` traits so tests use fakes. `gritt key-set <profile>` reads the
   key from stdin and writes only the keychain.
@@ -98,12 +109,19 @@ All run from the worktree root on 2026-09-04:
 
 - `cargo fmt --all --check`: pass.
 - `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test --workspace`: pass, 22 tests (12 core, 4 harness, 6 binary).
+- `cargo test --workspace`: pass, 26 tests after the fix round (14 core,
+  4 harness, 8 binary); 22 before it.
 - `cargo build --release`: pass, 1m 34s cold.
 - `cargo test --manifest-path .agents/cli/Cargo.toml`: pass, 69 tests; the
   memory command contract is unchanged.
 - `gritt --version`, `gritt --help`, `gritt config`: run.
-- `gritt-agent ticket validate` and `chain-check`: see PM handoff.
+- `gritt-agent ticket validate --repo-root .`: `tkt_validate ok (0
+  warnings)`.
+- `gritt-agent ticket chain-check --repo-root . --ticket TKT-0009 --base
+  feature/tkt-0008-gritt-cli`: `tkt_chain_check ok (0 warning(s))`, branch
+  `tkt-0009-01-contracts` based on the base tip `ab3e34a`.
+- `gritt-agent ticket chain-check --repo-root . --ticket TKT-0009 --base
+  main`: `tkt_chain_check ok (0 warning(s))`.
 
 ## Completion Gate
 
@@ -132,4 +150,10 @@ All run from the worktree root on 2026-09-04:
 
 ## Updates
 
-- None.
+- 2026-09-04 review fix round. The chain reviewer returned `needs-fix` with
+  three findings: the `Connector` trait advertised `inspect` in its
+  capabilities without an operation; `embeddings` and `rerank` could be
+  enabled from a config file instead of the environment only; and this
+  report deferred its chain-check evidence to the PM handoff. All three are
+  fixed in the second commit on the branch, with tests for the file-layer
+  rejection and the environment path, and the validation set was rerun.
