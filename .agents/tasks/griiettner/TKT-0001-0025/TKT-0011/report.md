@@ -280,9 +280,6 @@ crossterm 0.29.0 (MIT), diffy 0.5.2 (MIT OR Apache-2.0), uuid 1.26.0
 - TKT-0013 must document in the tool and privacy docs that shell commands
   run with the user's authority and are not confined to the workspace,
   and that the stronger prompt is the only guard for paths outside it.
-- After a cancel during a print or REPL approval, the blocking stdin read
-  that was waiting for the answer lingers until the next line arrives, so
-  the next typed line may be consumed as that stale answer.
 
 ## Reviewer Verdict
 

@@ -131,7 +131,7 @@ tickets:
   - id: TKT-0008
     namespace: griiettner
     title: Build the complete Gritt local AI coding agent CLI
-    status: in_progress
+    status: done
     owner: griiettner
     priority: normal
     created: 2026-09-04
@@ -140,6 +140,7 @@ tickets:
       concept: .agents/tasks/griiettner/TKT-0001-0025/TKT-0008/concept.md
       plan: .agents/tasks/griiettner/TKT-0001-0025/TKT-0008/plan.md
       task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0008/task.md
+      report: .agents/tasks/griiettner/TKT-0001-0025/TKT-0008/report.md
     dependencies: []
     areas:
       - .agents/tasks
@@ -245,13 +246,14 @@ tickets:
   - id: TKT-0014
     namespace: griiettner
     title: Review integrated Build the complete Gritt local AI coding agent CLI chain
-    status: planning
+    status: done
     owner: griiettner
     priority: normal
     created: 2026-09-04
     updated: 2026-09-04
     artifacts:
       task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0014/task.md
+      report: .agents/tasks/griiettner/TKT-0001-0025/TKT-0014/report.md
     dependencies:
       - TKT-0009
       - TKT-0010

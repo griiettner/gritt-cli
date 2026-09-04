@@ -3,7 +3,7 @@ id: TKT-0008
 namespace: griiettner
 title: Build the complete Gritt local AI coding agent CLI
 artifact: task
-status: in_progress
+status: done
 owner: griiettner
 created: 2026-09-04
 updated: 2026-09-04
