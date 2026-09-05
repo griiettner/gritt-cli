@@ -40,7 +40,7 @@ command -v codex >/dev/null 2>&1
 | Role | CLI | Model | Effort | Fallback |
 | --- | --- | --- | --- | --- |
 | Orchestrator | Claude Code | Fable 5.1 | medium | none |
-| Implementation | Grok CLI | Grok 4.6 | high | none |
+| Implementation | Grok CLI | Grok 4.6 | high | forked in-harness Claude Code agent, Opus 4.8, high |
 | Reviewer | Codex | GPT 6 Astra | model default | GPT 5.6 Sol, medium |
 | Author, report, and TKT writer | Codex | GPT 5.6 Luna | model default | none |
 
@@ -56,6 +56,15 @@ codex exec --model gpt-5.6-luna "<prompt>"
 
 The GPT 5.6 Sol command is only the reviewer fallback. Use it when GPT 6 Astra
 is unavailable, not as a general substitute for another role.
+
+Grok CLI's non-interactive route (`grok -p` / `--always-approve`) is blocked
+by the auto-mode safety classifier in this environment, categorically, not as
+a permission-allow-list gap. When `grok -p` is unavailable or classifier-
+blocked, use a forked in-harness Claude Code agent (the Agent tool, not a
+`claude -p` subprocess) running model `claude-opus-4-8` at effort `high` as
+the Implementation worker instead. This is the only role with a fallback that
+changes CLI, not just model — record every use of it in the chain/orchestrator
+report; it must never happen silently.
 
 ## Local overrides
 
@@ -78,4 +87,6 @@ Ignore an override when it is absent, empty, or set to `none`.
 - Make every delegated prompt self-contained because workers start cold.
 - Tell reviewers not to edit application code, then inspect the diff after review.
 - Use GPT 5.6 Sol only after the GPT 6 Astra reviewer call fails.
+- Use the Opus 4.8 in-harness fallback only after `grok -p` fails or is
+  classifier-blocked, and state the deviation in the report every time.
 - Do not silently replace any other unavailable CLI or model. Report the blocker.

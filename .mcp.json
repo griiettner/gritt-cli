@@ -1,17 +1,8 @@
 {
   "mcpServers": {
-    "gritt-local-memory": {
+    "gritt": {
       "command": ".agents/gritt-agent",
-      "args": ["memory", "serve"]
-    },
-    "turso-local-memory": {
-      "command": "tursodb",
-      "args": [
-        "--readonly",
-        "--experimental-index-method",
-        ".agents/brain/data/agent-memory.db",
-        "--mcp"
-      ]
+      "args": ["mcp", "serve"]
     }
   }
 }

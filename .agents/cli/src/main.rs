@@ -8,7 +8,7 @@ use gritt_agent::ticket::new_chain::{
     DEFAULT_AREAS, DEFAULT_BASE_BRANCH, DEFAULT_BRANCH_PATTERN, DEFAULT_MERGE_POLICY,
     DEFAULT_SKILLS,
 };
-use gritt_agent::{codex, migrate, repo, skill, ticket, Result};
+use gritt_agent::{codex, delegate, migrate, repo, skill, ticket, Result};
 
 /// Project-local agent CLI for Gritt: local memory, tickets, and skills.
 #[derive(Parser)]
@@ -28,6 +28,16 @@ enum Command {
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
+    },
+    /// Unified MCP server exposing all Gritt tools to one harness session.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+    /// Supervised headless delegation to installed agent CLIs.
+    Delegate {
+        #[command(subcommand)]
+        command: DelegateCommand,
     },
     /// Ticket allocation, chains, identity, index sync, and validation.
     Ticket {
@@ -64,6 +74,18 @@ enum MemoryCommand {
         limit: u16,
     },
     /// Serve the local memory tools over MCP on stdin and stdout.
+    Serve,
+}
+
+#[derive(Subcommand)]
+enum DelegateCommand {
+    /// Serve the delegation tool over MCP on stdin and stdout.
+    Serve,
+}
+
+#[derive(Subcommand)]
+enum McpCommand {
+    /// Serve the unified Gritt MCP server on stdin and stdout.
     Serve,
 }
 
@@ -311,6 +333,19 @@ async fn run(cli: Cli) -> Result<i32> {
                     Ok(0)
                 }
             }
+        }
+        Command::Delegate {
+            command: DelegateCommand::Serve,
+        } => {
+            delegate::mcp::serve().await?;
+            Ok(0)
+        }
+        Command::Mcp {
+            command: McpCommand::Serve,
+        } => {
+            let repo = resolve()?;
+            gritt_agent::mcp::serve(&repo).await?;
+            Ok(0)
         }
         Command::Ticket { command } => {
             let repo = resolve()?;

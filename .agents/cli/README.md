@@ -42,7 +42,8 @@ the working directory to the nearest folder that contains `.agents/`.
 | --- | --- |
 | `memory index` | Index `*.md`, `*.mdx`, `*.yaml`, `*.yml`, and `*.json` files into `.agents/brain/data/agent-memory.db`, removing entries for deleted files |
 | `memory search <query> [--limit N]` | Print ranked chunk citations as `path:start-end` |
-| `memory serve` | Reindex, then serve `search_local_memory` and `read_local_memory` over stdio MCP |
+| `memory serve` | Reindex, then serve `search_local_memory` and `read_local_memory` over stdio MCP. Superseded by `mcp serve` |
+| `mcp serve` | Serve the unified Gritt MCP server: memory tools plus supervised `delegate_run` headless runs of grok, codex, and claude (see ADR-012) |
 | `ticket new --title <title>` | Allocate the next contiguous id in the developer namespace, scaffold `task.md`, and sync indexes. Rolls back when the sync fails |
 | `ticket new-chain --title <title> --step <slug:title> ...` | Allocate consecutive ids for an orchestrator, one worker per `--step` (at least two), and a final reviewer; scaffold every `task.md` with `chain_role`, `chain_parent`, `chain_children`, and `dependencies`; sync indexes and roll back when the sync fails |
 | `ticket identity [--refresh] [--namespace <login>] [--no-persist]` | Print the resolved GitHub login and its source, and store it in `.agents/state/identity.local.yaml` |

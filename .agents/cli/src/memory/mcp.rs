@@ -126,7 +126,8 @@ async fn dispatch(
     }
 }
 
-async fn call_tool(
+/// Executes one tool call. Shared with the unified `gritt-agent mcp` server.
+pub async fn call_tool(
     connection: &Connection,
     params: &Value,
 ) -> std::result::Result<Value, (i64, String)> {

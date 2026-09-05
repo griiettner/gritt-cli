@@ -106,3 +106,14 @@ memories:
       - preparing a release
       - adding a non-terminal frontend
       - changing the control-plane boundary
+  - id: ADR-012
+    title: Unified MCP server and MCP-based agent delegation
+    file: ADR-012-unified-mcp-and-delegation.md
+    tags:
+      - mcp
+      - delegation
+      - tooling
+    read_when:
+      - wiring Gritt tools into an agent harness
+      - adding tools to the Gritt MCP server
+      - changing how agent CLIs are invoked headlessly

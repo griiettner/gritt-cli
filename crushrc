@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Unified Gritt MCP server: memory search/read plus supervised agent
+# delegation, in one server (mirrors .mcp.json).
+
+mcp add gritt \
+  --command .agents/gritt-agent \
+  --args mcp --args serve

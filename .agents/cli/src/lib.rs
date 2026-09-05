@@ -6,10 +6,12 @@
 //! workspace; this crate is repository tooling only.
 
 pub mod codex;
+pub mod delegate;
 pub mod error;
 pub mod frontmatter;
 pub mod fsx;
 pub mod memory;
+pub mod mcp;
 pub mod migrate;
 pub mod repo;
 pub mod skill;
