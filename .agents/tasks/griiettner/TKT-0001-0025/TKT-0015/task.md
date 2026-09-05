@@ -3,10 +3,10 @@ id: TKT-0015
 namespace: griiettner
 title: Build an OpenCode-inspired full-screen agent TUI with generic MCP harness support
 artifact: task
-status: planning
+status: in_progress
 owner: griiettner
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-05
 chain_role: orchestrator
 chain_children:
   - TKT-0016

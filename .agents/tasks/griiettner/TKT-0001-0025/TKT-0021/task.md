@@ -3,10 +3,10 @@ id: TKT-0021
 namespace: griiettner
 title: Review integrated OpenCode-inspired agent TUI and MCP harness chain
 artifact: task
-status: planning
+status: done
 owner: griiettner
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-05
 chain_role: reviewer
 chain_parent: TKT-0015
 dependencies:
