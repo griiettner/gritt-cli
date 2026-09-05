@@ -296,7 +296,7 @@ the 4 native-session cases listed in the commit messages.
 
 ## Completion Gate
 
-- **Acceptance**: yes, after the two rounds of review fixes recorded in the
+- **Acceptance**: yes, after the three rounds of review fixes recorded in the
   update below.
   Every configured entry has a state and a non-empty explanation; supported
   servers initialize and list tools; a turn calls the exact tool identity it
@@ -316,7 +316,7 @@ the 4 native-session cases listed in the commit messages.
   durable contract changes; both are noted below.
 - **Validation**: every check above passed; nothing was skipped except the
   pre-existing live provider tests, which need keys. The final figures after
-  round 2 are 319 workspace tests over three consecutive runs.
+  round 3 are 324 workspace tests over three consecutive runs.
 - **Security and safety**: the change adds process launching and network
   access, both gated. Reading the file authorizes nothing; a definition runs
   only after an explicit approval keyed to its fingerprint. Children get an
@@ -389,4 +389,8 @@ the 4 native-session cases listed in the commit messages.
   CLI path, generation-checked trust reads, cancellable queue admission, owned
   HTTP notification and reply tasks, compliant server-request replies, input
   limits without framing bypasses, and backend prediction aligned with
-  `ControlPlane::open`.
+  `ControlPlane::open`. Round 3, also appended there: continuous launch
+  ownership through shutdown, bearer-token redaction, serialized trust
+  decisions, order-independent cancellation, bounded auxiliary HTTP
+  admission, cross-chunk SSE framing, and opening MCP on first entry into a
+  native session.

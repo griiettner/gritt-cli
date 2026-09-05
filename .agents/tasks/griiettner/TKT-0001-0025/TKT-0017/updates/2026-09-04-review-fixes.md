@@ -348,3 +348,118 @@ can run at a time, so the check fails while another `gritt-agent mcp serve`
 holds that lock, including one started by a reviewer in the same worktree.
 That is an environment collision, not a defect: rerun once the other process
 has exited.
+
+---
+
+# 2026-09-05 Round 3 review fixes
+
+## Trigger
+
+The third review returned `needs-fix` with seven confirmed defects: two High
+and five Medium. Round-2 fixes 3, 7, and 9 were confirmed resolved. The rest
+were partial in the same way as before: the named case was closed but the
+mechanism still had a gap one step out. Two of the seven were defects the
+round-2 *fix* introduced (the SSE accounting and the auxiliary task spawn
+order), which is worth saying plainly.
+
+## Changes per finding
+
+**1. High — shutdown lost ownership of startup connections.** Two gaps.
+`finish_launch` released a completed connection while `start` still held it
+inside `.collect()` until every handshake in the batch finished, so during
+that window shutdown could see neither a pending launch nor an installed
+entry. And the outer `timeout` wrapped the whole of `connect_inner`, so a
+handshake that ran long had its future dropped before the cleanup, leaving a
+live child that only shutdown's drain would find. Ownership is now continuous:
+the launch registration travels on `Established` and is released only under
+the same lock that installs or closes the connection, and the deadline wraps
+the negotiation alone so every exit path runs its own cleanup. `start` also
+treats `closing` as stale. The test now asserts the processes are gone *as
+shutdown returns*, with no polling, because the signal handler calls
+`process::exit` immediately afterwards.
+
+**2. High — bearer tokens escaped redaction.** Only the complete header value
+was registered, so `Authorization: Bearer sk-...` protected the whole string
+while a server echoing just `sk-...` slipped through exact-string replacement.
+`credential_variants` now registers the complete value and the credential part
+after an authentication scheme, with a length floor so a stray short word
+cannot be redacted out of every message. The HTTP echo regression now
+configures `Bearer <token>` and the endpoint echoes the bare token into its
+metadata, a tool description, and a result. Reverting the fix fails that test.
+
+**3. Medium — a rejected stale approval stayed persisted.** `decide` wrote the
+trust record and only then validated the generation, so a delayed approval
+could overwrite a newer denial and return an error without undoing the write;
+a later restart then read Approved and launched the denied definition.
+Decisions are now serialized and the state is re-read inside that guard, so
+persistence and application happen in the same order and a stale write cannot
+replace a newer decision. The regression delays the write, lands a denial
+behind it, and asserts the denial is what is persisted, what the runtime
+shows, and what a subsequent restart reads.
+
+**4. Medium — cancelled queued calls could still reach the server.** The abort
+is queued behind the request it cancels, so a writer resuming after a block
+sent the request first and only then read the cancellation. Cancellation is
+now recorded on the connection itself, before anything is queued, and both
+transports check it immediately before writing. The regression fills the pipe
+to a server that has paused its reader, cancels a call sitting in the backlog,
+lets the server drain, and asserts the marker that server writes on receipt
+never appears. Reverting the check fails it.
+
+**5. Medium — auxiliary HTTP work was still unbounded.** Tasks were spawned
+and stored before acquiring a permit, so eight stalled POSTs held the permits
+while every later notification and server reply piled up behind them with its
+payload. Admission is now bounded by the same cap as execution: over the
+limit, the message is dropped rather than queued, which is safe for
+best-effort traffic. Each auxiliary POST also has its own deadline so a
+stalled one releases its permit and its slot instead of holding both until
+shutdown. The regression cancels sixty calls against an endpoint that accepts
+notifications and never answers, and asserts only a bounded handful ever
+reached it.
+
+**6. Medium — the SSE budget failed on chunk boundaries.** The round-2
+accounting looked for a delimiter within a single chunk, so a `\n\n` split
+across two chunks never reset the pending count and a valid stream would
+eventually be rejected at the event bound; a chunk carrying many events also
+counted as one. Framing is now tracked byte by byte with the newline run
+carried across chunks, the way the parser sees the stream. Tests cover a
+delimiter split across chunks, in both `\n\n` and `\r\n\r\n` form, and fifty
+valid events arriving both as one burst and byte by byte.
+
+**7. Medium — switching to a native session left MCP unloaded.** Opening was
+gated on the backend resolved at startup, so a run that began on an external
+agent and later resumed into a native session had no servers, and the turn
+refresh only touched entries that were already loaded. `McpRuntime::ensure_open`
+opens once and does nothing after, and the native agent calls it at the start
+of every turn. The regression builds a native session against a runtime that
+was never opened and asserts the tool is discovered, gated, approved, and
+called.
+
+## Validation
+
+- `cargo fmt --all --check`: pass.
+- `cargo clippy --workspace --all-targets -- -D warnings`: pass. Three
+  findings in the new code (an unused accessor, `manual_repeat_n`, and an
+  unused helper left by a stale edit) were fixed before the final run.
+- `cargo test --workspace --no-fail-fast`: pass, 324 tests, 0 failed, over
+  three consecutive runs.
+- `GRITT_LIVE_MCP_TESTS=1 cargo test -p gritt-harness --test mcp_live_smoke`:
+  pass. The single configured entry, `gritt`, is ready on protocol
+  `2025-06-18` with 3 tools. No tool was called.
+
+Five tests were added and two rewritten: three in `mcp_runtime.rs`, one in
+`mcp_native_session.rs`, and three unit tests for the SSE budget replacing the
+two that described the old accounting.
+
+Two of the new regressions were checked against the unfixed code: reverting
+the bearer-token variants fails the HTTP echo test, and reverting the
+pre-write cancellation check fails the queued-cancellation test. The others
+assert states that the unfixed paths could not reach.
+
+## Note on the previous session
+
+This round was started once before and interrupted. Findings 1, 2, 3, 4, and 7
+were already implemented in the worktree when work resumed; findings 5 and 6,
+every regression, and the validation were completed here. One file was briefly
+reverted by mistake during recovery and restored from the stash object, then
+de-duplicated against the interrupted session's version.
