@@ -10,13 +10,15 @@ use clap::{Args, Parser, Subcommand};
 use gritt_connector::{default_connectors_with_secrets, environment_secrets, parse_connector_id};
 use gritt_core::connector::{AuthState, ConnectorId};
 use gritt_core::event::{ApprovalDecision, EventKind};
+use gritt_core::mcp::{McpRuntimeSettings, McpServerState, TrustDecision};
 use gritt_core::session::{Phase, SessionStore};
 use gritt_core::{Error, Result};
 use gritt_harness::agent::{AgentBuilder, ApprovalMode, SessionSelector, TurnStatus, Ui};
 use gritt_harness::control::ControlPlane;
+use gritt_harness::mcp::McpRuntime;
 use gritt_harness::modes::print::{PrintUi, PrintUiOptions};
 use gritt_harness::modes::repl::{line_prompter, run_repl, CancelSlot, LineInput};
-use gritt_harness::store::{resolve_location, Store};
+use gritt_harness::store::{resolve_location, Store, StoreTrustStore};
 use gritt_harness::telemetry::Telemetry;
 use gritt_harness::tools::Workspace;
 use gritt_harness::tui::run_tui;
@@ -43,6 +45,24 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// `.mcp.json` is read, never written. Approval is Gritt's own record and
+/// lives in the session database.
+#[derive(Subcommand)]
+enum McpCommand {
+    /// Show every configured server with its state and tools.
+    List,
+    /// Approve launching a server as it is defined right now. Editing the
+    /// entry afterwards asks again.
+    Trust {
+        server: String,
+        /// Record a refusal instead of an approval.
+        #[arg(long)]
+        deny: bool,
+    },
+    /// Forget every recorded decision for this workspace.
+    Forget,
 }
 
 #[derive(Subcommand)]
@@ -76,6 +96,11 @@ enum Command {
     Tui {
         #[command(flatten)]
         session: SessionArgs,
+    },
+    /// Inspect and approve the workspace's MCP servers.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
     },
     /// Manage sessions.
     Session {
@@ -189,17 +214,88 @@ async fn builder(
     } else {
         ModelCache::default_dir().map(ModelCache::new)
     };
+    let transport: Arc<dyn gritt_provider::transport::HttpTransport> =
+        Arc::new(ReqwestTransport::new()?);
+    let workspace_root = Workspace::open(workspace)?;
+    // One runtime per workspace, shared by every session the builder opens.
+    // Creating it launches nothing: a server runs only once its exact
+    // definition has been approved for this workspace.
+    let mcp = Arc::new(
+        McpRuntime::new(workspace_root.root(), McpRuntimeSettings::default())
+            .with_http_transport(Arc::clone(&transport))
+            .with_trust(StoreTrustStore::new(Arc::clone(&store))),
+    );
     Ok(AgentBuilder {
         config,
         store,
         telemetry,
         keys: Arc::new(resolver()),
-        transport: Arc::new(ReqwestTransport::new()?),
+        transport,
         catalog: ModelCatalog::new(),
         cache,
-        workspace: Workspace::open(workspace)?,
+        workspace: workspace_root,
         approval,
+        mcp: Some(mcp),
     })
+}
+
+/// Reads `.mcp.json` and starts every approved server before the first turn.
+///
+/// A malformed file is a warning, not a failed run: the rest of Gritt keeps
+/// working and the reason is visible. Entries that are not running are
+/// listed with their reason so nothing is silently skipped.
+async fn start_mcp(builder: &AgentBuilder, verbose: bool) {
+    let Some(mcp) = builder.mcp() else { return };
+    let snapshots = match mcp.open(&gritt_harness::CancellationToken::new()).await {
+        Ok(snapshots) => snapshots,
+        Err(error) => {
+            eprintln!("warning: MCP configuration: {error}");
+            return;
+        }
+    };
+    for snapshot in snapshots {
+        match &snapshot.state {
+            McpServerState::Ready => {
+                if verbose {
+                    eprintln!(
+                        "mcp: {} ready with {} tool(s)",
+                        snapshot.name, snapshot.tool_count
+                    );
+                }
+            }
+            McpServerState::AwaitingApproval => eprintln!(
+                "mcp: {} is waiting for approval; run `gritt mcp trust {}`",
+                snapshot.name, snapshot.name
+            ),
+            other => eprintln!("mcp: {} is {}", snapshot.name, describe_state(other)),
+        }
+    }
+}
+
+fn describe_state(state: &McpServerState) -> String {
+    let reason = state.reason();
+    let label = match state {
+        McpServerState::AwaitingApproval => "awaiting approval",
+        McpServerState::Denied => "denied",
+        McpServerState::Starting => "starting",
+        McpServerState::Ready => "ready",
+        McpServerState::Failed { .. } => "failed",
+        McpServerState::Stopped => "stopped",
+        McpServerState::Invalid { .. } => "invalid",
+        McpServerState::UnsupportedTransport { .. } => "an unsupported transport",
+    };
+    if reason.is_empty() {
+        label.to_owned()
+    } else {
+        format!("{label}: {reason}")
+    }
+}
+
+/// Ends every MCP connection. Owned stdio children never outlive the run.
+async fn stop_mcp(plane: &ControlPlane) {
+    if let Some(mcp) = plane.builder.mcp() {
+        mcp.shutdown().await;
+    }
 }
 
 /// Wraps the builder in the control plane with every external connector
@@ -376,6 +472,9 @@ async fn run_print(
         warm_catalog(&builder, args).await;
     }
     let approval = builder.approval;
+    if connector.is_none() {
+        start_mcp(&builder, verbose).await;
+    }
     let plane = plane(builder)?;
     let mut agent = plane
         .open(
@@ -399,6 +498,7 @@ async fn run_print(
         Ok(outcome) => outcome,
         Err(error) => {
             ui.finish();
+            stop_mcp(&plane).await;
             return Ok(if error.kind == gritt_core::ErrorKind::Cancelled {
                 ExitCode::from(130)
             } else {
@@ -407,6 +507,7 @@ async fn run_print(
         }
     };
     ui.finish();
+    stop_mcp(&plane).await;
     // The closing newline is the last write; a pipe that broke there
     // still means the reader did not get the whole answer.
     if let Some(message) = ui.output_error() {
@@ -440,6 +541,9 @@ async fn run_repl_mode(
         warm_catalog(&builder, args).await;
     }
     let approval = builder.approval;
+    if connector.is_none() {
+        start_mcp(&builder, verbose).await;
+    }
     let plane = plane(builder)?;
     let agent = plane
         .open(
@@ -457,7 +561,7 @@ async fn run_repl_mode(
     // approval prompter takes answers from it, never both at once.
     let input = LineInput::from_reader(std::io::BufReader::new(std::io::stdin()));
     let options = print_options(verbose, approval, &input, &slot);
-    run_repl(
+    let result = run_repl(
         &plane,
         agent,
         &input,
@@ -466,7 +570,9 @@ async fn run_repl_mode(
         options,
         slot,
     )
-    .await?;
+    .await;
+    stop_mcp(&plane).await;
+    result?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -485,6 +591,9 @@ async fn run_tui_mode(
     if connector.is_none() {
         warm_catalog(&builder, args).await;
     }
+    if connector.is_none() {
+        start_mcp(&builder, false).await;
+    }
     let plane = plane(builder)?;
     let agent = plane
         .open(
@@ -495,7 +604,69 @@ async fn run_tui_mode(
             phase_flag(args),
         )
         .await?;
-    run_tui(&plane, agent).await?;
+    let result = run_tui(&plane, agent).await;
+    stop_mcp(&plane).await;
+    result?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn mcp_command(
+    workspace: &Path,
+    database: Option<&Path>,
+    command: McpCommand,
+) -> Result<ExitCode> {
+    let store = open_store(workspace, database).await?;
+    let root = Workspace::open(workspace)?;
+    let runtime = McpRuntime::new(root.root(), McpRuntimeSettings::default())
+        .with_http_transport(Arc::new(ReqwestTransport::new()?))
+        .with_trust(StoreTrustStore::new(Arc::clone(&store)));
+    let cancel = gritt_harness::CancellationToken::new();
+    match command {
+        McpCommand::Forget => {
+            store
+                .clear_mcp_trust(&root.root().to_string_lossy())
+                .await?;
+            println!("forgot every MCP approval for {}", root.root().display());
+            return Ok(ExitCode::SUCCESS);
+        }
+        McpCommand::Trust { server, deny } => {
+            let config = runtime.read_config()?;
+            runtime.load(&config).await?;
+            let decision = if deny {
+                TrustDecision::Denied
+            } else {
+                TrustDecision::Approved
+            };
+            runtime.decide(&server, decision).await?;
+            println!(
+                "{server} is now {}",
+                if deny { "denied" } else { "approved" }
+            );
+        }
+        McpCommand::List => {}
+    }
+    let snapshots = runtime.open(&cancel).await?;
+    if snapshots.is_empty() {
+        println!(
+            "no servers configured in {}",
+            gritt_harness::mcp::CONFIG_FILE
+        );
+    }
+    for snapshot in &snapshots {
+        println!(
+            "{:<24} {:<10} {}",
+            snapshot.name,
+            snapshot
+                .transport
+                .map(|kind| kind.to_string())
+                .unwrap_or_else(|| "-".into()),
+            describe_state(&snapshot.state)
+        );
+        for tool in &snapshot.tools {
+            println!("    {tool}");
+        }
+    }
+    runtime.shutdown().await;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -753,6 +924,7 @@ async fn main() -> ExitCode {
             run_repl_mode(&workspace, database, &session, verbose).await
         }
         Some(Command::Tui { session }) => run_tui_mode(&workspace, database, &session).await,
+        Some(Command::Mcp { command }) => mcp_command(&workspace, database, command).await,
         Some(Command::Session { command }) => session_command(&workspace, database, command).await,
         Some(Command::Connectors) => connectors_command(&workspace, database).await,
         Some(Command::Doctor) => doctor_command(&workspace, database).await,

@@ -469,8 +469,9 @@ fn an_old_database_upgrades_in_place_and_keeps_its_rows() {
     let doctor = space.run(&["doctor"]);
     assert!(doctor.status.success(), "stderr: {}", stderr(&doctor));
     let text = stdout(&doctor);
-    assert!(text.contains("product migrations: 3/3 applied"), "{text}");
+    assert!(text.contains("product migrations: 4/4 applied"), "{text}");
     assert!(text.contains("0003_session_told_phase: applied"), "{text}");
+    assert!(text.contains("0004_mcp_trust: applied"), "{text}");
     assert!(text.contains("sessions: 1"), "{text}");
     assert!(!text.contains(KEY));
     let list = space.run(&["session", "list"]);
