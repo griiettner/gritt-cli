@@ -146,3 +146,103 @@ sidebar no longer shows context occupancy at all on the live path, and the
 walkthrough evidence section already stated that no human ran it in a real
 terminal, which the reviewer confirmed is still outstanding for the
 chain's verification requirement.
+
+---
+
+# Round 2
+
+## Trigger
+
+Re-review of PR #11 at `2c24cac` returned `needs-fix` with one High and
+five Medium findings, all confirmed. Round-1 fixes 2, 4, 8, 9, 12 and the
+refresh half of 11 were confirmed met; the rest were partial.
+
+## Changes per finding
+
+**1 (High) — superseding a resume stranded its reservation.** A session
+change shared `Runtime::work` with ordinary requests, so `/sessions`
+during a pending resume called `spawn`, aborted the open, and left
+`pending_open` and `session_transition` behind. The session-list response
+then cleared the loading line, and the reducer's Escape only looked at
+`running` and `loading`, so nothing could unwind it: prompts, settings,
+and further resumes stayed refused for the rest of the run. The session
+change now has its own slot, `Runtime::open_work`, which no other request
+touches, and `take_pending_open` aborts that task with the reservation so
+the two cannot separate. Escape checks `session_transition` as well.
+`a_session_list_during_a_resume_leaves_the_transition_recoverable` drives
+the real `Action::RefreshSessions` plus `UiMsg::Sessions` sequence and
+asserts both that the open survives it and that Escape recovers; the
+round-1 supersession test no longer clears the reservation by hand, it
+cancels the way a user does.
+
+**2 — keychain reads still blocked the first draw.** `event_loop` still
+called `profile_summaries()` synchronously. That line was meant to go in
+round 1 and did not: the script that removed it aborted on a later
+assertion before writing the file, and the follow-up script only reapplied
+the other half. It is gone; `load_profiles` is the only path, and the
+comment now says why nothing may enumerate profiles before the first draw.
+
+**3 — the concurrency permit outlived nothing.** `blocking` held the
+permit in the future that awaits the worker, so a cancelled caller
+released it while its `spawn_blocking` was still running. The permit is
+now owned and moved into the closure.
+`cancelling_a_scan_does_not_release_its_worker_s_permit` cancels six scans
+against a `git` that blocks for 120 ms and asserts the peak concurrent
+invocation count stays within the bound; against the previous code it
+records six. `record_write`'s `exists()` stat moved into the same blocking
+path, because the event handler awaits it after every turn.
+
+**4 — MCP operations lost their cancellation ownership.** `Runtime::mcp`
+now holds an id and a token. `begin_mcp` signals the operation it replaces
+rather than dropping the token, and `UiMsg::McpOutcome` carries the id, so
+a completion from a superseded action clears neither the live token nor
+the loading line. `overlapping_mcp_actions_keep_their_own_tokens_and_completions`
+covers both halves.
+
+**5 — setup bypassed session pinning.** `setup_outcome` adopted the saved
+profile into the draft and the sidebar without the pinning check, so
+`/connect` → add provider → save from a pinned session displayed a
+provider the driver was not using. The shared `refuses_pinned_change` now
+runs before the selection is adopted; the write itself is unaffected and
+the explanation says a new session is what uses it. Two tests: the pinned
+case saves without moving the selection or the composer draft, and the
+unpinned case still adopts the profile and returns the catalog reload,
+which also closes the reviewer's optional note that the returned action
+was unasserted.
+
+**6 — a delayed MCP approval could authorize mutation during a turn.**
+The definition response was accepted whenever no approval was pending,
+even if a turn had started since it was requested, and the decision
+handler mutated without rechecking. The response is now refused when
+settings are not editable, with a notice naming the server, and the
+`Decide` handler enforces the same guard before touching the runtime.
+`a_definition_arriving_after_a_turn_started_is_refused` covers both.
+
+**Optional, applied.** Focused tests for explicit connector confirmation
+(including that Escape starts nothing), for the Gritt-owned MCP label
+beside the connector's unreported state, and for the catalog action
+returned after a successful setup.
+
+## Validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, 0 errors |
+| `cargo test --workspace --no-fail-fast` | pass, 474 passed, 0 failed |
+| `cargo test -p gritt --test tui_pty` | pass, 10 passed |
+| `cargo test -p gritt-harness` | pass, 309 passed |
+| `GRITT_LIVE_MCP_TESTS=1 ... --test mcp_live_smoke` | pass, 1 passed |
+
+Honest note on one flake: `the_first_prompt_creates_the_session_and_new_keeps_it`
+failed once when run immediately after the full workspace suite, and its
+message was not captured. It passed on five subsequent runs, including the
+same back-to-back sequence and a run under synthetic CPU load, so it reads
+as contention rather than a defect. It is recorded here rather than left
+out; if it recurs, the PTY waits are the place to look.
+
+## Remaining follow-up
+
+Unchanged from round 1, minus the items closed above. The manual terminal
+walkthrough is still outstanding and is still the chain's, not this
+ticket's, to close.

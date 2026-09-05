@@ -265,9 +265,9 @@ Run from `/Users/griiettner/Projects/grittflow/gritt-cli-tkt-0019`:
 | --- | --- |
 | `cargo fmt --all --check` | pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | pass |
-| `cargo test -p gritt-harness` | pass, 301 tests over 10 targets |
+| `cargo test -p gritt-harness` | pass, 309 tests over 10 targets |
 | `cargo test -p gritt --test tui_pty` | pass, 10 tests |
-| `cargo test --workspace --no-fail-fast` | pass, 466 tests, 0 failed |
+| `cargo test --workspace --no-fail-fast` | pass, 474 tests, 0 failed |
 | `GRITT_LIVE_MCP_TESTS=1 cargo test -p gritt-harness --test mcp_live_smoke` | pass, 1 test, after the note below |
 
 The live smoke check failed on its first run in this worktree with
@@ -279,11 +279,12 @@ files on a fresh worktree, measured here at 41 s before it answers
 check passed in 1.08 s. Wiring `McpRuntimeSettings` to `config.toml`
 remains TKT-0017's follow-up.
 
-New test counts: 18 reducer tests in `src/tui/app/tests.rs`, 5
+New test counts: 22 reducer tests in `src/tui/app/tests.rs`, 8
 runtime-handler tests in `src/tui/run.rs`, 10 in the new
 `tests/tui_integration.rs`, 4 PTY tests in `crates/gritt/tests/tui_pty.rs`,
-3 new snapshot screens at 5 sizes each, and 5 unit tests in
-`src/changes.rs`. The counts above are after the review fixes.
+3 new snapshot screens at 5 sizes each, and 6 unit tests in
+`src/changes.rs`. The counts above are after both rounds of review
+fixes.
 
 `.agents/gritt-agent ticket chain-check --ticket TKT-0019 --base main`:
 
@@ -346,7 +347,7 @@ What a human should still check in a real terminal:
 
 ## Completion Gate
 
-- **Acceptance:** yes, after the review fixes. The first version was
+- **Acceptance:** yes, after two rounds of review fixes. The first version was
   overstated on three of these and the review was right: installed agents
   could not actually be selected, connector sessions could not resume, and
   late asynchronous work was only partly rejected — catalogs and scans
@@ -358,7 +359,11 @@ What a human should still check in a real terminal:
   modal overlay, invokes approved native MCP tools, preserves the composer
   draft and scroll through dialogs and through a cancelled open, keeps
   connector authority separate, and rejects every late asynchronous
-  result.
+  result. Round 2 found three more reachable failures in that last claim
+  and in cancellation — a session change could be stranded by a later
+  request, an MCP operation could lose its cancellation token to the next
+  one, and a slow definition read could put a launch approval in front of
+  a running turn — all closed and covered; see the update file.
 - **Scope:** yes. No new MCP protocol feature, no provider request
   mapping change, no LSP or skill execution, no visual redesign, and no
   user documentation. No cost or context figure whose source is unknown.
