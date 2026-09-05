@@ -70,6 +70,57 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_millis(300));
             return;
         }
+        // Completes startup, stops reading for a while so the client's pipe
+        // fills and its queue backs up, then drains everything. A call that
+        // was cancelled while it sat in that backlog must never arrive.
+        "pausedreader" => {
+            let stdin = std::io::stdin();
+            let mut started = false;
+            for line in stdin.lock().lines() {
+                let Ok(line) = line else { break };
+                let Ok(message) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                    continue;
+                };
+                let id = message.get("id").cloned();
+                let params = message.get("params").cloned().unwrap_or_default();
+                match message
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                {
+                    "initialize" => send(&serde_json::json!({
+                        "jsonrpc": "2.0", "id": id, "result": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "pausedreader", "version": "0.1.0"}}})),
+                    "tools/list" => {
+                        send(&serde_json::json!({"jsonrpc": "2.0", "id": id,
+                            "result": {"tools": [tool("filler", "fills the pipe"),
+                                                 tool("guarded", "must never be called")]}}));
+                        started = true;
+                    }
+                    "tools/call" => {
+                        let name = params
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        if name == "guarded" {
+                            mark("FIXTURE_MARKER", name);
+                        }
+                        send(&serde_json::json!({"jsonrpc": "2.0", "id": id,
+                            "result": {"content": [{"type": "text", "text": name}]}}));
+                    }
+                    _ => {}
+                }
+                if started {
+                    started = false;
+                    // The pause: the client keeps writing into a pipe nobody
+                    // is draining, so its requests queue up behind it.
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
+            }
+            return;
+        }
         // Completes startup, then stops reading stdin for good, so the
         // client's pipe to it fills on the next write. Shutdown must not
         // depend on that write, and a caller must not hang on it.

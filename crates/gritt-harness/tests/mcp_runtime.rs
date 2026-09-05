@@ -265,7 +265,12 @@ async fn a_silent_server_stops_at_the_initialization_deadline() {
     let McpServerState::Failed { reason } = state_of(&snapshots, "never-answers") else {
         panic!("{snapshots:?}");
     };
-    assert!(reason.contains("not ready within"), "{reason}");
+    // Either the handshake's own deadline or the overall one; both say the
+    // server ran out of time rather than failing for another reason.
+    assert!(
+        reason.contains("did not answer within") || reason.contains("not ready within"),
+        "{reason}"
+    );
     runtime.shutdown().await;
 }
 
@@ -700,6 +705,23 @@ async fn all_gone(pids: &[u32]) -> bool {
     false
 }
 
+/// Asserts every pid is already gone, with no waiting.
+///
+/// Used where the guarantee is that a call has *finished* the cleanup by the
+/// time it returns; polling afterwards would accept a late exit and hide
+/// exactly the gap being tested.
+fn assert_gone_now(pids: &[u32], message: &str) {
+    #[cfg(unix)]
+    for pid in pids {
+        assert!(!is_alive(*pid), "{message} (pid {pid} still alive)");
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pids, message);
+        eprintln!("skipped: process liveness is only checked on unix");
+    }
+}
+
 /// Asserts every pid is gone, or reports the check as skipped.
 async fn assert_all_gone(pids: &[u32], message: &str) {
     #[cfg(unix)]
@@ -803,6 +825,14 @@ mod http_fixture {
                     .get("authorization")
                     .cloned()
                     .unwrap_or_else(|| "no-secret".into());
+                // What a careless server actually logs: the credential
+                // without its scheme, which exact-string redaction of the
+                // whole header value would miss.
+                let bare = secret
+                    .rsplit(char::is_whitespace)
+                    .next()
+                    .unwrap_or(&secret)
+                    .to_owned();
                 let message: serde_json::Value =
                     serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
                 let rpc = message
@@ -875,7 +905,7 @@ mod http_fixture {
                             serde_json::json!({
                                 "jsonrpc": "2.0", "id": id,
                                 "result": {"tools": [{"name": "reflect",
-                                    "description": format!("reflects {secret}"),
+                                    "description": format!("reflects {bare}"),
                                     "inputSchema": {"type": "object"}}]}
                             })
                         } else {
@@ -909,7 +939,7 @@ mod http_fixture {
                             Mode::EchoSecret => sse(&[serde_json::json!({
                                 "jsonrpc": "2.0", "id": id,
                                 "result": {"content": [{"type": "text",
-                                    "text": format!("issued for {secret}")}]}})]),
+                                    "text": format!("issued for {bare}")}]}})]),
                             Mode::Mixed | Mode::StallNotifications | Mode::ServerRequests => {
                                 sse(&[serde_json::json!({"jsonrpc": "2.0", "id": id,
                                     "result": {"content": [{"type": "text",
@@ -1115,7 +1145,10 @@ async fn a_stdio_server_cannot_echo_its_own_credential_back_out() {
 
 #[tokio::test]
 async fn an_http_server_cannot_echo_its_own_credential_back_out() {
-    std::env::set_var("GRITT_TEST_ECHO_HTTP_SECRET", ECHOED);
+    // The supported shape for an HTTP credential: a scheme and a token. The
+    // server echoes only the token, which is what a whole-value redaction
+    // would let through.
+    std::env::set_var("GRITT_TEST_ECHO_HTTP_SECRET", format!("Bearer {ECHOED}"));
     let endpoint = http_fixture::start(http_fixture::Mode::EchoSecret).await;
     let dir = workspace(serde_json::json!({"remote-leaky": {
         "type": "http",
@@ -1133,7 +1166,12 @@ async fn an_http_server_cannot_echo_its_own_credential_back_out() {
     assert_eq!(entry.state, McpServerState::Ready);
     assert!(!serde_json::to_string(&snapshots).unwrap().contains(ECHOED));
     let tools = runtime.tool_set().await;
-    assert!(!tools.definitions()[0].description.contains(ECHOED));
+    let description = &tools.definitions()[0].description;
+    assert!(
+        !description.contains(ECHOED),
+        "the bare token reached a tool description: {description}"
+    );
+    assert!(description.contains("[redacted]"), "{description}");
     let result = call(
         &runtime,
         "mcp__remote-leaky__reflect",
@@ -1142,7 +1180,11 @@ async fn an_http_server_cannot_echo_its_own_credential_back_out() {
     )
     .await
     .unwrap();
-    assert!(!result.output.contains(ECHOED), "{}", result.output);
+    assert!(
+        !result.output.contains(ECHOED),
+        "the bare token reached a tool result: {}",
+        result.output
+    );
     assert!(result.output.contains("[redacted]"), "{}", result.output);
     runtime.shutdown().await;
 }
@@ -1582,19 +1624,47 @@ async fn the_handshake_is_ordered_and_server_requests_are_answered() {
 /// lifecycle change in the middle of the await.
 struct PausedTrust {
     release: tokio::sync::Semaphore,
+    /// Held separately so a test can delay persistence without also
+    /// delaying reads.
+    writes: tokio::sync::Semaphore,
     decision: gritt_core::mcp::TrustDecision,
+    /// Every decision actually written, in the order it was written.
+    written: std::sync::Mutex<Vec<gritt_core::mcp::TrustDecision>>,
 }
 
 impl PausedTrust {
     fn new(decision: gritt_core::mcp::TrustDecision) -> Arc<Self> {
         Arc::new(Self {
             release: tokio::sync::Semaphore::new(0),
+            // Writes run freely unless a test says otherwise.
+            writes: tokio::sync::Semaphore::new(usize::from(u16::MAX)),
             decision,
+            written: std::sync::Mutex::new(Vec::new()),
         })
     }
 
     fn release(&self) {
         self.release.add_permits(1);
+    }
+
+    /// Blocks every later write until `release_write` is called, once per
+    /// write that should be allowed through.
+    fn hold_writes(&self) {
+        let available = self.writes.available_permits();
+        if available > 0 {
+            self.writes
+                .try_acquire_many(available as u32)
+                .expect("paused trust writes")
+                .forget();
+        }
+    }
+
+    fn release_write(&self) {
+        self.writes.add_permits(1);
+    }
+
+    fn written(&self) -> Vec<gritt_core::mcp::TrustDecision> {
+        self.written.lock().unwrap().clone()
     }
 }
 
@@ -1614,15 +1684,29 @@ impl gritt_harness::mcp::trust::TrustStore for PausedTrust {
             // through and pause nothing.
             let permit = self.release.acquire().await.expect("paused trust");
             permit.forget();
-            Ok(Some(self.decision))
+            // Reads reflect writes, as a real store does; otherwise a test
+            // could not tell which decision actually survived.
+            Ok(Some(
+                self.written
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .copied()
+                    .unwrap_or(self.decision),
+            ))
         })
     }
 
     fn record<'a>(
         &'a self,
-        _record: gritt_core::mcp::TrustRecord,
+        record: gritt_core::mcp::TrustRecord,
     ) -> gritt_core::session::BoxFuture<'a, gritt_core::Result<()>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            let permit = self.writes.acquire().await.expect("paused trust writes");
+            permit.forget();
+            self.written.lock().unwrap().push(record.decision);
+            Ok(())
+        })
     }
 }
 
@@ -1749,13 +1833,15 @@ async fn shutdown_during_startup_takes_the_children_with_it() {
         "shutdown waited on the stalled handshake for {:?}",
         began.elapsed()
     );
-    // Both children are gone, including the one that only ever existed
-    // inside an in-flight initialization.
-    assert_all_gone(
+    // Both children are gone the moment shutdown returns, including the one
+    // that only ever existed inside an in-flight initialization. Asserted
+    // without waiting: the signal handler calls `process::exit` as soon as
+    // shutdown returns, so a child that only dies shortly afterwards would
+    // survive in the real path.
+    assert_gone_now(
         &[ready, stalled],
         "a child outlived a shutdown during startup",
-    )
-    .await;
+    );
     assert!(runtime.child_pids().await.is_empty());
     // The interrupted start must not install anything afterwards.
     let snapshots = starting.await.unwrap();
@@ -1981,6 +2067,208 @@ async fn a_stalled_notification_cannot_hold_up_shutdown() {
     assert!(
         began.elapsed() < Duration::from_secs(30),
         "shutdown waited on a stalled notification for {:?}",
+        began.elapsed()
+    );
+}
+
+// --- Round 3 review fixes ----------------------------------------------
+
+#[tokio::test]
+async fn a_delayed_approval_cannot_overwrite_a_newer_denial() {
+    let dir = workspace(serde_json::json!({"contested": stdio("basic")}));
+    let trust = PausedTrust::new(gritt_core::mcp::TrustDecision::Approved);
+    let runtime =
+        Arc::new(McpRuntime::new(dir.path(), settings()).with_trust(Arc::clone(&trust) as Arc<_>));
+    let cancel = CancellationToken::new();
+    trust.release();
+    runtime.open(&cancel).await.unwrap();
+
+    // An approval whose write is held open.
+    trust.hold_writes();
+    let approving = Arc::clone(&runtime);
+    let approve = tokio::spawn(async move {
+        approving
+            .decide("contested", gritt_core::mcp::TrustDecision::Approved)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A denial arrives while that write is still in flight.
+    let denying = Arc::clone(&runtime);
+    let deny = tokio::spawn(async move {
+        denying
+            .decide("contested", gritt_core::mcp::TrustDecision::Denied)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Let both writes through, oldest first.
+    trust.release_write();
+    trust.release_write();
+    approve.await.unwrap().ok();
+    deny.await.unwrap().unwrap();
+
+    // The denial is the decision that stands, in memory and in the store.
+    assert_eq!(
+        state_of(&runtime.snapshots().await, "contested"),
+        &McpServerState::Denied
+    );
+    assert_eq!(
+        trust.written().last(),
+        Some(&gritt_core::mcp::TrustDecision::Denied),
+        "a stale approval was persisted over the denial: {:?}",
+        trust.written()
+    );
+
+    // And a restart reads that denial rather than launching the server.
+    trust.release();
+    runtime.restart("contested", &cancel).await.unwrap();
+    assert_eq!(
+        state_of(&runtime.snapshots().await, "contested"),
+        &McpServerState::Denied,
+        "a restart launched a denied definition"
+    );
+    assert!(runtime.child_pids().await.is_empty());
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_call_cancelled_while_queued_never_reaches_the_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("guarded-was-called");
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        serde_json::json!({"mcpServers": {"paused": {
+            "command": FIXTURE,
+            "args": ["pausedreader"],
+            "env": {"FIXTURE_MARKER": marker.to_string_lossy()},
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let runtime = Arc::new(
+        McpRuntime::new(
+            dir.path(),
+            McpRuntimeSettings {
+                init_timeout: Duration::from_secs(10),
+                call_timeout: Duration::from_secs(120),
+                ..settings()
+            },
+        )
+        .with_trust(MemoryTrustStore::trust_all()),
+    );
+    let cancel = CancellationToken::new();
+    let snapshots = runtime.open(&cancel).await.unwrap();
+    assert_eq!(state_of(&snapshots, "paused"), &McpServerState::Ready);
+    let tools = runtime.tool_set().await;
+    let filler = tools.lookup("mcp__paused__filler").cloned().unwrap();
+    let guarded = tools.lookup("mcp__paused__guarded").cloned().unwrap();
+
+    // The server has stopped reading for a few seconds. Fill its pipe so the
+    // guarded call has to wait in Gritt's own queue rather than going
+    // straight out.
+    let padding = serde_json::json!({"text": "f".repeat(64 * 1024)});
+    let filling = CancellationToken::new();
+    let mut backlog = Vec::new();
+    for _ in 0..40 {
+        let runtime = Arc::clone(&runtime);
+        let filler = filler.clone();
+        let padding = padding.clone();
+        let token = filling.clone();
+        backlog.push(tokio::spawn(async move {
+            let _ = runtime.call(&filler, &padding, &token).await;
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The call under test queues behind that backlog, then is cancelled
+    // while the writer is still blocked.
+    let guarded_token = CancellationToken::new();
+    let calling = Arc::clone(&runtime);
+    let held = guarded.clone();
+    let token = guarded_token.clone();
+    let guarded_call = tokio::spawn(async move {
+        calling
+            .call(&held, &serde_json::json!({"text": "go"}), &token)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    guarded_token.cancel();
+    let outcome = guarded_call.await.unwrap();
+    assert!(outcome.is_err(), "the cancelled call reported success");
+
+    // The server wakes up and drains everything still queued. The cancelled
+    // request must not be among it, even though its abort was queued behind
+    // it.
+    filling.cancel();
+    for task in backlog {
+        let _ = task.await;
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(
+        !marker.exists(),
+        "a cancelled call reached the server once the reader resumed"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn stalled_auxiliary_posts_cannot_accumulate() {
+    let endpoint = http_fixture::start(http_fixture::Mode::StallNotifications).await;
+    let dir = workspace(serde_json::json!({"stalls": {
+        "type": "http",
+        "url": endpoint.url,
+    }}));
+    let runtime = http_runtime(dir.path());
+    let cancel = CancellationToken::new();
+    runtime.open(&cancel).await.unwrap();
+    let frozen = runtime
+        .tool_set()
+        .await
+        .lookup("mcp__stalls__fetch")
+        .cloned()
+        .unwrap();
+
+    // Every cancellation produces a notification POST this endpoint accepts
+    // and never answers. Far more than the auxiliary budget allows.
+    let mut attempts = Vec::new();
+    for _ in 0..60 {
+        let runtime = Arc::clone(&runtime);
+        let frozen = frozen.clone();
+        attempts.push(tokio::spawn(async move {
+            let token = CancellationToken::new();
+            let canceller = token.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                canceller.cancel();
+            });
+            let _ = runtime.call(&frozen, &serde_json::json!({}), &token).await;
+        }));
+    }
+    for attempt in attempts {
+        let _ = attempt.await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Admission is bounded, so only a handful of those POSTs were ever sent;
+    // the rest were dropped rather than queued up with their payloads.
+    let notifications = endpoint
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(line, _)| line.contains("notifications/cancelled"))
+        .count();
+    assert!(
+        notifications <= 16,
+        "stalled notifications accumulated: {notifications} reached the endpoint"
+    );
+
+    // And the stalled work is released rather than held to the end.
+    let began = std::time::Instant::now();
+    runtime.shutdown().await;
+    assert!(
+        began.elapsed() < Duration::from_secs(30),
+        "shutdown waited on stalled auxiliary work for {:?}",
         began.elapsed()
     );
 }

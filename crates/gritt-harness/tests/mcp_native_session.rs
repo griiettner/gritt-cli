@@ -120,6 +120,12 @@ struct Fixture {
 
 /// A workspace with one MCP server that records every tool call it receives.
 async fn fixture(policy: PolicyConfig, approval: ApprovalMode) -> Fixture {
+    fixture_with(policy, approval, true).await
+}
+
+/// `pre_open` mirrors how the binary starts: a run that begins natively opens
+/// the runtime up front, and a run that begins on an external agent does not.
+async fn fixture_with(policy: PolicyConfig, approval: ApprovalMode, pre_open: bool) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("tool-was-called");
     std::fs::write(
@@ -154,7 +160,9 @@ async fn fixture(policy: PolicyConfig, approval: ApprovalMode) -> Fixture {
         )
         .with_trust(MemoryTrustStore::trust_all()),
     );
-    mcp.open(&CancellationToken::new()).await.unwrap();
+    if pre_open {
+        mcp.open(&CancellationToken::new()).await.unwrap();
+    }
     let builder = AgentBuilder {
         config,
         store,
@@ -315,4 +323,39 @@ async fn mcp_tools_reach_the_provider_in_coding_and_never_in_planning() {
     assert!(planning.request_preview("do the thing").tools.is_empty());
     let _ = &fixture.dir;
     fixture.plane.builder.mcp().unwrap().shutdown().await;
+}
+
+#[tokio::test]
+async fn entering_a_native_session_loads_mcp_even_when_the_run_began_elsewhere() {
+    // A run that starts on an external agent never opens the runtime: that
+    // agent owns its own MCP clients. Resuming into a native session is the
+    // first moment Gritt needs its own servers, and the turn must not go out
+    // without them.
+    let policy = PolicyConfig {
+        rules: vec![rule("mcp__*", PolicyOutcome::Ask)],
+        fallback: PolicyOutcome::Deny,
+    };
+    let fixture = fixture_with(policy, ApprovalMode::Ask, false).await;
+    let mcp = fixture.plane.builder.mcp().unwrap().clone();
+    assert!(!mcp.is_open(), "the runtime should start unopened");
+    assert!(mcp.tool_set().await.is_empty());
+
+    let mut driver = open(&fixture).await;
+    let mut ui = RecordingUi {
+        answers: vec![ApprovalDecision::Approved],
+        ..RecordingUi::default()
+    };
+    let outcome = driver.run_turn("search the notes", &mut ui).await.unwrap();
+    assert_eq!(outcome.status, TurnStatus::Completed);
+
+    // The server was discovered, offered, approved, and called.
+    assert!(mcp.is_open());
+    assert_eq!(ui.asked.len(), 1);
+    assert_eq!(ui.asked[0].resource, "mcp:probe/echo");
+    let results = tool_results(&ui.events);
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].1, "{results:?}");
+    assert_eq!(results[0].2, "echo ran");
+    assert!(fixture.marker.exists());
+    mcp.shutdown().await;
 }
