@@ -107,7 +107,16 @@ enum UiMsg {
     },
     /// Credential availability, computed off the event path because
     /// resolving one reaches the keychain.
-    Profiles(Vec<crate::setup::ProfileSummary>),
+    ///
+    /// `generation` is the configuration this was computed against.
+    /// Resolving a credential blocks for as long as the operating system
+    /// wants, and setup can install a whole new configuration while it
+    /// waits, so a result that outlived its own configuration is refused
+    /// rather than applied (TKT-0020).
+    Profiles {
+        generation: u64,
+        profiles: Vec<crate::setup::ProfileSummary>,
+    },
     /// A plane rebuilt around re-read configuration, with the summaries
     /// that were computed against it, both off the event path.
     Reloaded {
@@ -345,6 +354,10 @@ struct Runtime {
     operations: u64,
     /// The session change in flight, if any.
     pending_open: Option<PendingOpen>,
+    /// How many configurations have been installed. Starts at zero and
+    /// moves only when a reload replaces the plane, so a profile lookup
+    /// can say which configuration it answered for.
+    config_generation: u64,
     /// The MCP operation in flight, identified so a late completion from
     /// a previous one cannot clear the current one's state.
     ///
@@ -621,6 +634,7 @@ async fn event_loop(
         open_work: None,
         operations: 0,
         pending_open: None,
+        config_generation: 0,
         mcp: None,
     };
     let mut idle_agent: Option<Box<dyn Driver>> = None;
@@ -946,9 +960,15 @@ fn record_and_scan(runtime: &Runtime, generation: u64, writes: Vec<String>) {
 fn load_profiles(runtime: &Runtime) {
     let plane = Arc::clone(&runtime.plane);
     let tx = runtime.tx.clone();
+    // Captured with the plane it is about to read. Whatever this returns
+    // describes that configuration and no later one.
+    let generation = runtime.config_generation;
     runtime.spawn_detached(async move {
         if let Ok(profiles) = tokio::task::spawn_blocking(move || plane.profile_summaries()).await {
-            let _ = tx.send(UiMsg::Profiles(profiles));
+            let _ = tx.send(UiMsg::Profiles {
+                generation,
+                profiles,
+            });
         }
     });
 }
@@ -1245,7 +1265,20 @@ async fn on_message(
             }
             app.request_mcp_approval(server, definition);
         }
-        UiMsg::Profiles(profiles) => {
+        UiMsg::Profiles {
+            generation,
+            profiles,
+        } => {
+            // A lookup that started before a reload describes the
+            // configuration that reload replaced. Applying it would drop
+            // the profile setup has just added: the new provider vanishes
+            // from `/connect`, and `/effort` stops offering explicit
+            // levels because it can no longer find the provider's protocol
+            // in this list. Reopening a picker does not re-read profiles,
+            // so nothing would put it back (TKT-0020).
+            if generation != runtime.config_generation {
+                return Ok(Action::None);
+            }
             app.profiles = profiles;
             app.refresh_connection_picker();
         }
@@ -1254,6 +1287,10 @@ async fn on_message(
             // has it. The rebuilt plane shares every handle, so nothing
             // already open is disturbed.
             runtime.plane = Arc::new(*plane);
+            // Everything computed against the previous configuration is
+            // now stale, including any profile lookup still blocked on the
+            // keychain.
+            runtime.config_generation = runtime.config_generation.wrapping_add(1);
             app.profiles = profiles;
             app.refresh_connection_picker();
         }
@@ -1503,6 +1540,11 @@ async fn on_action(
             // can block for as long as the operating system wants, so none
             // of it runs on the loop.
             let operation = runtime.next_operation();
+            // The configuration this save starts from. If it reloads, the
+            // `Reloaded` below installs a newer one; if it does not, the
+            // profiles it computed still belong to this generation and are
+            // refused should anything else have reloaded meanwhile.
+            let generation = runtime.config_generation;
             runtime.spawn(
                 app,
                 Work::Setup,
@@ -1534,7 +1576,10 @@ async fn on_action(
                                 profiles,
                             });
                         } else {
-                            let _ = tx.send(UiMsg::Profiles(profiles));
+                            let _ = tx.send(UiMsg::Profiles {
+                                generation,
+                                profiles,
+                            });
                         }
                     }
                     let _ = tx.send(UiMsg::Setup {
@@ -1753,6 +1798,7 @@ impl LoopHarness {
             open_work: None,
             operations: 0,
             pending_open: None,
+            config_generation: 0,
             mcp: None,
         };
         Self {
@@ -2194,6 +2240,81 @@ mod tests {
         );
     }
 
+    fn summary(name: &str) -> crate::setup::ProfileSummary {
+        crate::setup::ProfileSummary {
+            name: name.into(),
+            protocol: Protocol::ChatCompletions,
+            base_url: "https://example.invalid/v1".into(),
+            credential: crate::setup::CredentialState::Available,
+            is_default: false,
+        }
+    }
+
+    /// A profile lookup that started before a reload must not replace the
+    /// list that reload installed.
+    ///
+    /// Startup resolves every profile's credential, which reaches the
+    /// keychain and blocks for as long as the operating system wants. A
+    /// user who runs `/connect` and saves a provider in that window gets a
+    /// reload with the new profile in it. If the startup lookup then lands,
+    /// applying it drops the provider that was just configured: it
+    /// disappears from `/connect`, and `/effort` stops offering explicit
+    /// levels because it can no longer find the provider's protocol in the
+    /// list. Reopening a picker does not re-read profiles, so nothing puts
+    /// it back.
+    ///
+    /// The order here is the defect's order: the refreshed configuration is
+    /// applied first, and the older startup response is delivered after it.
+    #[tokio::test]
+    async fn a_profile_lookup_from_before_a_reload_is_refused() {
+        let mut h = harness().await;
+        // What startup found: only the profile that was configured then.
+        let startup_generation = h.runtime.config_generation;
+        let stale = vec![summary("openrouter")];
+
+        // Setup saves a new provider and the plane is rebuilt around the
+        // re-read configuration.
+        let reloaded = (*h.runtime.plane).clone();
+        h.message(UiMsg::Reloaded {
+            plane: Box::new(reloaded),
+            profiles: vec![summary("openrouter"), summary("anthropic")],
+        })
+        .await;
+        assert_eq!(
+            h.app.profiles.len(),
+            2,
+            "the reload did not install its own list"
+        );
+
+        // The startup lookup finally returns, describing the configuration
+        // that reload replaced.
+        h.message(UiMsg::Profiles {
+            generation: startup_generation,
+            profiles: stale,
+        })
+        .await;
+
+        let names: Vec<&str> = h.app.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["openrouter", "anthropic"],
+            "a profile lookup from before the reload replaced the list it installed"
+        );
+
+        // And a lookup issued against the current configuration still
+        // applies, so the guard delays nothing that is still true.
+        h.message(UiMsg::Profiles {
+            generation: h.runtime.config_generation,
+            profiles: vec![summary("anthropic")],
+        })
+        .await;
+        assert_eq!(
+            h.app.profiles.len(),
+            1,
+            "a current profile lookup was refused"
+        );
+    }
+
     fn approval_message(
         generation: u64,
         id: &str,
@@ -2294,6 +2415,7 @@ mod tests {
             open_work: None,
             operations: 0,
             pending_open: None,
+            config_generation: 0,
             mcp: None,
         };
         Harness {

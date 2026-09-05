@@ -658,4 +658,5 @@ REPL's stale-approval read window (pre-existing).
 
 ## Updates
 
+- [2026-09-05 final review fix](updates/2026-09-05-final-review-fix.md)
 - [2026-09-05 review fixes](updates/2026-09-05-review-fixes.md)
