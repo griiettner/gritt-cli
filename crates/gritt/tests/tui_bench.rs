@@ -75,7 +75,10 @@ fn assert_no_profiles_resolve(dir: &Path, home: &Path) {
             "--workspace",
             &dir.to_string_lossy(),
             "--database",
-            &dir.join("gritt.db").to_string_lossy(),
+            // Its own database: the running fixture holds an exclusive
+            // lock on the session one, and a probe that cannot open it
+            // reports a lock error rather than the configuration.
+            &dir.join("doctor-probe.db").to_string_lossy(),
             "doctor",
         ])
         .env("HOME", home)
@@ -86,11 +89,25 @@ fn assert_no_profiles_resolve(dir: &Path, home: &Path) {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    // A diagnostic that failed to run proves nothing, so the exit status is
+    // checked before its content.
+    assert!(
+        output.status.success(),
+        "doctor failed, so the fixture was never verified: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The affirmative result, not merely the absence of a credential
+    // string: doctor says this when the merged configuration has no
+    // profiles at all.
+    assert!(
+        text.contains("no profiles configured"),
+        "the fixture resolved at least one profile:\n{text}"
+    );
     assert!(
         !text.contains("key available") && !text.contains("no key for profile"),
         "a profile resolved in the fixture, so startup still reaches the keychain:\n{text}"
     );
-    record("idle fixture: zero profiles resolve, so no keychain call is made");
+    record("idle fixture: doctor reports no profiles configured, so no keychain call is made");
 }
 
 /// A configured workspace: one profile with a key variable that resolves, so
