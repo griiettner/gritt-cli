@@ -1575,7 +1575,7 @@ fn settings_wait_for_a_turn_and_loading_is_cancellable() {
     assert_eq!(app.dispatch(Command::Models, None), Action::None);
     assert!(app.overlays.is_empty());
     app.running = false;
-    app.loading = Some("loading openai models".into());
+    app.begin_work(Work::Catalog, "loading openai models");
     // Escape with nothing open cancels the work the loading line names.
     assert_eq!(app.on_key(key(KeyCode::Esc)), Action::Cancel);
 }

@@ -18,7 +18,9 @@ use gritt_core::{Error, Result};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use super::app::{Action, AgentSummary, App, EntryKind, McpRequest, PendingApproval, StatusBar};
+use super::app::{
+    Action, AgentSummary, App, EntryKind, McpRequest, PendingApproval, StatusBar, Work,
+};
 use super::fixture::{self, FixtureScreen};
 use super::render::draw;
 use super::theme::Theme;
@@ -283,6 +285,9 @@ struct Runtime {
     /// it, and Escape aborts it, so the loading line always describes work
     /// that is really running.
     work: Option<JoinHandle<()>>,
+    /// Which kind of work `work` is, so superseding or cancelling it ends
+    /// the right label rather than clearing every kind at once.
+    work_kind: Option<Work>,
     /// The task behind a session change, kept apart from `work`.
     ///
     /// A session change owns a reservation: the driver being replaced is
@@ -341,17 +346,26 @@ impl Runtime {
     }
 
     /// Replaces the background request, aborting whatever it superseded.
-    fn spawn(&mut self, future: impl std::future::Future<Output = ()> + Send + 'static) {
-        // Superseding uses the same rule as cancelling: an MCP operation
-        // is signalled and left to clean up, everything else is dropped.
-        // A session change is in neither slot and is never touched here.
-        if let Some(previous) = self.mcp.take() {
-            previous.cancel.cancel();
-            self.work = None;
+    /// Replaces the ordinary background request.
+    ///
+    /// Only this slot is touched: a session change lives in `open_work`
+    /// and an MCP action is detached with its own token, so neither can be
+    /// dropped by an unrelated request starting.
+    fn spawn(
+        &mut self,
+        app: &mut App,
+        kind: Work,
+        label: impl Into<String>,
+        future: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        if let Some(previous) = self.work_kind.take() {
+            app.end_work(previous);
         }
         if let Some(previous) = self.work.take() {
             previous.abort();
         }
+        self.work_kind = Some(kind);
+        app.begin_work(kind, label);
         self.work = Some(tokio::spawn(future));
     }
 
@@ -362,21 +376,29 @@ impl Runtime {
         tokio::spawn(future);
     }
 
-    /// Stops the background request.
+    /// Stops everything cancellable and reports whether there was any.
     ///
-    /// MCP work is signalled rather than aborted: its future owns a child
-    /// process and a launch slot, and aborting it would drop both before
-    /// the shutdown that releases them, leaving the process alive until
-    /// the application exits.
-    fn cancel_work(&mut self) {
+    /// Every kind is ended, not just the one whose label happens to be on
+    /// screen: Escape means "stop what is running", and an MCP restart
+    /// must stay cancellable even after an unrelated catalog response has
+    /// arrived. MCP work is signalled rather than aborted, because its
+    /// future owns a child process and a launch slot and aborting it would
+    /// drop both before the shutdown that releases them.
+    fn cancel_work(&mut self, app: &mut App) -> bool {
+        let mut cancelled = false;
         if let Some(previous) = self.mcp.take() {
             previous.cancel.cancel();
-            self.work = None;
-            return;
+            app.end_work(Work::Mcp);
+            cancelled = true;
         }
-        if let Some(work) = self.work.take() {
-            work.abort();
+        if let Some(kind) = self.work_kind.take() {
+            if let Some(work) = self.work.take() {
+                work.abort();
+            }
+            app.end_work(kind);
+            cancelled = true;
         }
+        cancelled
     }
 
     /// Starts an MCP action, signalling the one it replaces.
@@ -508,6 +530,7 @@ async fn event_loop(
         changes: Arc::new(WorkspaceChanges::new(app.status.workspace.clone())),
         tx: ui_tx.clone(),
         work: None,
+        work_kind: None,
         open_work: None,
         operations: 0,
         pending_open: None,
@@ -570,7 +593,7 @@ async fn event_loop(
         }
     }
     stop.store(true, Ordering::SeqCst);
-    runtime.cancel_work();
+    runtime.cancel_work(&mut app);
     if let Some(handle) = &handle {
         handle.cancel();
     }
@@ -612,9 +635,23 @@ fn seed_draft(app: &mut App, plane: &ControlPlane) {
 
 /// Rescans the workspace under the current sidebar generation.
 fn scan_changes(runtime: &Runtime, generation: u64) {
+    record_and_scan(runtime, generation, Vec::new());
+}
+
+/// Records the writes a turn observed and rescans, entirely in the
+/// background.
+///
+/// Nothing here is awaited by a handler. The generation is captured now
+/// and travels with the result, so a scan for a session the user has left
+/// is refused when it lands rather than being prevented by blocking the
+/// loop until it finishes.
+fn record_and_scan(runtime: &Runtime, generation: u64, writes: Vec<String>) {
     let changes = Arc::clone(&runtime.changes);
     let tx = runtime.tx.clone();
     runtime.spawn_detached(async move {
+        for path in writes {
+            changes.record_write(path).await;
+        }
         changes.capture_baseline().await;
         let scanned = changes.scan().await;
         let _ = tx.send(UiMsg::Changes {
@@ -735,10 +772,13 @@ async fn on_message(
             *idle_agent = Some(agent);
             // Tools may have written; the sidebar refreshes after a turn
             // without blocking the frame that reported it finished.
-            for path in app.take_observed_writes() {
-                runtime.changes.record_write(path).await;
-            }
-            scan_changes(runtime, app.sidebar.generation);
+            //
+            // Recording a write stats the file and a scan runs `git`, both
+            // under the same bounded blocking pool. Awaiting either here
+            // would stop drawing and key handling — including Escape —
+            // whenever those workers were busy, which is exactly when a
+            // turn has just finished writing files.
+            record_and_scan(runtime, app.sidebar.generation, app.take_observed_writes());
             if let Some(mcp) = runtime.plane.builder.mcp().cloned() {
                 let tx = runtime.tx.clone();
                 runtime.spawn_detached(async move {
@@ -752,7 +792,7 @@ async fn on_message(
             profile,
             result,
         } => {
-            app.loading = None;
+            app.end_work(Work::Catalog);
             match result {
                 Ok(catalog) => {
                     app.apply_catalog(selection, &profile, catalog.models, catalog.state);
@@ -763,7 +803,7 @@ async fn on_message(
             }
         }
         UiMsg::Sessions(sessions) => {
-            app.loading = None;
+            app.end_work(Work::Sessions);
             app.load_sessions(sessions);
         }
         UiMsg::Agents(agents) => {
@@ -792,7 +832,7 @@ async fn on_message(
                 return Ok(Action::None);
             }
             let pending = runtime.take_pending_open().expect("checked above");
-            app.loading = None;
+            app.end_work(Work::Open);
             app.session_transition = false;
             match result {
                 Ok(DraftOpen::Opened {
@@ -840,7 +880,7 @@ async fn on_message(
             app.apply_changes(generation, changes);
         }
         UiMsg::Diff(diff) => {
-            app.loading = None;
+            app.end_work(Work::Diff);
             app.show_file_diff(diff);
         }
         UiMsg::Mcp(snapshots) => app.apply_mcp(snapshots),
@@ -856,13 +896,13 @@ async fn on_message(
                 return Ok(Action::None);
             }
             runtime.mcp = None;
-            app.loading = None;
+            app.end_work(Work::Mcp);
             if let Err(error) = result {
                 app.notice = Some(error.message);
             }
         }
         UiMsg::McpApproval { server, definition } => {
-            app.loading = None;
+            app.end_work(Work::Mcp);
             // The definition was asked for when nothing was running. If a
             // turn or another approval started while it was being read,
             // showing it now would let the answer authorize a launch
@@ -891,7 +931,7 @@ async fn on_message(
             app.refresh_connection_picker();
         }
         UiMsg::Setup { message, close } => {
-            app.loading = None;
+            app.end_work(Work::Setup);
             return Ok(app.setup_outcome(message, close));
         }
     }
@@ -919,10 +959,10 @@ async fn on_action(
             app.pending = None;
             app.mcp_approval = None;
             *responder = None;
-            let cancelled_work = app.loading.take().is_some();
-            if cancelled_work {
-                runtime.cancel_work();
-            }
+            // Cancellation is derived from what is really running, not
+            // from the label on screen: an unrelated completion could
+            // clear that label and leave a live operation uncancellable.
+            let cancelled_work = runtime.cancel_work(app);
             // A cancelled session change has no driver coming and will
             // never produce a `Finished`, so the loop has to end the
             // running state itself. Without this the first lazy open being
@@ -971,7 +1011,7 @@ async fn on_action(
             } else if app.running && app.session_id.is_none() {
                 // The lazy path: no session exists yet, so the first
                 // prompt is what creates one from the draft.
-                app.loading = Some("opening the session".into());
+                app.begin_work(Work::Open, "opening the session");
                 open_draft(app, runtime, Some(prompt), None);
             } else {
                 app.running = false;
@@ -999,8 +1039,7 @@ async fn on_action(
         Action::RefreshSessions => {
             let plane = Arc::clone(&runtime.plane);
             let tx = runtime.tx.clone();
-            app.loading = Some("loading sessions".into());
-            runtime.spawn(async move {
+            runtime.spawn(app, Work::Sessions, "loading sessions", async move {
                 let sessions = plane.builder.store.list().await.unwrap_or_default();
                 let _ = tx.send(UiMsg::Sessions(sessions));
             });
@@ -1012,7 +1051,7 @@ async fn on_action(
             }
             // Resuming keeps the stored profile, model, and effort: the
             // request only names the session.
-            app.loading = Some("resuming".into());
+            app.begin_work(Work::Open, "resuming");
             app.session_transition = true;
             let named = id.0.clone();
             let plane = Arc::clone(&runtime.plane);
@@ -1040,7 +1079,7 @@ async fn on_action(
                 app.notice = Some("finish or cancel the work in flight first".into());
                 return Ok(());
             }
-            app.loading = Some(format!("starting {}", id.as_str()));
+            app.begin_work(Work::Open, format!("starting {}", id.as_str()));
             app.session_transition = true;
             let plane = Arc::clone(&runtime.plane);
             let tx = runtime.tx.clone();
@@ -1076,10 +1115,10 @@ async fn on_action(
             });
         }
         Action::LoadCatalog { profile, selection } => {
-            app.loading = Some(format!("loading {profile} models"));
             let plane = Arc::clone(&runtime.plane);
             let tx = runtime.tx.clone();
-            runtime.spawn(async move {
+            let label = format!("loading {profile} models");
+            runtime.spawn(app, Work::Catalog, label, async move {
                 let result = plane.catalog(&profile).await;
                 let _ = tx.send(UiMsg::Catalog {
                     selection,
@@ -1112,7 +1151,6 @@ async fn on_action(
             let Some(submission) = app.take_setup_submission() else {
                 return Ok(());
             };
-            app.loading = Some("saving the profile".into());
             let plane = Arc::clone(&runtime.plane);
             let tx = runtime.tx.clone();
             // The write, the configuration reload, and the credential
@@ -1120,7 +1158,7 @@ async fn on_action(
             // system calls. `keyring::Entry::get_password()` in particular
             // can block for as long as the operating system wants, so none
             // of it runs on the loop.
-            runtime.spawn(async move {
+            runtime.spawn(app, Work::Setup, "saving the profile", async move {
                 let outcome = tokio::task::spawn_blocking(move || {
                     let (message, ok) =
                         crate::setup::apply_setup(plane.setup().as_ref(), submission);
@@ -1158,8 +1196,11 @@ async fn on_action(
             *idle_agent = None;
             *handle = None;
             *responder = None;
-            runtime.cancel_work();
-            app.loading = None;
+            runtime.cancel_work(app);
+            if let Some(pending) = runtime.take_pending_open() {
+                drop(pending);
+                app.end_work(Work::Open);
+            }
             scan_changes(runtime, app.sidebar.generation);
         }
         Action::Mcp(request) => {
@@ -1171,14 +1212,18 @@ async fn on_action(
             if let McpRequest::RequestApproval { server } = request {
                 // Fetching the definition changes nothing; it only asks
                 // what approving would run.
-                app.loading = Some("reading the server definition".into());
-                runtime.spawn(async move {
-                    let definition = mcp
-                        .definition_summary(&server)
-                        .await
-                        .unwrap_or_else(|| "this entry cannot run as configured".to_owned());
-                    let _ = tx.send(UiMsg::McpApproval { server, definition });
-                });
+                runtime.spawn(
+                    app,
+                    Work::Mcp,
+                    "reading the server definition",
+                    async move {
+                        let definition = mcp
+                            .definition_summary(&server)
+                            .await
+                            .unwrap_or_else(|| "this entry cannot run as configured".to_owned());
+                        let _ = tx.send(UiMsg::McpApproval { server, definition });
+                    },
+                );
                 return Ok(());
             }
             // The mutation guard is enforced here as well as in the
@@ -1189,7 +1234,7 @@ async fn on_action(
                     Some("a turn or an approval is active; the MCP change was not applied".into());
                 return Ok(());
             }
-            app.loading = Some("applying the MCP change".into());
+            app.begin_work(Work::Mcp, "applying the MCP change");
             // The token is kept by the loop, with an id. Cancelling signals
             // it and lets the operation's own cleanup shut the child down
             // and release its launch slot; aborting the future would drop
@@ -1227,10 +1272,9 @@ async fn on_action(
         }
         Action::ScanChanges => scan_changes(runtime, app.sidebar.generation),
         Action::OpenFileDiff(path) => {
-            app.loading = Some("reading the diff".into());
             let changes = Arc::clone(&runtime.changes);
             let tx = runtime.tx.clone();
-            runtime.spawn(async move {
+            runtime.spawn(app, Work::Diff, "reading the diff", async move {
                 let diff = changes.diff(&path).await;
                 let _ = tx.send(UiMsg::Diff(diff));
             });
@@ -1465,6 +1509,7 @@ mod tests {
             changes: Arc::new(WorkspaceChanges::new(dir.path())),
             tx,
             work: None,
+            work_kind: None,
             open_work: None,
             operations: 0,
             pending_open: None,
@@ -1697,7 +1742,7 @@ mod tests {
     async fn cancelling_mcp_work_signals_it_rather_than_aborting_it() {
         let mut h = harness().await;
         let (_id, token) = h.runtime.begin_mcp();
-        h.app.loading = Some("applying the MCP change".into());
+        h.app.begin_work(Work::Mcp, "applying the MCP change");
         h.act(Action::Cancel).await;
         assert!(
             token.is_cancelled(),
@@ -1738,10 +1783,13 @@ mod tests {
             "the reservation was replaced by the session list"
         );
         assert!(h.app.session_transition);
-        // The session list cleared the loading line, so the transition is
-        // the only thing left that says work is outstanding. Escape has to
-        // see it, or the interface has no way back.
-        assert!(h.app.loading.is_none());
+        // The session list ends its own label and no other. The transition
+        // keeps saying it is outstanding, which is what Escape acts on.
+        assert!(!h.app.is_working_on(Work::Sessions));
+        assert!(
+            h.app.is_working_on(Work::Open),
+            "the session list ended the resume's label as well as its own"
+        );
         assert_eq!(
             h.app.on_key(crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Esc,
@@ -1766,7 +1814,7 @@ mod tests {
     async fn overlapping_mcp_actions_keep_their_own_tokens_and_completions() {
         let mut h = harness().await;
         let (first, first_token) = h.runtime.begin_mcp();
-        h.app.loading = Some("applying the MCP change".into());
+        h.app.begin_work(Work::Mcp, "applying the MCP change");
         let (second, second_token) = h.runtime.begin_mcp();
         assert_ne!(first, second);
         assert!(
@@ -1786,7 +1834,10 @@ mod tests {
             h.runtime.mcp.is_some(),
             "a late completion took the live operation's token"
         );
-        assert!(h.app.loading.is_some(), "a late completion cleared loading");
+        assert!(
+            h.app.loading().is_some(),
+            "a late completion cleared the live operation's label"
+        );
         // Escape can still reach the operation that is really running.
         h.act(Action::Cancel).await;
         assert!(second_token.is_cancelled());
@@ -1828,5 +1879,134 @@ mod tests {
             h.runtime.mcp.is_none(),
             "an MCP mutation started during a running turn"
         );
+    }
+    /// A `git` that blocks, so the bounded worker pool can be filled on
+    /// purpose.
+    struct BlockingGit {
+        delay: std::time::Duration,
+    }
+
+    impl crate::changes::GitRunner for BlockingGit {
+        fn run(
+            &self,
+            _root: &std::path::Path,
+            _args: &[&str],
+        ) -> std::io::Result<std::process::Output> {
+            std::thread::sleep(self.delay);
+            Err(std::io::Error::other("not a repository"))
+        }
+    }
+
+    /// Round 3, finding 1: a turn finishing must not wait for the
+    /// workspace observer.
+    ///
+    /// Recording a write stats the file and a scan runs `git`, both under
+    /// the same bounded pool. If the handler awaited them, a turn that had
+    /// just written files — the moment the pool is busiest — would stop
+    /// drawing and stop reading keys, Escape included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn a_turn_finishing_does_not_wait_for_the_workspace_observer() {
+        let mut h = harness().await;
+        h.runtime.changes = Arc::new(WorkspaceChanges::with_git(
+            "/tmp/ws",
+            // Long enough that awaiting it would blow the 500 ms budget
+            // below by a wide margin, short enough not to hold the test
+            // binary's blocking pool open at exit.
+            Arc::new(BlockingGit {
+                delay: std::time::Duration::from_secs(2),
+            }),
+        ));
+        // Fill every blocking slot the observer is allowed to use.
+        for _ in 0..4 {
+            scan_changes(&h.runtime, h.app.sidebar.generation);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // A turn that wrote a file finishes now.
+        h.app.push(EntryKind::Tool, "-> file_write notes.txt");
+        h.app.observed_writes.push("notes.txt".into());
+        let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let finished = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            h.message(UiMsg::Finished {
+                generation: h.app.sidebar.generation,
+                agent: Box::new(StubDriver {
+                    session: session("live"),
+                    turns,
+                }),
+                result: Ok(TurnOutcome {
+                    status: crate::agent::TurnStatus::Completed,
+                    text: String::new(),
+                    usage: Default::default(),
+                    tool_calls: 0,
+                    error: None,
+                }),
+            }),
+        )
+        .await;
+        assert!(
+            finished.is_ok(),
+            "the turn-completion handler waited for the blocked workspace observer"
+        );
+        assert!(!h.app.running, "the turn was not marked finished");
+        assert!(h.idle.is_some(), "the driver was not returned");
+        assert!(
+            h.app.observed_writes.is_empty(),
+            "the write was not handed to the observer"
+        );
+    }
+
+    /// Round 3, finding 2: an unrelated completion must not take away the
+    /// ability to cancel what is still running.
+    ///
+    /// The reported sequence: a slow `/models` load, its picker closed,
+    /// then an MCP restart. The catalog response arrives and clears its
+    /// own label; the restart is still running and must still be
+    /// cancellable.
+    #[tokio::test]
+    async fn a_catalog_response_cannot_disable_cancelling_an_mcp_restart() {
+        let mut h = harness().await;
+        // A slow catalog load, started from `/models`.
+        h.act(Action::LoadCatalog {
+            profile: "openrouter".into(),
+            selection: h.app.selection,
+        })
+        .await;
+        assert!(h.app.is_working_on(Work::Catalog));
+
+        // An MCP action starts while it is still in flight.
+        let (_id, token) = h.runtime.begin_mcp();
+        h.app.begin_work(Work::Mcp, "applying the MCP change");
+
+        // The catalog answers. It clears its own label and nothing else.
+        h.message(UiMsg::Catalog {
+            selection: h.app.selection,
+            profile: "openrouter".into(),
+            result: Err(gritt_core::Error::config("no")),
+        })
+        .await;
+        assert!(!h.app.is_working_on(Work::Catalog));
+        assert!(
+            h.app.is_working_on(Work::Mcp),
+            "an unrelated completion cleared the MCP operation's label"
+        );
+
+        // Escape still produces a cancellation, and it reaches the MCP
+        // operation rather than finding nothing to do.
+        assert_eq!(
+            h.app.on_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE
+            )),
+            Action::Cancel,
+            "Escape had nothing to cancel while an MCP action was running"
+        );
+        h.act(Action::Cancel).await;
+        assert!(
+            token.is_cancelled(),
+            "the MCP operation was never told to stop"
+        );
+        assert!(h.runtime.mcp.is_none());
+        assert!(!h.app.is_busy());
     }
 }

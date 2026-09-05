@@ -626,7 +626,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     }
     // Asynchronous work is visible and cancellable, never a frozen frame.
-    if let Some(loading) = &app.loading {
+    if let Some(loading) = app.loading() {
         spans.push(Span::styled(format!("{loading}… "), theme.accent()));
         spans.push(Span::styled("Esc cancels".to_owned(), theme.dim()));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);

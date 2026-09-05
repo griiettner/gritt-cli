@@ -210,6 +210,26 @@ pub struct ModelCatalogView {
     pub loading: bool,
 }
 
+/// A kind of asynchronous work the interface can be waiting on.
+///
+/// The order is the display priority: when several are in flight, the
+/// label shown is the first of these that is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Work {
+    /// Opening, resuming, or replacing the session.
+    Open,
+    /// An MCP lifecycle action or a definition read.
+    Mcp,
+    /// Writing a provider profile and re-reading the configuration.
+    Setup,
+    /// Loading a profile's model list.
+    Catalog,
+    /// Listing sessions.
+    Sessions,
+    /// Reading a file's diff.
+    Diff,
+}
+
 /// Which searchable list an overlay is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
@@ -566,9 +586,15 @@ pub struct App {
     /// longer matches, so a slow list for the previous profile can never
     /// land under the current one.
     pub selection: u64,
-    /// What asynchronous work is in flight, shown near the composer. The
-    /// interface stays usable while it runs.
-    pub loading: Option<String>,
+    /// The asynchronous work in flight, by kind, with the label each one
+    /// shows.
+    ///
+    /// A map and not one field. One kind finishing says nothing about
+    /// another still running, and a single shared flag meant an ordinary
+    /// catalog response could clear the line an MCP restart had put up,
+    /// after which Escape had nothing to act on and the restart could not
+    /// be cancelled at all.
+    busy: std::collections::BTreeMap<Work, String>,
     /// The live session, `None` before the first prompt opens one.
     pub session_id: Option<SessionId>,
     /// Set for a connector session: the agent owns its model, effort, and
@@ -656,7 +682,7 @@ impl App {
             session_pinned: false,
             mcp: Vec::new(),
             selection: 0,
-            loading: None,
+            busy: std::collections::BTreeMap::new(),
             session_id: None,
             connector: None,
             mcp_target: None,
@@ -1497,6 +1523,34 @@ impl App {
         }
     }
 
+    /// Records that work of this kind has started.
+    pub fn begin_work(&mut self, kind: Work, label: impl Into<String>) {
+        self.busy.insert(kind, label.into());
+    }
+
+    /// Records that work of this kind has ended. Ending a kind that was
+    /// not running is not an error: a cancelled operation and its own
+    /// completion can both arrive.
+    pub fn end_work(&mut self, kind: Work) {
+        self.busy.remove(&kind);
+    }
+
+    /// The label to show near the composer, highest priority first.
+    pub fn loading(&self) -> Option<&str> {
+        self.busy.values().next().map(String::as_str)
+    }
+
+    /// Whether anything is in flight. This is what Escape acts on, so it
+    /// cannot be cleared by an unrelated kind finishing.
+    pub fn is_busy(&self) -> bool {
+        !self.busy.is_empty()
+    }
+
+    /// Whether work of this kind is in flight.
+    pub fn is_working_on(&self, kind: Work) -> bool {
+        self.busy.contains_key(&kind)
+    }
+
     /// Whether settings may change right now.
     ///
     /// A session transition counts: the choices would be applied against a
@@ -2182,7 +2236,7 @@ impl App {
                 // is checked on its own: its loading line can have been
                 // replaced by another request's, and without this the
                 // interface would have no way back.
-                if self.running || self.loading.is_some() || self.session_transition {
+                if self.running || self.is_busy() || self.session_transition {
                     Action::Cancel
                 } else {
                     self.notice = None;

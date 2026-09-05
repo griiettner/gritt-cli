@@ -300,6 +300,102 @@ async fn a_draft_from_the_reducer_opens_a_session_through_the_plane() {
     assert!(app.session_id.is_some());
 }
 
+/// A key provider whose resolution blocks, standing in for a keychain
+/// that is slow to answer.
+struct SlowKeys {
+    delay: std::time::Duration,
+}
+
+impl gritt_provider::adapter::KeyProvider for SlowKeys {
+    fn key(&self, _profile: &str, _reference: &SecretRef) -> gritt_core::Result<Secret> {
+        std::thread::sleep(self.delay);
+        Ok(Secret::new(KEY))
+    }
+}
+
+/// A slow keychain must not be on the path to the first frame.
+///
+/// `profile_summaries()` resolves a credential for every configured
+/// profile, and the full-screen mode enters the alternate screen before it
+/// draws. Resolving on that path leaves the terminal entered, blank, and
+/// deaf for as long as the operating system takes to answer. This asserts
+/// the shape that guarantee rests on: the summaries are slow, and the
+/// state the first frame is built from does not need them.
+#[tokio::test]
+async fn a_slow_keychain_is_not_on_the_path_to_the_first_frame() {
+    let mut config = Config::default();
+    config.profiles.insert(
+        "openrouter".into(),
+        profile(
+            "openrouter",
+            Protocol::ChatCompletions,
+            "https://openrouter.ai/api/v1",
+        ),
+    );
+    config.default_profile = Some("openrouter".into());
+    config.default_model = Some("openai/gpt-5-nano".into());
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        Store::open(DatabaseLocation::Explicit(dir.path().join("gritt.db")))
+            .await
+            .unwrap(),
+    );
+    let telemetry = Arc::new(Telemetry::new(Arc::clone(&store), config.logging.clone()));
+    let builder = AgentBuilder {
+        config,
+        store,
+        telemetry,
+        keys: Arc::new(SlowKeys {
+            delay: std::time::Duration::from_millis(750),
+        }),
+        transport: Arc::new(FixtureTransport::new(Vec::new(), 17)),
+        catalog: ModelCatalog::new(),
+        cache: None,
+        workspace: Workspace::open(dir.path()).unwrap(),
+        approval: ApprovalMode::DenyAll,
+        mcp: None,
+    };
+    let plane = ControlPlane::native(Arc::new(builder));
+
+    // The enumeration really is slow.
+    let started = std::time::Instant::now();
+    let summaries = tokio::task::spawn_blocking({
+        let plane = plane.clone();
+        move || plane.profile_summaries()
+    })
+    .await
+    .unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(700),
+        "the fixture keychain was not slow, so this proves nothing"
+    );
+
+    // What the first frame is built from: the configured defaults and the
+    // workspace, none of which touch a credential.
+    let mut app = app();
+    let started = std::time::Instant::now();
+    app.status.workspace = plane.builder.workspace_root().display().to_string();
+    app.draft = SessionDraft::default();
+    app.draft.profile = plane.builder.config.default_profile.clone();
+    app.draft.model = plane.builder.config.default_model.clone();
+    app.status.profile = app.draft.profile.clone().unwrap_or_default();
+    app.status.model = app.draft.model.clone().unwrap_or_default();
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    terminal
+        .draw(|frame| gritt_harness::tui::render::draw(frame, &app))
+        .unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(200),
+        "building and drawing the first frame waited on something slow"
+    );
+    assert_eq!(app.frames(), 1);
+    // The profiles arrive later; the dialog is what fills in.
+    assert!(app.profiles.is_empty());
+    app.profiles = summaries;
+    assert_eq!(app.connection_picker().rows().len(), 5);
+}
+
 // -- MCP through the reducer ------------------------------------------
 
 /// Pipes a turn's events into the reducer and answers approvals with the
