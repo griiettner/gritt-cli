@@ -125,7 +125,6 @@ impl Session {
                 "--database",
                 &dir.join("gritt.db").to_string_lossy(),
                 "tui",
-                "--no-models",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -135,6 +134,14 @@ impl Session {
         command.env("GRITT_BENCH_KEY", "bench-key-never-drawn");
         command.env("TERM", "xterm-256color");
         command.env("NO_COLOR", "1");
+        // Startup probes every installed agent, and each probe runs a real
+        // executable under a 15 second deadline. An empty `PATH` means none
+        // is found, so startup work finishes on a schedule this test
+        // controls rather than on whatever is installed on the machine.
+        command.env(
+            "PATH",
+            dir.join("no-such-bin").to_string_lossy().to_string(),
+        );
         let child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
         let pid = child.process_id().unwrap_or_default();
@@ -213,6 +220,30 @@ impl Session {
             .unwrap();
     }
 
+    /// Waits until the terminal has been silent for `quiet`, or gives up
+    /// after `cap`. Returns whether it went quiet.
+    ///
+    /// Startup work legitimately redraws: profile discovery can wait on the
+    /// keychain, the workspace scan runs `git`, and each lands as its own
+    /// message. Assuming a fixed settling time makes the idle measurement a
+    /// race against that work; waiting for actual silence does not.
+    fn wait_until_quiet(&mut self, quiet: Duration, cap: Duration) -> bool {
+        let deadline = Instant::now() + cap;
+        let mut last_change = Instant::now();
+        let mut seen = self.bytes_seen();
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+            self.drain();
+            if self.bytes_seen() != seen {
+                seen = self.bytes_seen();
+                last_change = Instant::now();
+            } else if last_change.elapsed() >= quiet {
+                return true;
+            }
+        }
+        false
+    }
+
     fn quit(&mut self) -> portable_pty::ExitStatus {
         // Ctrl-Q.
         self.send(&[0x11]);
@@ -273,7 +304,7 @@ fn rss_kib(pid: u32) -> Option<u64> {
 fn launch_to_usable_composer_with_existing_config() {
     let dir = tempfile::tempdir().unwrap();
     let start = Instant::now();
-    let mut session = Session::start(dir.path(), 40, 120, &[]);
+    let mut session = Session::start(dir.path(), 40, 120, &["--no-models"]);
     session.wait_for(ALT_SCREEN_ON, Duration::from_secs(30));
     let alt = start.elapsed();
     // The home status line is the first thing that proves a composer is on
@@ -308,6 +339,71 @@ fn launch_to_usable_composer_with_existing_config() {
     );
 }
 
+/// A provider that accepts the connection and then never answers.
+///
+/// This is what "independent of provider readiness" has to survive: the
+/// model list is requested and does not come back.
+fn stalling_provider() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            // Held open, never answered, never closed.
+            held.push(stream);
+        }
+    });
+    port
+}
+
+/// Launch with a model list that is requested and never arrives.
+///
+/// The earlier measurement passed `--no-models`, which skips the request
+/// entirely and so cannot show whether the composer waits for it. This one
+/// makes the request and lets it hang.
+#[test]
+fn launch_to_usable_composer_with_a_pending_catalog_request() {
+    let port = stalling_provider();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "default_profile = \"local\"\ndefault_model = \"openai/gpt-5-nano\"\n\
+             [profiles.local]\nname = \"local\"\nprotocol = \"chat_completions\"\n\
+             base_url = \"http://127.0.0.1:{port}/v1\"\n\
+             [profiles.local.key]\nkeychain_service_entry = \"gritt-bench-no-such-entry/local\"\n\
+             env_var_name = \"GRITT_BENCH_KEY\"\n"
+        ),
+    )
+    .unwrap();
+    let start = Instant::now();
+    // No `--no-models`: the catalog is requested and will not answer.
+    let mut session = Session::start(dir.path(), 40, 120, &[]);
+    session.wait_for(ALT_SCREEN_ON, Duration::from_secs(30));
+    session.wait_for(COMPOSER, Duration::from_secs(30));
+    let usable = start.elapsed();
+    record(&format!(
+        "launch with a pending catalog: usable composer at {:.0}ms",
+        usable.as_secs_f64() * 1_000.0
+    ));
+    record(&format!(
+        "  budget {:<32} {:.0}ms vs 500ms -> {}",
+        "launch, catalog pending",
+        usable.as_secs_f64() * 1_000.0,
+        if usable <= Duration::from_millis(500) {
+            "MET"
+        } else {
+            "NOT MET"
+        },
+    ));
+    assert!(
+        usable < Duration::from_secs(10),
+        "the composer waited {usable:?} for a model list that never arrived"
+    );
+    assert!(session.quit().success());
+}
+
 // -- idle -------------------------------------------------------------
 
 /// CPU and terminal traffic over 30 idle seconds.
@@ -322,15 +418,20 @@ fn idle_cpu_and_redraw_over_thirty_seconds() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let mut session = Session::start(dir.path(), 40, 120, &[]);
+    let mut session = Session::start(dir.path(), 40, 120, &["--no-models"]);
     session.wait_for(ALT_SCREEN_ON, Duration::from_secs(30));
     session.wait_for(COMPOSER, Duration::from_secs(30));
-    // Let startup's background work finish, so the sample is idle and not
-    // the tail of the launch.
-    thread::sleep(Duration::from_secs(3));
-    session.drain();
+    // Measure only once the terminal has actually gone silent.
+    assert!(
+        session.wait_until_quiet(Duration::from_secs(2), Duration::from_secs(60)),
+        "startup never went quiet, so there is no idle period to measure"
+    );
 
-    let before_cpu = cpu_seconds(session.pid).unwrap_or(0.0);
+    let Some(before_cpu) = cpu_seconds(session.pid) else {
+        record("idle: `ps` reported no CPU time, skipped rather than recorded as zero");
+        assert!(session.quit().success());
+        return;
+    };
     let before_bytes = session.bytes_seen();
     let before_rss = rss_kib(session.pid);
     let window = Duration::from_secs(30);
@@ -340,7 +441,12 @@ fn idle_cpu_and_redraw_over_thirty_seconds() {
         session.drain();
     }
     let elapsed = start.elapsed();
-    let cpu = cpu_seconds(session.pid).unwrap_or(0.0) - before_cpu;
+    let Some(after_cpu) = cpu_seconds(session.pid) else {
+        record("idle: `ps` stopped reporting, skipped rather than recorded as zero");
+        assert!(session.quit().success());
+        return;
+    };
+    let cpu = after_cpu - before_cpu;
     let bytes = session.bytes_seen() - before_bytes;
     let percent = cpu / elapsed.as_secs_f64() * 100.0;
     record(&format!(
@@ -373,13 +479,17 @@ fn idle_cpu_and_redraw_over_thirty_seconds() {
 #[test]
 fn an_idle_session_writes_nothing_to_the_terminal() {
     let dir = tempfile::tempdir().unwrap();
-    let mut session = Session::start(dir.path(), 40, 120, &[]);
+    let mut session = Session::start(dir.path(), 40, 120, &["--no-models"]);
     session.wait_for(ALT_SCREEN_ON, Duration::from_secs(30));
     session.wait_for(COMPOSER, Duration::from_secs(30));
     // Startup's background work (profiles, agent probes, the change scan)
-    // each land as a message and legitimately redraw. Wait them out.
-    thread::sleep(Duration::from_secs(3));
-    session.drain();
+    // each land as a message and legitimately redraw. Wait for real
+    // silence rather than assuming a settling time: a probe finishing a
+    // second late is a correct redraw, not the defect this guards.
+    assert!(
+        session.wait_until_quiet(Duration::from_secs(2), Duration::from_secs(60)),
+        "startup never went quiet, so there is no idle period to measure"
+    );
 
     let before = session.bytes_seen();
     thread::sleep(Duration::from_secs(3));
@@ -409,7 +519,7 @@ fn an_idle_session_writes_nothing_to_the_terminal() {
 fn scripted_walkthrough_at_both_reference_sizes() {
     for (rows, cols) in [(40u16, 120u16), (24, 80)] {
         let dir = tempfile::tempdir().unwrap();
-        let mut session = Session::start(dir.path(), rows, cols, &[]);
+        let mut session = Session::start(dir.path(), rows, cols, &["--no-models"]);
         session.wait_for(ALT_SCREEN_ON, Duration::from_secs(30));
         session.wait_for(COMPOSER, Duration::from_secs(30));
         record(&format!("walkthrough {cols}x{rows}: home drawn"));
