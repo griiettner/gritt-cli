@@ -127,8 +127,11 @@ the working directory, connection, model, effort, and phase. With nothing
 configured it says `Use /connect to get started.`
 
 Type `/connect` and press Enter. The picker lists configured provider
-profiles and any installed agents it found. Choosing a provider with no key
-opens a setup form for the profile name, endpoint, key variable, and key.
+profiles, any installed agents it found, a `Set up <name>…` row for each
+known provider you have not configured, and a `Custom endpoint…` row.
+Choosing a provider that has no key opens a setup form for the profile name,
+endpoint, key variable, and key. If you reach `/models` first, a profile with
+no key is headed there by the same `Set up <profile>…` row.
 Ctrl-T cycles the protocol, Ctrl-D chooses whether the profile lands in your
 user config or this project's, and Enter on the last field saves. The profile
 goes to `config.toml` and the key goes to the operating system keychain. The

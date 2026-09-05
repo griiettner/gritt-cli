@@ -55,8 +55,10 @@ refresh is not retried until the interval passes. With no cache and a failed
 fetch the model list is reported missing and capabilities are unreported.
 
 Capabilities recorded from the list: context length, tools, vision,
-structured output, reasoning, and pricing. Gritt does not fill gaps with
-guesses. A feature the provider reports as unsupported is refused before a
+structured output, reasoning, and pricing. These describe what Gritt parsed
+out of that provider's list, not what the model can do: a provider that
+reports nothing leaves every capability unreported even for a model that
+plainly supports the feature. Gritt does not fill gaps with guesses. A feature the provider reports as unsupported is refused before a
 request is sent. A feature the provider does not report at all is allowed
 and flagged with a `capability_warning` diagnostic on the first event of the
 turn, because OpenAI and Anthropic lists report no capability flags.

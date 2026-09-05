@@ -76,8 +76,13 @@ or a long failure reason is cut.
 ### Connecting and provider setup
 
 `/connect` lists configured provider profiles and installed agents in one
-picker. Choosing a provider that has no key opens a setup form: the profile
-name, the endpoint, the key variable, and the key itself. In that form Tab
+picker, along with a `Set up <name>…` row for each known provider that is not
+configured yet and a `Custom endpoint…` row. Choosing one of those opens a
+setup form: the profile name, the endpoint, the key variable, and the key
+itself. `/models` offers the same entry point from the other direction: when
+the selected profile has no key, the model list is headed by a
+`Set up <profile>…` row that opens the same form, and setup returns to the
+picker afterwards without losing your search or your prompt draft. In that form Tab
 and the arrow keys move between fields, Ctrl-T cycles the protocol through
 `chat_completions`, `responses`, and `messages`, Ctrl-D toggles whether the
 profile is saved to the user config or the project config, Enter on the last
@@ -102,20 +107,28 @@ to the model default, with a notice saying so.
 
 ### Sessions are pinned to a provider and model
 
-A session that has stored history is pinned to the provider, model, and
-effort it was opened with. Gritt cannot move a stored transcript and its
-continuation state to a different model, so it does not pretend to: choosing
-another provider or model on a pinned session opens a notice saying that
-changing this needs a new session. `/new` is that path. It clears the
-transcript view, the session identity, and the usage totals while keeping
-your composer draft and the provider and model you just chose, so the next
-prompt opens a fresh session on the new selection. The previous session is
-not deleted and stays in `/sessions`.
+A session that has stored history is pinned to the provider and model it was
+opened with. Gritt cannot move a stored transcript and its continuation state
+to a different model, so it does not pretend to: choosing another provider or
+model on a pinned session opens a notice saying that changing this needs a
+new session.
+
+Effort is not pinned. `/effort` works on a live session and takes effect from
+the next turn, because it changes what the next request asks for and not what
+the stored transcript means.
+
+The refusal happens before the choice is applied, so the draft still holds the
+session's own provider and model afterwards. The order to change model is
+therefore `/new` first, then `/models`: `/new` clears the transcript view, the
+session identity, and the usage totals, keeps your composer draft, and leaves
+the previous session in `/sessions`; the selection you make after it opens the
+next session. Selecting first and running `/new` afterwards does not carry the
+rejected choice across.
 
 The same rule is enforced twice on purpose: once in the interface, for an
 immediate answer, and once in the control plane, which refuses the draft
-outright. Resuming a session restores its pinned provider, model, effort,
-phase, transcript, and continuation state.
+outright. Resuming a session restores the provider, model, effort, phase,
+transcript, and continuation state it was left with.
 
 ### Commands
 

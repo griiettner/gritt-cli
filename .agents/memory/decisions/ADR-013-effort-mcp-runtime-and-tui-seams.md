@@ -88,7 +88,7 @@ reload can hand the same dispatch name to a different tool.
 
 ### 4. The binary injects setup, config reload, and workspace observation
 
-The full-screen runtime stays a client of the control plane. Three seams let
+The full-screen runtime stays a client of the control plane. Two seams let
 the binary supply what only it may do, keeping configuration-layer merging
 and keychain access out of the harness (ADR-006):
 
@@ -96,11 +96,17 @@ and keychain access out of the harness (ADR-006):
   keychain, with the profile written first so a refused keychain still
   leaves a usable profile;
 - config reload: saving a profile does not change the running configuration
-  until the plane is rebuilt around a reloaded config;
-- workspace observation: a harness service that reports changed files,
-  including read-only `git` invocations through an injected runner. The
-  invocation set is fixed and never interpolates user text into a command
-  position.
+  until the plane is rebuilt around a reloaded config.
+The binary also hands the loop the workspace MCP runtime to start, when
+the run is on the native path, so startup happens in the background and a
+failure to read `.mcp.json` is reported inside the interface rather than
+on stderr, which the alternate screen owns.
+
+Workspace observation is a harness service rather than a binary seam: the
+loop constructs it itself for the workspace it was given. It reports changed
+files through read-only `git` invocations behind an injected runner, and the
+invocation set is fixed and never interpolates user text into a command
+position.
 
 MCP lifecycle reaches an interface by subscription, publishing the whole
 snapshot list on every change, so nothing polls and a lagged subscriber

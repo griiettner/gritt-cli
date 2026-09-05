@@ -40,7 +40,10 @@ gritt mcp forget            # forget every decision for this workspace
 ```
 
 Editing the entry changes its fingerprint, so the approval no longer applies
-and Gritt asks again. A child gets the workspace as its working directory,
+and Gritt asks again. The fingerprint covers the entry's content, not the file
+around it: reformatting, reindenting, or reordering keys leaves it unchanged,
+and so does rotating the value of a variable the entry names, because the
+approval is over the `${VAR}` reference rather than what it resolves to. A child gets the workspace as its working directory,
 its argument array verbatim, and a minimal environment plus the variables the
 entry declares; provider keys configured for Gritt are never passed on.
 
@@ -93,10 +96,15 @@ reason and the others carry on; a failed server is not restarted
 automatically and a call is not retried after a disconnect. A single line of
 server output above 8 MiB is treated as a protocol violation.
 
-These values are not yet settable in `config.toml`. The one case where the
-default bites in practice is a server that does substantial work before
-answering `initialize`, such as building an index on its first run in a fresh
-checkout; it fails the first start and succeeds afterwards.
+These values are not yet settable in `config.toml`, and that is the one place
+where the initialization default bites. A server that does substantial work
+before answering `initialize`, such as building an index on its first run in a
+fresh checkout, can exceed 30 seconds and be stopped partway. Retrying does
+not necessarily recover: if the work is not resumable, the next start begins
+it again and hits the same deadline, so the entry can fail indefinitely while
+being perfectly healthy. Gritt's own server does this, and until the deadline
+is configurable the way out is to let that server complete its first run
+outside Gritt.
 
 Cancelling a turn cancels its MCP calls. A call that has already been sent is
 withdrawn with `notifications/cancelled` so the server can stop work, and a
