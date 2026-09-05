@@ -1,0 +1,631 @@
+//! Session drafts through the control plane: new-session selection, a
+//! provider change invalidating the model, resumed-session pinning, the
+//! stale catalog fallback, the connector restriction, and effort that
+//! persists between turns and reaches the adapter request.
+
+use std::sync::Arc;
+
+use chrono::{Duration, Utc};
+use gritt_core::config::Config;
+use gritt_core::connector::ConnectorId;
+use gritt_core::event::{ApprovalDecision, ApprovalRequest, Event};
+use gritt_core::provider::{
+    EffortUnsupportedReason, ModelCapabilities, ModelInfo, ModelList, ModelListStatus, Protocol,
+    ProviderProfile, ReasoningEffort,
+};
+use gritt_core::secret::{Secret, SecretRef};
+use gritt_core::session::{BoxFuture, Phase, Session, SessionId, SessionKind, SessionStore};
+use gritt_harness::agent::{AgentBuilder, ApprovalMode, Ui};
+use gritt_harness::control::{ControlPlane, DraftOpen};
+use gritt_harness::draft::{CatalogState, DraftError, DraftOutcome, DraftWarning, SessionDraft};
+use gritt_harness::driver::EffortOutcome;
+use gritt_harness::policy::Decision;
+use gritt_harness::setup::CredentialState;
+use gritt_harness::store::{DatabaseLocation, Store};
+use gritt_harness::telemetry::Telemetry;
+use gritt_harness::tools::Workspace;
+use gritt_provider::models::{CachedModelList, ModelCache, ModelCatalog};
+use gritt_provider::{FixtureResponse, FixtureTransport, StaticKey};
+
+const KEY: &str = "fixture-key-never-printed";
+
+fn fixture(name: &str) -> Vec<u8> {
+    let path = format!(
+        "{}/../gritt-provider/tests/fixtures/chat-completions/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    std::fs::read(&path).unwrap_or_else(|error| panic!("cannot read {path}: {error}"))
+}
+
+fn profile(name: &str, protocol: Protocol, base_url: &str) -> ProviderProfile {
+    ProviderProfile {
+        name: name.into(),
+        protocol,
+        base_url: base_url.into(),
+        key: SecretRef::for_profile(name, format!("{}_API_KEY", name.to_uppercase())),
+        aliases: Default::default(),
+    }
+}
+
+fn config() -> Config {
+    let mut config = Config::default();
+    config.profiles.insert(
+        "openrouter".into(),
+        profile(
+            "openrouter",
+            Protocol::ChatCompletions,
+            "https://openrouter.ai/api/v1",
+        ),
+    );
+    config.profiles.insert(
+        "other".into(),
+        profile("other", Protocol::Responses, "https://other.example/v1"),
+    );
+    config.profiles.insert(
+        "anthropic".into(),
+        profile("anthropic", Protocol::Messages, "https://api.anthropic.com"),
+    );
+    config.aliases.insert("fast".into(), "other/model-x".into());
+    config.default_profile = Some("openrouter".into());
+    config.default_model = Some("openai/gpt-5-nano".into());
+    config
+}
+
+struct Fixture {
+    dir: tempfile::TempDir,
+    plane: ControlPlane,
+    transport: Arc<FixtureTransport>,
+}
+
+async fn fixture_plane(responses: Vec<FixtureResponse>, cache: Option<ModelCache>) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        Store::open(DatabaseLocation::Explicit(dir.path().join("gritt.db")))
+            .await
+            .unwrap(),
+    );
+    let config = config();
+    let telemetry = Arc::new(Telemetry::new(Arc::clone(&store), config.logging.clone()));
+    let transport = Arc::new(FixtureTransport::new(responses, 17));
+    let builder = AgentBuilder {
+        config,
+        store,
+        telemetry,
+        keys: Arc::new(StaticKey(Secret::new(KEY))),
+        transport: transport.clone(),
+        catalog: ModelCatalog::new(),
+        cache,
+        workspace: Workspace::open(dir.path()).unwrap(),
+        approval: ApprovalMode::DenyAll,
+    };
+    Fixture {
+        dir,
+        plane: ControlPlane::native(Arc::new(builder)),
+        transport,
+    }
+}
+
+/// Puts a fresh list for `profile` in the catalog with one reasoning
+/// model.
+fn seed_catalog(plane: &ControlPlane, profile: &str, model: &str, reasoning: Option<bool>) {
+    plane.builder.catalog.insert(ModelList {
+        profile: profile.into(),
+        status: ModelListStatus::Fresh {
+            fetched_at: Utc::now(),
+        },
+        models: vec![ModelInfo {
+            id: model.into(),
+            display_name: None,
+            capabilities: ModelCapabilities {
+                reasoning,
+                ..Default::default()
+            },
+            replaced_by: None,
+            deprecated: false,
+        }],
+    });
+}
+
+#[derive(Default)]
+struct RecordingUi {
+    events: Vec<Event>,
+}
+
+impl Ui for RecordingUi {
+    fn event(&mut self, event: &Event) {
+        self.events.push(event.clone());
+    }
+
+    fn approve<'a>(
+        &'a mut self,
+        _request: &'a ApprovalRequest,
+        _decision: &'a Decision,
+        _preview: Option<&'a str>,
+    ) -> BoxFuture<'a, ApprovalDecision> {
+        Box::pin(async { ApprovalDecision::Denied })
+    }
+}
+
+fn ready(
+    outcome: DraftOutcome,
+) -> (
+    gritt_harness::draft::ResolvedDraft,
+    CatalogState,
+    Vec<DraftWarning>,
+) {
+    match outcome {
+        DraftOutcome::Ready {
+            draft,
+            catalog,
+            warnings,
+        } => (draft, catalog, warnings),
+        DraftOutcome::Rejected { errors, .. } => panic!("rejected: {errors:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_new_session_draft_resolves_profile_model_and_effort_together() {
+    let fx = fixture_plane(vec![FixtureResponse::sse(fixture("stream-text.sse"))], None).await;
+    seed_catalog(&fx.plane, "openrouter", "openai/gpt-5-nano", Some(true));
+
+    // Defaults fill an empty draft.
+    let (resolved, catalog, warnings) = ready(
+        fx.plane
+            .validate_draft(&SessionDraft::default())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(resolved.profile, "openrouter");
+    assert_eq!(resolved.model, "openai/gpt-5-nano");
+    assert_eq!(resolved.effort, ReasoningEffort::Auto);
+    assert_eq!(resolved.phase, Phase::Planning);
+    assert_eq!(resolved.resume, None);
+    assert!(matches!(catalog, CatalogState::Fresh { .. }));
+    assert!(warnings.is_empty());
+
+    // Explicit choices, then the session is created with the effort and
+    // the first turn sends it through the adapter.
+    let draft = SessionDraft::default()
+        .with_name("work")
+        .with_profile("openrouter")
+        .with_model("openai/gpt-5-nano")
+        .with_effort(ReasoningEffort::High)
+        .with_phase(Phase::Coding);
+    let DraftOpen::Opened {
+        mut driver,
+        catalog,
+        ..
+    } = fx.plane.open_draft(draft).await.unwrap()
+    else {
+        panic!("expected the draft to open");
+    };
+    assert!(matches!(catalog, CatalogState::Fresh { .. }));
+    assert_eq!(driver.effort(), Some(ReasoningEffort::High));
+    assert_eq!(driver.phase(), Phase::Coding);
+    assert_eq!(driver.session().kind.effort(), Some(ReasoningEffort::High));
+    let mut ui = RecordingUi::default();
+    driver.run_turn("hello", &mut ui).await.unwrap();
+    let body = fx.transport.requests()[0].body_json().unwrap();
+    assert_eq!(body["reasoning"], serde_json::json!({ "effort": "high" }));
+
+    let stored = fx
+        .plane
+        .builder
+        .store
+        .find_by_name("work")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.kind.effort(), Some(ReasoningEffort::High));
+}
+
+#[tokio::test]
+async fn a_provider_change_invalidates_the_model_selection() {
+    let fx = fixture_plane(vec![], None).await;
+    // The alias belongs to `other`; picked under `openrouter` it is refused.
+    let outcome = fx
+        .plane
+        .validate_draft(
+            &SessionDraft::default()
+                .with_profile("openrouter")
+                .with_model("fast"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.errors(),
+        &[DraftError::ModelOutsideProfile {
+            model: "fast".into(),
+            model_profile: "other".into(),
+            profile: "openrouter".into(),
+        }]
+    );
+    // A qualified name from another profile is refused the same way.
+    let outcome = fx
+        .plane
+        .validate_draft(
+            &SessionDraft::default()
+                .with_profile("other")
+                .with_model("openrouter/openai/gpt-5-nano"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome.errors(),
+        [DraftError::ModelOutsideProfile { .. }]
+    ));
+    // The builder helper clears the model when the profile changes, and
+    // an unknown or missing profile is typed too.
+    let cleared = SessionDraft::default()
+        .with_profile("openrouter")
+        .with_model("openai/gpt-5-nano")
+        .with_profile("other");
+    assert_eq!(cleared.model, None);
+    let outcome = fx
+        .plane
+        .validate_draft(&SessionDraft::default().with_profile("nope"))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.errors(),
+        &[DraftError::UnknownProfile {
+            profile: "nope".into()
+        }]
+    );
+    let outcome = fx
+        .plane
+        .validate_draft(&SessionDraft::default().with_profile("other"))
+        .await
+        .unwrap();
+    // `other` has no model of its own and the default model is
+    // openrouter's bare id; without a catalog it resolves under `other`.
+    let (resolved, catalog, _) = ready(outcome);
+    assert_eq!(resolved.profile, "other");
+    assert_eq!(catalog, CatalogState::Skipped);
+}
+
+#[tokio::test]
+async fn effort_is_validated_against_the_profile_protocol_and_catalog() {
+    let fx = fixture_plane(vec![], None).await;
+    // Chat Completions with nothing reported: explicit effort is refused.
+    let outcome = fx
+        .plane
+        .validate_draft(&SessionDraft::default().with_effort(ReasoningEffort::High))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.errors(),
+        &[DraftError::EffortUnsupported {
+            profile: "openrouter".into(),
+            model: "openai/gpt-5-nano".into(),
+            effort: ReasoningEffort::High,
+            reason: EffortUnsupportedReason::ReasoningNotReported,
+        }]
+    );
+    // Messages: refused by protocol.
+    let outcome = fx
+        .plane
+        .validate_draft(
+            &SessionDraft::default()
+                .with_profile("anthropic")
+                .with_model("claude-sonnet-5")
+                .with_effort(ReasoningEffort::Low),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome.errors(),
+        [DraftError::EffortUnsupported {
+            reason: EffortUnsupportedReason::Protocol {
+                protocol: Protocol::Messages
+            },
+            ..
+        }]
+    ));
+    // Responses: allowed without list evidence; `auto` always is.
+    let (resolved, _, _) = ready(
+        fx.plane
+            .validate_draft(
+                &SessionDraft::default()
+                    .with_profile("other")
+                    .with_model("model-x")
+                    .with_effort(ReasoningEffort::Medium),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(resolved.effort, ReasoningEffort::Medium);
+    ready(
+        fx.plane
+            .validate_draft(&SessionDraft::default().with_effort(ReasoningEffort::Auto))
+            .await
+            .unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_session_stays_pinned_and_loads_its_stored_effort() {
+    let fx = fixture_plane(
+        vec![
+            FixtureResponse::sse(fixture("stream-text.sse")),
+            FixtureResponse::sse(fixture("stream-text.sse")),
+        ],
+        None,
+    )
+    .await;
+    seed_catalog(&fx.plane, "openrouter", "openai/gpt-5-nano", Some(true));
+    let DraftOpen::Opened { mut driver, .. } = fx
+        .plane
+        .open_draft(SessionDraft::default().with_name("pinned"))
+        .await
+        .unwrap()
+    else {
+        panic!("expected open");
+    };
+    let id = driver.session().id.clone();
+    // Effort changes between turns through the driver and persists.
+    assert_eq!(
+        driver.set_effort(ReasoningEffort::Low).await.unwrap(),
+        EffortOutcome::Applied {
+            effort: ReasoningEffort::Low
+        }
+    );
+    let mut ui = RecordingUi::default();
+    driver.run_turn("first", &mut ui).await.unwrap();
+    assert_eq!(
+        fx.transport.requests()[0].body_json().unwrap()["reasoning"]["effort"],
+        "low"
+    );
+    drop(driver);
+
+    // Asking for another profile or model is refused with the pin.
+    let outcome = fx
+        .plane
+        .validate_draft(
+            &SessionDraft::default()
+                .with_name("pinned")
+                .with_profile("other"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.errors(),
+        &[DraftError::SessionPinned {
+            name: "pinned".into(),
+            profile: "openrouter".into(),
+            model: "openai/gpt-5-nano".into(),
+            requested_profile: Some("other".into()),
+            requested_model: None,
+        }]
+    );
+    let outcome = fx
+        .plane
+        .validate_draft(
+            &SessionDraft::default()
+                .with_name("pinned")
+                .with_model("fast"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome.errors(),
+        [DraftError::SessionPinned { .. }]
+    ));
+
+    // The same profile and model, or nothing, resumes with the stored
+    // effort and phase; the interface never has to restate them.
+    let (resolved, _, _) = ready(
+        fx.plane
+            .validate_draft(
+                &SessionDraft::default()
+                    .with_name("pinned")
+                    .with_profile("openrouter")
+                    .with_model("openai/gpt-5-nano"),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(resolved.resume, Some(id.clone()));
+    assert_eq!(resolved.effort, ReasoningEffort::Low);
+    assert_eq!(resolved.phase, Phase::Planning);
+    let DraftOpen::Opened { mut driver, .. } = fx
+        .plane
+        .open_draft(
+            SessionDraft::default()
+                .with_name("pinned")
+                .with_phase(Phase::Coding),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected resume");
+    };
+    assert_eq!(driver.session().id, id);
+    assert_eq!(driver.effort(), Some(ReasoningEffort::Low));
+    assert_eq!(driver.phase(), Phase::Coding);
+    let mut ui = RecordingUi::default();
+    driver.run_turn("second", &mut ui).await.unwrap();
+    assert_eq!(
+        fx.transport.requests()[1].body_json().unwrap()["reasoning"]["effort"],
+        "low"
+    );
+    assert_eq!(fx.plane.builder.store.list().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_unsupported_effort_is_refused_by_the_driver_and_not_stored() {
+    let fx = fixture_plane(vec![], None).await;
+    let DraftOpen::Opened { mut driver, .. } = fx
+        .plane
+        .open_draft(SessionDraft::default().with_name("plain"))
+        .await
+        .unwrap()
+    else {
+        panic!("expected open");
+    };
+    assert_eq!(
+        driver.set_effort(ReasoningEffort::High).await.unwrap(),
+        EffortOutcome::Unsupported {
+            effort: ReasoningEffort::High,
+            reason: EffortUnsupportedReason::ReasoningNotReported,
+        }
+    );
+    assert_eq!(driver.effort(), Some(ReasoningEffort::Auto));
+    let stored = fx
+        .plane
+        .builder
+        .store
+        .find_by_name("plain")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.kind.effort(), Some(ReasoningEffort::Auto));
+}
+
+#[tokio::test]
+async fn a_stale_catalog_falls_back_and_flags_an_unlisted_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ModelCache::new(dir.path().join("models"));
+    let fetched_at = Utc::now() - Duration::days(3);
+    cache
+        .write(
+            "openrouter",
+            &CachedModelList {
+                fetched_at: Some(fetched_at),
+                last_attempt_at: Some(fetched_at),
+                models: vec![ModelInfo {
+                    id: "openai/gpt-5-nano".into(),
+                    display_name: None,
+                    capabilities: ModelCapabilities {
+                        reasoning: Some(true),
+                        ..Default::default()
+                    },
+                    replaced_by: None,
+                    deprecated: false,
+                }],
+            },
+        )
+        .unwrap();
+    // The transport has no response, so the refresh fails.
+    let fx = fixture_plane(vec![], Some(cache)).await;
+    let catalog = fx.plane.catalog("openrouter").await.unwrap();
+    assert_eq!(catalog.state, CatalogState::Stale { fetched_at });
+    assert_eq!(catalog.models.len(), 1);
+    // The stale list still validates a listed model's effort.
+    let (resolved, state, warnings) = ready(
+        fx.plane
+            .validate_draft(&SessionDraft::default().with_effort(ReasoningEffort::Medium))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(resolved.effort, ReasoningEffort::Medium);
+    assert!(matches!(state, CatalogState::Stale { .. }));
+    assert!(warnings.is_empty());
+    // An unlisted model is allowed with a warning, as in print mode.
+    let (_, _, warnings) = ready(
+        fx.plane
+            .validate_draft(&SessionDraft::default().with_model("openai/other"))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        warnings,
+        vec![DraftWarning::ModelNotInCatalog {
+            profile: "openrouter".into(),
+            model: "openai/other".into(),
+        }]
+    );
+    // A profile with no cache and a failed refresh is reported missing.
+    let other = fx.plane.catalog("other").await.unwrap();
+    assert!(matches!(other.state, CatalogState::Missing { .. }));
+    assert!(other.models.is_empty());
+    let text = format!("{other:?}");
+    assert!(!text.contains(KEY));
+    drop(fx);
+}
+
+#[tokio::test]
+async fn connector_sessions_are_outside_the_native_draft() {
+    let fx = fixture_plane(vec![], None).await;
+    let now = Utc::now();
+    fx.plane
+        .builder
+        .store
+        .create(Session {
+            id: SessionId("c1".into()),
+            name: "codex-work".into(),
+            kind: SessionKind::Connector {
+                id: ConnectorId::Codex,
+            },
+            phase: Phase::Coding,
+            workspace: fx.dir.path().to_path_buf(),
+            created_at: now,
+            updated_at: now,
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let outcome = fx
+        .plane
+        .validate_draft(&SessionDraft::default().with_name("codex-work"))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.errors(),
+        &[DraftError::ConnectorSession {
+            name: "codex-work".into(),
+            connector: ConnectorId::Codex,
+        }]
+    );
+    // A session from another workspace is typed too.
+    fx.plane
+        .builder
+        .store
+        .create(Session {
+            id: SessionId("w1".into()),
+            name: "elsewhere".into(),
+            kind: SessionKind::Native {
+                provider_profile: "openrouter".into(),
+                model: "openai/gpt-5-nano".into(),
+                effort: ReasoningEffort::Auto,
+            },
+            phase: Phase::Planning,
+            workspace: "/nonexistent/other-workspace".into(),
+            created_at: now,
+            updated_at: now,
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let outcome = fx
+        .plane
+        .validate_draft(&SessionDraft::default().with_name("elsewhere"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome.errors(),
+        [DraftError::OtherWorkspace { .. }]
+    ));
+}
+
+#[tokio::test]
+async fn profile_summaries_report_availability_without_values() {
+    let fx = fixture_plane(vec![], None).await;
+    let summaries = fx.plane.profile_summaries();
+    assert_eq!(summaries.len(), 3);
+    let openrouter = summaries.iter().find(|s| s.name == "openrouter").unwrap();
+    assert!(openrouter.is_default);
+    assert_eq!(openrouter.credential, CredentialState::Available);
+    assert_eq!(openrouter.protocol, Protocol::ChatCompletions);
+    let text = serde_json::to_string(&summaries).unwrap();
+    assert!(!text.contains(KEY));
+    // No setup writer was injected: writes are unavailable, never a panic.
+    let outcome = fx.plane.setup().store_credential(
+        &fx.plane.builder.config.profiles["openrouter"],
+        Secret::new("sk-x"),
+    );
+    assert!(matches!(
+        outcome,
+        gritt_harness::setup::CredentialStoreOutcome::Unavailable { .. }
+    ));
+}

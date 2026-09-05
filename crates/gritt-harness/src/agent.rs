@@ -17,17 +17,19 @@ use gritt_core::event::{
     StopReason, Usage,
 };
 use gritt_core::policy::PolicyOutcome;
-use gritt_core::provider::{Message, PromptRequest, RequestOptions, Role};
+use gritt_core::provider::{Message, PromptRequest, ReasoningEffort, RequestOptions, Role};
 use gritt_core::secret::Secret;
 use gritt_core::session::{BoxFuture, Phase, Session, SessionId, SessionKind, SessionStore};
 use gritt_core::tool::{ToolCall, ToolResult};
 use gritt_core::{Error, ErrorKind, Result};
 use gritt_provider::adapter::{redact_text, redact_value, CapabilitySource, KeyProvider};
 use gritt_provider::alias;
+use gritt_provider::effort::{effort_support, EffortSupport};
 use gritt_provider::models::{load_models, ModelCache, ModelCatalog};
 use gritt_provider::transport::HttpTransport;
 use gritt_provider::{adapter_for, AdapterContext, CancellationToken};
 
+use crate::driver::EffortOutcome;
 use crate::policy::{Decision, PolicyEngine};
 use crate::store::Store;
 use crate::telemetry::Telemetry;
@@ -195,6 +197,59 @@ impl NativeAgent {
         self.session.phase
     }
 
+    /// The effort the next turn sends. `Auto` for a session stored before
+    /// effort existed.
+    pub fn effort(&self) -> ReasoningEffort {
+        self.session.kind.effort().unwrap_or_default()
+    }
+
+    /// The profile and model this session is pinned to.
+    pub fn profile_and_model(&self) -> (&str, &str) {
+        match &self.session.kind {
+            SessionKind::Native {
+                provider_profile,
+                model,
+                ..
+            } => (provider_profile, model),
+            SessionKind::Connector { .. } => ("", ""),
+        }
+    }
+
+    /// Changes the effort for later turns and persists it with the
+    /// session. A level the adapter cannot send for this model is refused
+    /// with the typed reason and nothing is stored; the transcript records
+    /// an applied change as a status event.
+    pub async fn set_effort(&mut self, effort: ReasoningEffort) -> Result<EffortOutcome> {
+        let (_, model) = self.profile_and_model();
+        let model = model.to_owned();
+        let capabilities = self.adapter.capabilities(&model).await?;
+        if let EffortSupport::Unsupported(reason) =
+            effort_support(self.adapter.protocol(), Some(&capabilities), effort)
+        {
+            return Ok(EffortOutcome::Unsupported { effort, reason });
+        }
+        if self.effort() == effort {
+            return Ok(EffortOutcome::Applied { effort });
+        }
+        self.store
+            .set_native_effort(&self.session.id, effort)
+            .await?;
+        if let SessionKind::Native {
+            effort: current, ..
+        } = &mut self.session.kind
+        {
+            *current = effort;
+        }
+        let event = self.harness_event(
+            EventKind::StatusChanged {
+                status: SessionStatus::Idle,
+            },
+            Some(serde_json::json!({ "effort": effort })),
+        );
+        self.store.append_events(vec![event]).await?;
+        Ok(EffortOutcome::Applied { effort })
+    }
+
     pub fn approval_mode(&self) -> ApprovalMode {
         self.approval
     }
@@ -302,9 +357,9 @@ impl NativeAgent {
     }
 
     fn request(&self, prompt: &str) -> PromptRequest {
-        let model = match &self.session.kind {
-            SessionKind::Native { model, .. } => model.clone(),
-            SessionKind::Connector { .. } => String::new(),
+        let (model, effort) = match &self.session.kind {
+            SessionKind::Native { model, effort, .. } => (model.clone(), *effort),
+            SessionKind::Connector { .. } => (String::new(), ReasoningEffort::Auto),
         };
         let mut messages = Vec::new();
         let mut content = prompt.to_owned();
@@ -334,7 +389,10 @@ impl NativeAgent {
                 Phase::Planning => Vec::new(),
                 Phase::Coding => NativeTools::definitions(),
             },
-            options: RequestOptions::default(),
+            options: RequestOptions {
+                effort,
+                ..RequestOptions::default()
+            },
         }
     }
 
@@ -850,7 +908,8 @@ impl AgentBuilder {
         }
     }
 
-    /// Opens or creates the session and builds its agent.
+    /// Opens or creates the session and builds its agent. A new session
+    /// starts at `Auto` effort; the draft path sets an explicit one.
     pub async fn open(
         &self,
         selector: SessionSelector,
@@ -858,30 +917,51 @@ impl AgentBuilder {
         model: Option<&str>,
         phase: Option<Phase>,
     ) -> Result<NativeAgent> {
-        let session = match self.find_session(&selector, phase).await? {
-            Some(session) => session,
+        match self.find_session(&selector, phase).await? {
+            Some(session) => self.agent_for(session).await,
             None => {
                 let (profile_name, model_id) = self.resolve_model(model, profile)?;
-                let now = Utc::now();
-                let id = SessionId(uuid::Uuid::new_v4().to_string());
-                let name = Self::session_name(&selector, &id);
-                let session = Session {
-                    id,
-                    name,
-                    kind: SessionKind::Native {
-                        provider_profile: profile_name,
-                        model: model_id,
-                    },
-                    phase: phase.unwrap_or(Phase::Planning),
-                    workspace: self.workspace.root().to_path_buf(),
-                    created_at: now,
-                    updated_at: now,
-                    parent_id: None,
-                };
-                self.store.create(session.clone()).await?;
-                session
+                self.create_native(
+                    &selector,
+                    profile_name,
+                    model_id,
+                    ReasoningEffort::Auto,
+                    phase,
+                )
+                .await
             }
+        }
+    }
+
+    /// Creates a native session from already resolved choices and builds
+    /// its agent. The profile and model are stored as given; callers
+    /// resolve aliases first.
+    pub async fn create_native(
+        &self,
+        selector: &SessionSelector,
+        profile: String,
+        model: String,
+        effort: ReasoningEffort,
+        phase: Option<Phase>,
+    ) -> Result<NativeAgent> {
+        let now = Utc::now();
+        let id = SessionId(uuid::Uuid::new_v4().to_string());
+        let name = Self::session_name(selector, &id);
+        let session = Session {
+            id,
+            name,
+            kind: SessionKind::Native {
+                provider_profile: profile,
+                model,
+                effort,
+            },
+            phase: phase.unwrap_or(Phase::Planning),
+            workspace: self.workspace.root().to_path_buf(),
+            created_at: now,
+            updated_at: now,
+            parent_id: None,
         };
+        self.store.create(session.clone()).await?;
         self.agent_for(session).await
     }
 
@@ -893,6 +973,7 @@ impl AgentBuilder {
         let SessionKind::Native {
             provider_profile,
             model,
+            ..
         } = &session.kind
         else {
             return Err(Error::config(

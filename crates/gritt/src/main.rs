@@ -26,6 +26,7 @@ use gritt_provider::ReqwestTransport;
 mod config;
 mod doctor;
 mod keys;
+mod setup;
 
 /// Run native and installed AI coding agents from one local terminal.
 #[derive(Parser)]
@@ -221,7 +222,8 @@ fn plane(builder: AgentBuilder) -> Result<ControlPlane> {
         .collect();
     secrets.extend(environment_secrets(&blocked));
     let external = default_connectors_with_secrets(&builder.config.connectors, secrets)?;
-    Ok(ControlPlane::new(Arc::new(builder), external))
+    let file_setup = Arc::new(setup::FileSetup::new(builder.workspace_root(), resolver()));
+    Ok(ControlPlane::new(Arc::new(builder), external).with_setup(file_setup))
 }
 
 /// The native approval flags mean nothing on an external agent, which
@@ -518,6 +520,7 @@ async fn session_command(
                         gritt_core::session::SessionKind::Native {
                             provider_profile,
                             model,
+                            ..
                         } => format!("{provider_profile}/{model}"),
                         gritt_core::session::SessionKind::Connector { id } =>
                             format!("connector:{}", id.as_str()),

@@ -1,25 +1,57 @@
 //! The control plane: picks the backend for a session and hands the modes
 //! one [`Driver`] whichever path produced it. The native connector is the
 //! first connector; external ones are optional and a missing one only
-//! fails its own sessions.
+//! fails its own sessions. It also validates and opens session drafts and
+//! reports profile and catalog state for the setup flow.
 
 use std::sync::Arc;
 
 use chrono::Utc;
 use gritt_core::connector::{AuthState, Connector, ConnectorId, ConnectorInfo, Transport};
+use gritt_core::provider::{ModelInfo, ModelListStatus, Protocol, ReasoningEffort};
 use gritt_core::secret::Secret;
 use gritt_core::session::{Phase, Session, SessionId, SessionKind, SessionStore};
-use gritt_core::{Error, Result};
+use gritt_core::{Error, ErrorKind, Result};
+use gritt_provider::adapter::CapabilitySource;
+use gritt_provider::alias;
+use gritt_provider::effort::{effort_support, EffortSupport};
 
 use crate::agent::{AgentBuilder, SessionSelector};
 use crate::connector_session::ConnectorSession;
+use crate::draft::{
+    CatalogState, DraftError, DraftOutcome, DraftWarning, ResolvedDraft, SessionDraft,
+};
 use crate::driver::Driver;
 use crate::native_connector::NativeConnector;
+use crate::setup::{CredentialState, ProfileSummary, ProviderSetup, ReadOnlySetup};
+
+/// A profile's model list as the model picker sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileCatalog {
+    pub profile: String,
+    pub protocol: Protocol,
+    pub state: CatalogState,
+    pub models: Vec<ModelInfo>,
+}
+
+/// What opening a draft did.
+pub enum DraftOpen {
+    Opened {
+        driver: Box<dyn Driver>,
+        catalog: CatalogState,
+        warnings: Vec<DraftWarning>,
+    },
+    Rejected {
+        errors: Vec<DraftError>,
+        catalog: Option<CatalogState>,
+    },
+}
 
 pub struct ControlPlane {
     pub builder: Arc<AgentBuilder>,
     native: Arc<NativeConnector>,
     external: Vec<Arc<dyn Connector>>,
+    setup: Arc<dyn ProviderSetup>,
 }
 
 impl ControlPlane {
@@ -29,7 +61,343 @@ impl ControlPlane {
             builder,
             native,
             external,
+            setup: Arc::new(ReadOnlySetup),
         }
+    }
+
+    /// Injects the binary's config and keychain writer (ADR-006).
+    pub fn with_setup(mut self, setup: Arc<dyn ProviderSetup>) -> Self {
+        self.setup = setup;
+        self
+    }
+
+    pub fn setup(&self) -> &Arc<dyn ProviderSetup> {
+        &self.setup
+    }
+
+    /// Every configured profile with credential availability, never a
+    /// value.
+    pub fn profile_summaries(&self) -> Vec<ProfileSummary> {
+        let config = &self.builder.config;
+        config
+            .profiles
+            .iter()
+            .map(|(name, profile)| ProfileSummary {
+                name: name.clone(),
+                protocol: profile.protocol,
+                base_url: profile.base_url.clone(),
+                credential: match self.builder.keys.key(name, &profile.key) {
+                    Ok(_) => CredentialState::Available,
+                    Err(_) => CredentialState::Missing {
+                        env_var_name: profile.key.env_var_name.clone(),
+                    },
+                },
+                is_default: config.default_profile.as_deref() == Some(name.as_str()),
+            })
+            .collect()
+    }
+
+    /// Warms a known profile's model list and reports its state without
+    /// exposing the provider body. An unknown profile is a config error.
+    pub async fn warm_catalog(&self, profile: &str) -> Result<CatalogState> {
+        if !self.builder.config.profiles.contains_key(profile) {
+            return Err(Error::config(format!("unknown profile `{profile}`")));
+        }
+        let from_status = |status: Option<ModelListStatus>| match status {
+            Some(ModelListStatus::Fresh { fetched_at }) => CatalogState::Fresh { fetched_at },
+            Some(ModelListStatus::Stale { fetched_at }) => CatalogState::Stale { fetched_at },
+            None => CatalogState::Skipped,
+        };
+        if self.builder.cache.is_none() {
+            return Ok(from_status(self.builder.catalog.status(profile)));
+        }
+        match self.builder.load_catalog(profile).await? {
+            None => Ok(from_status(self.builder.catalog.status(profile))),
+            Some(error) if error.kind == ErrorKind::MissingModelList => Ok(CatalogState::Missing {
+                reason: error.message,
+            }),
+            Some(error) => Ok(CatalogState::RefreshFailed {
+                reason: error.message,
+            }),
+        }
+    }
+
+    /// Warms the profile's list and returns it for the model picker.
+    pub async fn catalog(&self, profile: &str) -> Result<ProfileCatalog> {
+        let state = self.warm_catalog(profile).await?;
+        let protocol = self.builder.config.profiles[profile].protocol;
+        let models = self
+            .builder
+            .catalog
+            .list(profile)
+            .map(|list| list.models)
+            .unwrap_or_default();
+        Ok(ProfileCatalog {
+            profile: profile.to_owned(),
+            protocol,
+            state,
+            models,
+        })
+    }
+
+    /// Validates a draft: profile, model, and effort together, after
+    /// warming the profile's catalog so model resolution and effort
+    /// support use the provider's data. Storage failures are `Err`;
+    /// everything a user can fix is a typed [`DraftOutcome::Rejected`].
+    pub async fn validate_draft(&self, draft: &SessionDraft) -> Result<DraftOutcome> {
+        if let Some(name) = &draft.name {
+            if let Some(session) = self.builder.store.find_by_name(name).await? {
+                return self.validate_resume(draft, session).await;
+            }
+        }
+        self.validate_new(draft).await
+    }
+
+    async fn validate_resume(
+        &self,
+        draft: &SessionDraft,
+        session: Session,
+    ) -> Result<DraftOutcome> {
+        let rejected = |error: DraftError| {
+            Ok(DraftOutcome::Rejected {
+                errors: vec![error],
+                catalog: None,
+            })
+        };
+        let recorded = session
+            .workspace
+            .canonicalize()
+            .unwrap_or_else(|_| session.workspace.clone());
+        if recorded != self.builder.workspace_root() {
+            return rejected(DraftError::OtherWorkspace {
+                name: session.name,
+                workspace: session.workspace,
+            });
+        }
+        let SessionKind::Native {
+            provider_profile,
+            model,
+            effort: stored_effort,
+        } = &session.kind
+        else {
+            let SessionKind::Connector { id } = session.kind else {
+                unreachable!("session kinds are native or connector");
+            };
+            return rejected(DraftError::ConnectorSession {
+                name: session.name,
+                connector: id,
+            });
+        };
+        let profile_mismatch = draft
+            .profile
+            .as_deref()
+            .is_some_and(|wanted| wanted != provider_profile);
+        let model_mismatch = match draft.model.as_deref() {
+            None => false,
+            Some(wanted) => {
+                match alias::resolve(
+                    &self.builder.config,
+                    &self.builder.catalog,
+                    wanted,
+                    Some(provider_profile),
+                ) {
+                    Ok(resolved) => {
+                        resolved.profile != *provider_profile || resolved.model != *model
+                    }
+                    Err(_) => true,
+                }
+            }
+        };
+        if profile_mismatch || model_mismatch {
+            return rejected(DraftError::SessionPinned {
+                name: session.name,
+                profile: provider_profile.clone(),
+                model: model.clone(),
+                requested_profile: draft.profile.clone(),
+                requested_model: draft.model.clone(),
+            });
+        }
+        let catalog = self.warm_catalog(provider_profile).await?;
+        let effort = draft.effort.unwrap_or(*stored_effort);
+        if let Some(error) = self.effort_error(provider_profile, model, effort) {
+            return Ok(DraftOutcome::Rejected {
+                errors: vec![error],
+                catalog: Some(catalog),
+            });
+        }
+        Ok(DraftOutcome::Ready {
+            draft: ResolvedDraft {
+                name: Some(session.name.clone()),
+                resume: Some(session.id.clone()),
+                profile: provider_profile.clone(),
+                model: model.clone(),
+                effort,
+                phase: draft.phase.unwrap_or(session.phase),
+            },
+            catalog,
+            warnings: Vec::new(),
+        })
+    }
+
+    async fn validate_new(&self, draft: &SessionDraft) -> Result<DraftOutcome> {
+        let config = &self.builder.config;
+        let Some(profile) = draft
+            .profile
+            .clone()
+            .or_else(|| config.default_profile.clone())
+        else {
+            return Ok(DraftOutcome::Rejected {
+                errors: vec![DraftError::MissingProfile],
+                catalog: None,
+            });
+        };
+        if !config.profiles.contains_key(&profile) {
+            return Ok(DraftOutcome::Rejected {
+                errors: vec![DraftError::UnknownProfile { profile }],
+                catalog: None,
+            });
+        }
+        let catalog = self.warm_catalog(&profile).await?;
+        let rejected = |error: DraftError, catalog: CatalogState| {
+            Ok(DraftOutcome::Rejected {
+                errors: vec![error],
+                catalog: Some(catalog),
+            })
+        };
+        let Some(model_name) = draft.model.clone().or_else(|| config.default_model.clone()) else {
+            return rejected(DraftError::MissingModel, catalog);
+        };
+        let resolved =
+            match alias::resolve(config, &self.builder.catalog, &model_name, Some(&profile)) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    return rejected(
+                        DraftError::ModelResolution {
+                            model: model_name,
+                            message: error.message,
+                        },
+                        catalog,
+                    );
+                }
+            };
+        if resolved.profile != profile {
+            return rejected(
+                DraftError::ModelOutsideProfile {
+                    model: model_name,
+                    model_profile: resolved.profile,
+                    profile,
+                },
+                catalog,
+            );
+        }
+        let mut warnings = Vec::new();
+        if let Some(from) = &resolved.remapped_from {
+            warnings.push(DraftWarning::DeprecatedModelRemapped {
+                from: from.clone(),
+                to: resolved.model.clone(),
+            });
+        }
+        if catalog.has_list()
+            && self
+                .builder
+                .catalog
+                .model(&profile, &resolved.model)
+                .is_none()
+        {
+            warnings.push(DraftWarning::ModelNotInCatalog {
+                profile: profile.clone(),
+                model: resolved.model.clone(),
+            });
+        }
+        let effort = draft.effort.unwrap_or_default();
+        if let Some(error) = self.effort_error(&profile, &resolved.model, effort) {
+            return rejected(error, catalog);
+        }
+        Ok(DraftOutcome::Ready {
+            draft: ResolvedDraft {
+                name: draft.name.clone(),
+                resume: None,
+                profile,
+                model: resolved.model,
+                effort,
+                phase: draft.phase.unwrap_or(Phase::Planning),
+            },
+            catalog,
+            warnings,
+        })
+    }
+
+    /// The same rule the adapter applies before a request.
+    fn effort_error(
+        &self,
+        profile: &str,
+        model: &str,
+        effort: ReasoningEffort,
+    ) -> Option<DraftError> {
+        let protocol = self.builder.config.profiles.get(profile)?.protocol;
+        let capabilities = self.builder.catalog.capabilities(profile, model);
+        match effort_support(protocol, capabilities.as_ref(), effort) {
+            EffortSupport::Supported => None,
+            EffortSupport::Unsupported(reason) => Some(DraftError::EffortUnsupported {
+                profile: profile.to_owned(),
+                model: model.to_owned(),
+                effort,
+                reason,
+            }),
+        }
+    }
+
+    /// Validates the draft and, when it is ready, opens the session: a
+    /// resumed one keeps its pinned profile and model and takes the
+    /// draft's effort and phase; a new one is created from the resolved
+    /// choices.
+    pub async fn open_draft(&self, draft: SessionDraft) -> Result<DraftOpen> {
+        let (resolved, catalog, warnings) = match self.validate_draft(&draft).await? {
+            DraftOutcome::Ready {
+                draft,
+                catalog,
+                warnings,
+            } => (draft, catalog, warnings),
+            DraftOutcome::Rejected { errors, catalog } => {
+                return Ok(DraftOpen::Rejected { errors, catalog });
+            }
+        };
+        let driver: Box<dyn Driver> = match &resolved.resume {
+            Some(id) => {
+                let session = self
+                    .builder
+                    .find_session(&SessionSelector::Id(id.clone()), Some(resolved.phase))
+                    .await?
+                    .ok_or_else(|| Error::storage(format!("session `{}` vanished", id.0)))?;
+                let mut agent = self.builder.agent_for(session).await?;
+                if agent.effort() != resolved.effort {
+                    agent.set_effort(resolved.effort).await?;
+                }
+                Box::new(agent)
+            }
+            None => {
+                let selector = match &resolved.name {
+                    Some(name) => SessionSelector::Named(name.clone()),
+                    None => SessionSelector::New { name: None },
+                };
+                Box::new(
+                    self.builder
+                        .create_native(
+                            &selector,
+                            resolved.profile,
+                            resolved.model,
+                            resolved.effort,
+                            Some(resolved.phase),
+                        )
+                        .await?,
+                )
+            }
+        };
+        Ok(DraftOpen::Opened {
+            driver,
+            catalog,
+            warnings,
+        })
     }
 
     /// A control plane with the native connector only.
