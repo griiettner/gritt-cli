@@ -246,3 +246,78 @@ out; if it recurs, the PTY waits are the place to look.
 Unchanged from round 1, minus the items closed above. The manual terminal
 walkthrough is still outstanding and is still the chain's, not this
 ticket's, to close.
+
+---
+
+# Round 3
+
+## Trigger
+
+Third review of PR #11 at `83ae981` returned `needs-fix` with two
+confirmed Medium findings. Round-2 fixes 1, 2, 5 and 6 were confirmed
+complete; 3 and 4 were partial, and both remaining defects are the halves
+those two left open.
+
+## Changes per finding
+
+**1 — metadata still blocked terminal input.** The `Finished` handler
+awaited `record_write` for every observed write and then the scan.
+`record_write` had been moved onto the bounded blocking pool in round 2 to
+get the stat off the loop, which fixed the stat but left the *await* on
+the loop: with both Git slots busy, the handler stopped drawing and
+stopped reading keys, Escape included. That is exactly the moment it
+matters, because a turn that just wrote files is what fills those slots.
+Recording and the follow-on scan now go through one background helper,
+`record_and_scan`, which captures the sidebar generation at the point of
+request so a result for a session the user has left is still refused when
+it lands. `a_turn_finishing_does_not_wait_for_the_workspace_observer`
+fills the pool with a `git` that blocks for two seconds and asserts the
+handler returns inside 500 ms; against the previous code it fails with the
+handler still waiting.
+
+**2 — ordinary completions could disable MCP cancellation.** A single
+`loading: Option<String>` was shared by every kind of asynchronous work.
+In the reported sequence — a slow `/models` load, its picker closed, then
+an MCP restart — the catalog response set that field to `None`, so the
+reducer's Escape saw nothing running and produced no `Action::Cancel`, and
+the runtime's cancel path was gated on the same field. The restart could
+not be cancelled at all.
+
+Work is now tracked per kind. `App::busy` is a map from `Work`
+(`Open`, `Mcp`, `Setup`, `Catalog`, `Sessions`, `Diff`) to its label;
+`App::loading()` derives the line on screen from it in priority order,
+`App::is_busy()` is what Escape acts on, and each completion ends only its
+own kind. `Runtime` records which kind occupies its ordinary slot, so
+superseding ends that kind and no other, and `cancel_work` ends every kind
+it actually stopped — signalling MCP rather than aborting it, as before.
+The round-2 test that asserted the shared field went quiet after a session
+list now asserts the opposite and correct thing: the session list ends its
+own label and the transition keeps saying it is outstanding.
+`a_catalog_response_cannot_disable_cancelling_an_mcp_restart` drives the
+reported sequence and fails against a simulated shared flag.
+
+**Optional, applied.** `a_slow_keychain_is_not_on_the_path_to_the_first_frame`
+in `tests/tui_integration.rs` builds a plane whose key provider takes
+750 ms, proves the enumeration really is that slow, then builds and draws
+the first frame from the configured defaults and the workspace and asserts
+it completes inside 200 ms.
+
+## Validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, 0 errors |
+| `cargo test --workspace --no-fail-fast` | pass, 477 passed, 0 failed |
+| `cargo test -p gritt --test tui_pty` | pass, 10 passed |
+| `cargo test -p gritt-harness` | pass, 312 passed |
+| `GRITT_LIVE_MCP_TESTS=1 ... --test mcp_live_smoke` | pass, 1 passed |
+
+Both new runtime tests were checked against the previous code and fail
+there, so neither is a test that would pass either way. The round-2 PTY
+flake did not recur in this round's runs.
+
+## Remaining follow-up
+
+Unchanged. The manual terminal walkthrough by a human is still
+outstanding, and it is the chain's to close rather than this ticket's.
