@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use gritt_core::event::{Event, StopReason, Usage};
 use gritt_core::provider::{
-    EventStream, ModelCapabilities, PromptRequest, Protocol, ProviderAdapter, RequestOptions, Role,
+    EventStream, ModelCapabilities, PromptRequest, Protocol, ProviderAdapter, ReasoningIntent,
+    RequestOptions, Role,
 };
 use gritt_core::session::{BoxFuture, ContinuationState};
 use gritt_core::tool::{ToolCall, ToolCallId, ToolDefinition, ToolResult};
@@ -88,8 +89,20 @@ impl ResponsesAdapter {
             if let Some(max_tokens) = state.options.max_tokens {
                 body["max_output_tokens"] = serde_json::json!(max_tokens);
             }
-            if state.options.reasoning == Some(true) {
-                body["reasoning"] = serde_json::json!({ "effort": "medium", "summary": "auto" });
+            // Effort maps to the documented `reasoning.effort` field. The
+            // legacy switch enables reasoning at the provider's default
+            // level; `Auto` sends nothing. The intent was validated before
+            // the first request, so a contradictory stored state falls
+            // back to sending nothing rather than failing a continuation.
+            match state.options.reasoning_intent() {
+                Ok(ReasoningIntent::Explicit(effort)) => {
+                    body["reasoning"] =
+                        serde_json::json!({ "effort": effort.as_str(), "summary": "auto" });
+                }
+                Ok(ReasoningIntent::Enabled) => {
+                    body["reasoning"] = serde_json::json!({ "summary": "auto" });
+                }
+                Ok(ReasoningIntent::Default) | Err(_) => {}
             }
             if let Some(schema) = &state.options.structured_output {
                 body["text"] = serde_json::json!({

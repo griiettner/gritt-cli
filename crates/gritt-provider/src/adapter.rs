@@ -10,7 +10,7 @@ use chrono::Utc;
 use futures::stream::{Stream, StreamExt};
 use gritt_core::event::{Event, EventKind, EventSource, SessionStatus, StopReason, Usage};
 use gritt_core::provider::{
-    EventStream, ModelCapabilities, PromptRequest, Protocol, ProviderProfile,
+    EventStream, ModelCapabilities, PromptRequest, Protocol, ProviderProfile, ReasoningIntent,
 };
 use gritt_core::secret::{Secret, SecretRef};
 use gritt_core::session::SessionId;
@@ -18,6 +18,7 @@ use gritt_core::tool::{ToolCall, ToolCallId};
 use gritt_core::{Error, ErrorKind, Result};
 
 use crate::cancel::CancellationToken;
+use crate::effort::{effort_support, unsupported_effort_error, EffortSupport};
 use crate::sse::{sse_stream, SseEvent};
 use crate::transport::{HttpRequest, HttpResponse, HttpTransport};
 
@@ -85,12 +86,18 @@ impl AdapterContext {
     /// attached to the first event of the stream. The warning is scoped to
     /// this request: any warning left by an earlier request is dropped
     /// here, and every pre-stream failure clears it again.
+    ///
+    /// An explicit reasoning effort is the one exception to "unknown does
+    /// not block": it is refused with a typed error whenever
+    /// [`effort_support`] finds no safe mapping for the protocol, because
+    /// sending a level the provider may misread is worse than refusing.
     pub fn check_capabilities(
         &self,
         request: &PromptRequest,
         emitter: &EventEmitter,
     ) -> Result<Option<ModelCapabilities>> {
         emitter.clear_pending_diagnostic();
+        let intent = request.options.reasoning_intent()?;
         let capabilities = self
             .capabilities
             .capabilities(&self.profile.name, &request.model);
@@ -104,8 +111,15 @@ impl AdapterContext {
                 capabilities.as_ref().and_then(|c| c.structured_output),
             ));
         }
-        if request.options.reasoning == Some(true) {
+        if intent != ReasoningIntent::Default {
             requested.push(("reasoning", capabilities.as_ref().and_then(|c| c.reasoning)));
+        }
+        if let ReasoningIntent::Explicit(effort) = intent {
+            if let EffortSupport::Unsupported(reason) =
+                effort_support(self.profile.protocol, capabilities.as_ref(), effort)
+            {
+                return Err(unsupported_effort_error(&request.model, effort, &reason));
+            }
         }
         let mut unreported = Vec::new();
         for (feature, reported) in requested {

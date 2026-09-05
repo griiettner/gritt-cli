@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use gritt_core::event::{Event, StopReason, Usage};
 use gritt_core::provider::{
-    EventStream, ModelCapabilities, PromptRequest, Protocol, ProviderAdapter, RequestOptions, Role,
+    EventStream, ModelCapabilities, PromptRequest, Protocol, ProviderAdapter, ReasoningIntent,
+    RequestOptions, Role,
 };
 use gritt_core::session::{BoxFuture, ContinuationState};
 use gritt_core::tool::{ToolDefinition, ToolResult};
@@ -103,10 +104,19 @@ impl ChatCompletionsAdapter {
         }
         // Reasoning is only requested where the list says it exists; the
         // OpenRouter form is the one Chat Completions endpoints document.
-        if state.options.reasoning == Some(true)
-            && capabilities.and_then(|c| c.reasoning) == Some(true)
-        {
-            body["reasoning"] = serde_json::json!({ "effort": "medium" });
+        // An explicit level was already checked by `effort_support` before
+        // the first request; the same gate here keeps a continuation from
+        // sending one the list no longer supports.
+        if capabilities.and_then(|c| c.reasoning) == Some(true) {
+            match state.options.reasoning_intent() {
+                Ok(ReasoningIntent::Explicit(effort)) => {
+                    body["reasoning"] = serde_json::json!({ "effort": effort.as_str() });
+                }
+                Ok(ReasoningIntent::Enabled) => {
+                    body["reasoning"] = serde_json::json!({ "enabled": true });
+                }
+                Ok(ReasoningIntent::Default) | Err(_) => {}
+            }
         }
         body
     }

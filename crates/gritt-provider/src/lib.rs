@@ -13,6 +13,7 @@ pub mod adapter;
 pub mod alias;
 pub mod cancel;
 pub mod chat_completions;
+pub mod effort;
 pub mod embeddings;
 pub mod messages;
 pub mod models;
@@ -28,6 +29,7 @@ pub use adapter::{
     AdapterContext, CapabilitySource, EnvKeys, KeyProvider, NoCapabilities, StaticKey,
 };
 pub use cancel::CancellationToken;
+pub use effort::{effort_support, EffortSupport};
 pub use models::{ModelCache, ModelCatalog};
 pub use transport::{FixtureResponse, FixtureTransport, HttpTransport, ReqwestTransport};
 
