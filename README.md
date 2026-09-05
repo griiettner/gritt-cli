@@ -1,35 +1,59 @@
 # Gritt
 
-Gritt is a local workspace for running AI agent sessions from one place. It
-starts as a Rust terminal application and is designed to grow into a local
-agent control plane with a desktop or web interface later.
+Gritt is a local terminal application for running AI coding agents from one
+place. Bring a provider key and Gritt runs its own agent loop with tools,
+permissions, and resumable sessions. Or point it at an installed agent such
+as Codex or Claude Code and Gritt supervises that agent while it keeps its
+own tools and authority. Both paths share one interface, one session store,
+and one local database. Nothing leaves your machine except the requests you
+configure.
 
-The repository keeps the name `gritt-cli` while the first terminal version is
-built.
+It ships as one Rust binary for macOS, Windows, and Linux. User
+documentation starts at [`docs/README.md`](docs/README.md), and
+[`CONTRIBUTING.md`](CONTRIBUTING.md) covers development and the agent
+workspace in this repository.
 
-## Status
+## Using the CLI
 
-The first terminal release is implemented. The Cargo workspace at the
-repository root builds one `gritt` binary for macOS, Windows, and Linux
-with the native provider path (OpenRouter, OpenAI, Anthropic, and generic
-OpenAI-compatible profiles), sessions with planning and coding phases, the
-permission engine and workspace-bounded tools, print, REPL, and full-screen
-modes, supervised Codex, Claude Code, Cursor, and OpenCode connectors, one
-embedded local database shared with `gritt-agent`, content-free telemetry,
-and reproducible checksummed builds.
-
-User documentation starts at [`docs/README.md`](docs/README.md). The
-accepted decisions are ADR-006 through ADR-011 under
-`.agents/memory/decisions/`; [`.agents/plans/plan1.md`](.agents/plans/plan1.md)
-remains the plan they were drawn from.
-
-Quick start:
+Build from source (Rust toolchain only) or download a release binary, then
+configure a provider profile and a key:
 
 ```bash
 cargo build --release --locked
-./target/release/gritt doctor
-./target/release/gritt run --plan "hello"
+cp docs/config.example.toml config.toml
+export OPENROUTER_API_KEY=...        # or: echo -n "$KEY" | gritt key-set openrouter
+./gritt doctor                         # config, keys, database, connectors; never prints a key
 ```
+
+[`docs/config.example.toml`](docs/config.example.toml) is an annotated
+template with every section: profiles, aliases, model-list policy, the
+permission policy, connectors, interface, and logging. The config names a
+key's keychain entry and environment variable; it never holds the value.
+
+Plan, code, and resume in named sessions:
+
+```bash
+gritt run --plan --session refactor "How should we split the parser module?"
+gritt run --code --session refactor "Split the parser as we planned"
+gritt repl --session refactor
+gritt tui --session refactor
+gritt session list
+```
+
+Coding turns get workspace-bounded file read, file write, and shell tools,
+each gated by the `allow`, `ask`, `deny` policy with a diff shown before
+any write. Ctrl-C cancels a turn and kills any child process it started.
+
+Run an installed agent through the same sessions and views instead:
+
+```bash
+gritt connectors
+gritt run --connector codex "Add a test for the alias resolver"
+gritt run --connector claude --session review "Review the last commit"
+```
+
+`gritt telemetry` prints the local, content-free records. The full guide is
+[`docs/getting-started.md`](docs/getting-started.md).
 
 ## How Gritt runs agents
 
@@ -41,7 +65,7 @@ history.
 The user supplies a provider key. Gritt owns the agent loop, provider adapter,
 tools, permissions, cancellation, and session continuation.
 
-The first provider targets are:
+Supported providers:
 
 | Provider | Protocol | Key source |
 | --- | --- | --- |
@@ -60,7 +84,7 @@ agent keeps ownership of its own loop and tools. Gritt translates the agent's
 output into the shared event model, relays approvals, handles cancellation, and
 stores the session beside native sessions.
 
-The connector order for this machine is:
+The connectors, in the order they were built, are:
 
 1. Native connector
 2. Codex
@@ -70,7 +94,7 @@ The connector order for this machine is:
 Connectors are optional. A missing or incompatible external CLI must not break
 the native path.
 
-## Proposed architecture
+## Architecture
 
 Both execution paths produce provider-neutral events for streamed text,
 reasoning summaries, tool calls and results, approvals, usage, status changes,
@@ -84,7 +108,7 @@ The main boundaries are:
 - `gritt-connector` supervises external agent processes and translates their events.
 - `gritt` is the binary. It selects modes, loads configuration and keys, and composes the other crates.
 
-The planned workspace is:
+The workspace is:
 
 ```text
 crates/
@@ -95,21 +119,22 @@ crates/
   gritt/
 ```
 
-Dependency versions will be shared from the workspace `Cargo.toml`. Product
-code is Rust and the installed binary has no runtime dependency. Repository
-maintenance runs through the separate `gritt-agent` crate at `.agents/cli/`.
-The repository has no Node tooling.
+Dependency versions are shared from the workspace `Cargo.toml`, and the
+toolchain is pinned in `rust-toolchain.toml`. Product code is Rust and the
+installed binary has no runtime dependency. Repository maintenance runs
+through the separate `gritt-agent` crate at `.agents/cli/`. The repository
+has no Node tooling.
 
 ## Terminal modes
 
-Features are built in this order:
+Three modes share one session store:
 
 1. Print mode accepts one prompt, streams output, and exits with a meaningful status.
 2. REPL mode adds interactive history and session continuation.
 3. Full-screen mode adds transcript navigation, approvals, diff review, status, commands, and task views.
 
-Print mode is the fallback. Later interface work must not make it unreliable or
-require a full-screen terminal.
+Print mode is the fallback. Every feature works there first, so scripts never
+need a full-screen terminal.
 
 ## Provider layer
 
@@ -127,162 +152,21 @@ the provider reports them.
 ## Permissions and keys
 
 Native tools pass through a policy engine with `allow`, `ask`, and `deny`
-outcomes. The first built-in tools cover workspace file access and approved
-shell execution. Child processes are tracked so cancellation can stop them.
+outcomes. The built-in tools cover workspace file access and approved shell
+execution. Shell commands run with the user's authority; a command that
+reaches outside the workspace always asks with a stronger prompt. Child
+processes are tracked so cancellation can stop them.
 
 Config files may name the environment variable used for a provider key, but
 they must never contain the key value. Keys come from the operating system
 keychain or the named environment variable. Logs, fixtures, errors, and
 transcripts must not expose them.
 
-## Working roadmap
-
-### Phase 0: workspace and contracts
-
-- Establish the Cargo workspace and crate boundaries.
-- Define provider-neutral event, session, tool, config, adapter, and connector contracts.
-- Prove HTTPS and SSE handling against OpenRouter with recorded fixtures.
-- Select a terminal UI crate after reviewing accessibility and platform support.
-- Confirm cross-compilation, signing, and release conventions.
-
-### Phase 1: native path
-
-- Add OpenRouter and generic Chat Completions profiles.
-- Fetch and cache model lists.
-- Build print and REPL modes, sessions, permissions, file and shell tools, and cancellation.
-- Stream transcript output and approval prompts in the terminal.
-
-### Phase 2: provider coverage
-
-- Add OpenAI Responses and Anthropic Messages.
-- Generate tool schemas per adapter and enforce capability checks.
-- Store keys in the system keychain and support secure key entry.
-
-### Phase 3: terminal harness
-
-- Add full-screen navigation, diff review, commands, task views, and child sessions.
-- Add provider comparison, usage reporting, diagnostics, and release packaging.
-
-### Phase 4: connectors
-
-- Promote the native path to the connector contract.
-- Add process supervision, health checks, approvals, timeouts, and cancellation.
-- Connect Codex, Claude Code, Cursor, and OpenCode through structured interfaces where available.
-- Keep capability differences visible instead of faking parity.
-
-## Agent workspace
-
-This repository includes a local workspace for planning, durable memory,
-skills, and ticket history:
-
-```text
-.
-├── AGENTS.md                 agent boot router
-├── CLAUDE.md                 Claude Code entry point
-├── .claude/skills/           generated Claude Code skill stubs
-└── .agents/
-    ├── MODELS.md             CLI and model delegation
-    ├── plans/plan1.md        working product proposal
-    ├── memory/               durable architecture and decisions
-    ├── skills/               canonical reusable procedures
-    ├── tasks/                ticket history and backlog
-    ├── brain/                agent infrastructure and local RAG
-    └── cli/                  gritt-agent maintenance CLI (Rust)
-```
-
-`AGENTS.md` is intentionally short. Agents query `gritt-local-memory` first,
-then read the canonical memory, decision, or ticket files returned by the
-search. Accepted project knowledge lives under `.agents/memory/`, while plans
-remain proposals until an ADR or ticket makes a decision explicit.
-
-Canonical skills live under `.agents/skills/`. Claude Code discovers generated
-stubs under `.claude/skills/`, while Codex uses the metadata stored beside each
-canonical skill.
-
-## Delegated model roles
-
-Project work rotates across the installed CLIs according to
-[`.agents/MODELS.md`](.agents/MODELS.md):
-
-| Role | CLI and model |
-| --- | --- |
-| Orchestrator | Claude Code, Fable 5.1 medium |
-| Implementation | Grok CLI, Grok 4.6 high |
-| Reviewer | Codex, GPT 6 Astra. GPT 5.6 Sol medium is the fallback. |
-| Reports and ticket writing | Codex, GPT 5.6 Luna |
-
-Delegated workers start cold, so prompts must include the task, constraints,
-relevant paths, expected result, and verification requirements.
-
-## Development workflow
-
-Before implementing product code:
-
-1. Read `AGENTS.md`.
-2. Query `gritt-local-memory` for relevant decisions and prior work.
-3. Read the returned canonical files and the relevant ticket, if one exists.
-4. Read `.agents/plans/plan1.md` when the task concerns the proposed product direction.
-5. Load the smallest applicable skill before editing.
-
-The full verification set is:
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo build --release
-```
-
-Recorded provider fixtures belong in normal tests. Live requests require
-`GRITT_LIVE_TESTS=1` and the selected profile's key. Live tests are never
-required for a normal pass.
-
-## Agent workspace maintenance
-
-Build the maintenance CLI once per checkout. It needs only the Rust toolchain:
-
-```bash
-cargo build --release --manifest-path .agents/cli/Cargo.toml
-```
-
-The binary lands at `.agents/cli/target/release/gritt-agent` and is also
-the `gritt-local-memory` MCP server declared in `.mcp.json`.
-
-After changing a canonical skill:
-
-```bash
-.agents/cli/target/release/gritt-agent skill sync
-```
-
-After changing memory or ticket files:
-
-```bash
-.agents/cli/target/release/gritt-agent ticket sync
-```
-
-To validate without rewriting generated skill adapters:
-
-```bash
-.agents/cli/target/release/gritt-agent skill sync --check
-.agents/cli/target/release/gritt-agent ticket validate
-```
-
-To refresh or query local memory from the terminal:
-
-```bash
-.agents/cli/target/release/gritt-agent memory index
-.agents/cli/target/release/gritt-agent memory search "query terms"
-```
-
-Do not edit generated `.claude/skills/` stubs or generated memory and ticket
-indexes by hand.
-
 ## Design constraints
 
 - No provider SDKs in the product. Gritt owns its protocol implementations.
 - No Git dependencies without an explicit license and maintenance decision.
 - No secrets or prompt content in logs by default.
-- No later phase starts before the current phase exit criteria are met.
 - No connector-specific behavior leaks into provider-neutral contracts.
 - No terminal scraping when a structured connector interface is available.
 

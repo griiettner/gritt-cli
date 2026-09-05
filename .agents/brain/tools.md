@@ -19,9 +19,9 @@ read_when:
 
 ```bash
 cargo build --release --manifest-path .agents/cli/Cargo.toml
-.agents/cli/target/release/gritt-agent memory index
-.agents/cli/target/release/gritt-agent memory search "query terms" --limit 10
-.agents/cli/target/release/gritt-agent memory serve
+./gritt-agent memory index
+./gritt-agent memory search "query terms" --limit 10
+./gritt-agent memory serve
 ```
 
 The index command is safe to rerun. It walks supported documents, stores

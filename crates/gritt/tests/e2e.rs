@@ -20,6 +20,52 @@ fn gritt() -> Command {
     Command::new(env!("CARGO_BIN_EXE_gritt"))
 }
 
+#[tokio::test]
+async fn default_database_opens_while_memory_is_locked_by_another_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join(".agents/brain/data");
+    std::fs::create_dir_all(&data).unwrap();
+    let memory_path = data.join("agent-memory.db");
+    let database = turso::Builder::new_local(memory_path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let connection = database.connect().unwrap();
+    connection
+        .execute("CREATE TABLE memory_marker (value TEXT)", ())
+        .await
+        .unwrap();
+
+    // The child really encounters the parent's lock with the legacy path.
+    let locked = gritt()
+        .arg("--workspace")
+        .arg(dir.path())
+        .arg("--database")
+        .arg(&memory_path)
+        .args(["session", "list"])
+        .output()
+        .unwrap();
+    assert!(!locked.status.success());
+    assert!(String::from_utf8_lossy(&locked.stderr).contains("lock"));
+
+    let output = gritt()
+        .arg("--workspace")
+        .arg(dir.path())
+        .args(["session", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(data.join("gritt.db").is_file());
+    connection
+        .execute("INSERT INTO memory_marker VALUES ('still open')", ())
+        .await
+        .unwrap();
+}
+
 fn fixture(name: &str) -> Vec<u8> {
     let path = format!(
         "{}/../gritt-provider/tests/fixtures/chat-completions/{name}",
@@ -122,9 +168,8 @@ struct Space {
 impl Space {
     fn new(port: u16) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".gritt")).unwrap();
         std::fs::write(
-            dir.path().join(".gritt/config.toml"),
+            dir.path().join("config.toml"),
             format!(
                 "default_profile = \"local\"\ndefault_model = \"openai/gpt-5-nano\"\n\
                  [profiles.local]\nname = \"local\"\nprotocol = \"chat_completions\"\n\
@@ -353,7 +398,7 @@ fn a_missing_connector_fails_alone_and_native_keeps_working() {
     // Point Cursor at an executable that cannot exist, so the test proves
     // the missing-executable path on every machine, installed CLI or not.
     let missing = space.path().join("no-such-cursor-agent");
-    let config = space.path().join(".gritt/config.toml");
+    let config = space.path().join("config.toml");
     let mut text = std::fs::read_to_string(&config).unwrap();
     text.push_str(&executables_section("cursor", &missing));
     std::fs::write(&config, text).unwrap();
@@ -442,7 +487,7 @@ fn doctor_never_echoes_a_malformed_config_line() {
     let provider = serve(Vec::new(), false);
     let space = Space::new(provider.port);
     std::fs::write(
-        space.path().join(".gritt/config.toml"),
+        space.path().join("config.toml"),
         "[profiles.broken]\nname = \"broken\"\napi_key = \"sk-leak\n",
     )
     .unwrap();

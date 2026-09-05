@@ -10,12 +10,13 @@ Tooling launcher. It does not need the `tkt` hub.
 Run all three, in order:
 
 ```bash
-.agents/cli/target/release/gritt-agent skill sync
-.agents/cli/target/release/gritt-agent ticket sync
-.agents/cli/target/release/gritt-agent ticket validate
+./gritt-agent skill sync
+./gritt-agent ticket sync
+./gritt-agent ticket validate
 ```
 
-Build the binary first when it is missing: `cargo build --release --manifest-path .agents/cli/Cargo.toml`.
+Use the bundled binary. After changing its source, rebuild with
+`cargo build --release --locked --manifest-path .agents/cli/Cargo.toml --bin gritt-agent`.
 
 - `skill sync` rewrites `.claude/skills/` stubs and each skill's `agents/openai.yaml` policy block from `.agents/skills/*/SKILL.md`.
 - `ticket sync` rewrites `.agents/tasks/**/index.yaml` and `.agents/memory/*/index.yaml` from frontmatter.

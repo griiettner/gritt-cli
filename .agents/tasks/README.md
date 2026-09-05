@@ -23,6 +23,6 @@ Do not create placeholder artifacts just to fill the structure.
 Validate ticket structure with:
 
 ```bash
-.agents/cli/target/release/gritt-agent ticket sync
-.agents/cli/target/release/gritt-agent ticket validate
+./gritt-agent ticket sync
+./gritt-agent ticket validate
 ```

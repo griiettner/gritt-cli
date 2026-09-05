@@ -39,6 +39,13 @@ the CLI and MCP server return the same source-aware citation format.
 
 ## Consequences
 
+- Gritt product sessions use `.agents/brain/data/gritt.db` in agent workspaces.
+  This supersedes the shared-file choice in the TKT-0008 plan. Separate table
+  namespaces do not prevent Turso file-lock conflicts between the running
+  memory service and the product process. The product never automatically
+  opens or copies the memory database. Older product sessions remain in that
+  file and can be accessed with `--database` after its other users close it.
+
 - `rusqlite` is removed. `turso` and `tokio` are runtime dependencies.
 - Database calls are asynchronous inside the memory modules and command entry
   point.

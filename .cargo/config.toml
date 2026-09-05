@@ -1,0 +1,5 @@
+[build]
+artifact-dir = "."
+
+[unstable]
+unstable-options = true

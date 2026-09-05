@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "gritt-local-memory": {
-      "command": ".agents/cli/target/release/gritt-agent",
+      "command": ".agents/gritt-agent",
       "args": ["memory", "serve"]
     },
     "turso-local-memory": {

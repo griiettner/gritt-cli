@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use gritt_core::config::{layer_from_value, merge, Config, ConfigLayer};
 use gritt_core::{embeddings, Error, Result};
 
-pub const PROJECT_CONFIG: &str = ".gritt/config.toml";
+/// Project configuration lives at the workspace root so first-run setup does
+/// not require creating a hidden directory.
+pub const PROJECT_CONFIG: &str = "config.toml";
 
 pub fn user_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|dir| dir.join("gritt").join("config.toml"))
@@ -107,7 +109,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("user.toml");
         std::fs::write(&user, "default_model = \"user-model\"\n").unwrap();
-        std::fs::create_dir_all(dir.path().join(".gritt")).unwrap();
         std::fs::write(
             dir.path().join(PROJECT_CONFIG),
             "default_model = \"project-model\"\n",

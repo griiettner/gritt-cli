@@ -10,19 +10,19 @@ cargo build --release --manifest-path .agents/cli/Cargo.toml
 Then run:
 
 ```text
-.agents/cli/target/release/gritt-agent memory index
-.agents/cli/target/release/gritt-agent memory search "query terms"
-.agents/cli/target/release/gritt-agent memory serve
-.agents/cli/target/release/gritt-agent ticket new --title "Ticket title"
-.agents/cli/target/release/gritt-agent ticket new-chain --title "Chain title" --step "one:First step" --step "two:Second step"
-.agents/cli/target/release/gritt-agent ticket identity
-.agents/cli/target/release/gritt-agent ticket chain-check --ticket TKT-0008 --base main
-.agents/cli/target/release/gritt-agent ticket sync
-.agents/cli/target/release/gritt-agent ticket validate
-.agents/cli/target/release/gritt-agent skill new skill-name "Skill description"
-.agents/cli/target/release/gritt-agent skill sync
-.agents/cli/target/release/gritt-agent codex trust --check
-.agents/cli/target/release/gritt-agent migrate cursor --source /path/to/repository --dry-run
+./gritt-agent memory index
+./gritt-agent memory search "query terms"
+./gritt-agent memory serve
+./gritt-agent ticket new --title "Ticket title"
+./gritt-agent ticket new-chain --title "Chain title" --step "one:First step" --step "two:Second step"
+./gritt-agent ticket identity
+./gritt-agent ticket chain-check --ticket TKT-0008 --base main
+./gritt-agent ticket sync
+./gritt-agent ticket validate
+./gritt-agent skill new skill-name "Skill description"
+./gritt-agent skill sync
+./gritt-agent codex trust --check
+./gritt-agent migrate cursor --source /path/to/repository --dry-run
 ```
 
 The six Node commands that used to live here were ported into the crate and

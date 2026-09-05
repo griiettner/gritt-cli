@@ -184,7 +184,7 @@ committed branch is incomplete and must remain active.
 For each worker PR, run this tool first:
 
 ```bash
-.agents/cli/target/release/gritt-agent ticket chain-check --ticket TKT-NNNN --base main
+./gritt-agent ticket chain-check --ticket TKT-NNNN --base main
 ```
 
 Add `--require-report` when the ticket policy requires a report before review.

@@ -1,5 +1,4 @@
-# Runs the dev/cli verify set for the gritt-agent crate on Linux and Windows.
-# macOS is the development platform and is covered locally.
+# Verifies gritt-agent and checks the bundled executable build on each OS.
 name: agent-cli
 
 on:
@@ -8,14 +7,19 @@ on:
     paths:
       - ".agents/cli/**"
       - ".github/workflows/agent-cli.yml"
+      - ".cargo/**"
+      - "rust-toolchain.toml"
   pull_request:
     paths:
       - ".agents/cli/**"
       - ".github/workflows/agent-cli.yml"
+      - ".cargo/**"
+      - "rust-toolchain.toml"
 
 env:
   CARGO_TERM_COLOR: always
   MANIFEST: .agents/cli/Cargo.toml
+  CARGO_BUILD_ARTIFACT_DIR: .agents/cli/target/verification-artifacts
 
 jobs:
   verify:
@@ -24,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       # The integration tests compare generated files byte for byte with
       # committed fixtures, so the checkout must keep LF line endings.
@@ -52,4 +56,14 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --manifest-path ${{ env.MANIFEST }} --all-targets -- -D warnings
       - name: cargo test
-        run: cargo test --manifest-path ${{ env.MANIFEST }}
+        run: cargo test --locked --manifest-path ${{ env.MANIFEST }}
+      - name: Build bundled executable
+        env:
+          CARGO_BUILD_ARTIFACT_DIR: .agents
+        run: cargo build --release --locked --manifest-path ${{ env.MANIFEST }} --bin gritt-agent
+      - name: Run bundled executable (Unix)
+        if: runner.os != 'Windows'
+        run: .agents/gritt-agent --version
+      - name: Run bundled executable (Windows)
+        if: runner.os == 'Windows'
+        run: .agents\gritt-agent.exe --version

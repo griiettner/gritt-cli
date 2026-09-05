@@ -38,7 +38,7 @@ Every durable memory `.md` file needs YAML frontmatter. Match the fields already
 Category `index.yaml` files are **generated** from that frontmatter — `gritt-agent ticket sync` reads each memory file's `id`, `title`, `tags`, and `read_when` and rewrites the index. Never hand-edit an `index.yaml`; a hand-edit is overwritten on the next sync. To get a good index entry, put `tags` and `read_when` in the memory file's frontmatter, then regenerate:
 
 ```bash
-.agents/cli/target/release/gritt-agent ticket sync
+./gritt-agent ticket sync
 ```
 
 ## Step 3 — Write the reflection file

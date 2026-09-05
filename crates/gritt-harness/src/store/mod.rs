@@ -1,9 +1,9 @@
-//! Embedded Turso/libSQL database shared with `gritt-agent` memory.
+//! Embedded Turso database for Gritt product state.
 //!
 //! The memory tables belong to the tooling crate. This module only creates
 //! `gritt_` prefixed tables and records each migration in
-//! `gritt_schema_migrations`, so the two namespaces evolve independently in
-//! one file (ADR-005, TKT-0008 plan).
+//! `gritt_schema_migrations`. Product state uses a separate file by default
+//! so a running memory service cannot lock Gritt out (ADR-005).
 
 mod session_store;
 
@@ -37,8 +37,8 @@ const MIGRATIONS_TABLE: &str = "CREATE TABLE IF NOT EXISTS gritt_schema_migratio
   applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 )";
 
-/// Where the database lives. A workspace with `.agents/` shares the
-/// `gritt-agent` file; anything else uses the user data directory.
+/// Where the database lives. Agent workspaces use their own product file;
+/// anything else uses the user data directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DatabaseLocation {
     Explicit(PathBuf),
@@ -66,7 +66,7 @@ pub fn resolve_location(workspace: &Path, explicit: Option<&Path>) -> Result<Dat
                 .join(".agents")
                 .join("brain")
                 .join("data")
-                .join("agent-memory.db"),
+                .join("gritt.db"),
         ));
     }
     let base = dirs::data_dir()
@@ -428,7 +428,7 @@ mod tests {
         let location = resolve_location(dir.path(), None).unwrap();
         assert_eq!(
             location,
-            DatabaseLocation::Workspace(dir.path().join(".agents/brain/data/agent-memory.db"))
+            DatabaseLocation::Workspace(dir.path().join(".agents/brain/data/gritt.db"))
         );
         let explicit = resolve_location(dir.path(), Some(Path::new("/x/y.db"))).unwrap();
         assert_eq!(

@@ -15,9 +15,8 @@ const ALT_SCREEN_ON: &str = "\x1b[?1049h";
 const ALT_SCREEN_OFF: &str = "\x1b[?1049l";
 
 fn write_config(dir: &Path) {
-    std::fs::create_dir_all(dir.join(".gritt")).unwrap();
     std::fs::write(
-        dir.join(".gritt/config.toml"),
+        dir.join("config.toml"),
         "default_profile = \"local\"\ndefault_model = \"openai/gpt-5-nano\"\n\
          [profiles.local]\nname = \"local\"\nprotocol = \"chat_completions\"\n\
          base_url = \"http://127.0.0.1:9/v1\"\n\
@@ -256,9 +255,8 @@ fn approval_diff_palette_and_sessions_views_work_by_keyboard_without_color() {
         text_sse("Write finished."),
     ]);
     let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join(".gritt")).unwrap();
     std::fs::write(
-        dir.path().join(".gritt/config.toml"),
+        dir.path().join("config.toml"),
         format!(
             "default_profile = \"local\"\ndefault_model = \"openai/gpt-5-nano\"\n\
              [profiles.local]\nname = \"local\"\nprotocol = \"chat_completions\"\n\

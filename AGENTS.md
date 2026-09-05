@@ -29,8 +29,9 @@ decisions are accepted in ADRs or ticket artifacts.
 - `.agents/plans/` holds proposals and planning inputs.
 
 Indexes route to canonical files. Generated indexes and `.claude/skills/`
-stubs must not be edited directly. Regenerate them with `gritt-agent`, built
-once per checkout with `cargo build --release --manifest-path .agents/cli/Cargo.toml`.
+stubs must not be edited directly. Regenerate them with the bundled
+`.agents/gritt-agent` executable. Rebuild only after changing its source, using
+`cargo build --release --locked --manifest-path .agents/cli/Cargo.toml --bin gritt-agent`.
 
 ## Rules
 

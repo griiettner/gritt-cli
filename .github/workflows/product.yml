@@ -54,11 +54,21 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
       - name: cargo clippy
+        env:
+          CARGO_BUILD_ARTIFACT_DIR: target/verification-artifacts
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test
+        env:
+          CARGO_BUILD_ARTIFACT_DIR: target/verification-artifacts
         run: cargo test --workspace --locked
-      - name: cargo build --release
+      - name: Build standalone executable at project root
         run: cargo build --release --locked
+      - name: Run root executable (Unix)
+        if: runner.os != 'Windows'
+        run: ./gritt --version
+      - name: Run root executable (Windows)
+        if: runner.os == 'Windows'
+        run: .\gritt.exe --version
 
   release:
     name: release (${{ matrix.target }})

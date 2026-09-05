@@ -10,16 +10,28 @@ used to live under `.agents/tools/`.
 The crate is its own Cargo workspace root. The future product workspace at the
 repository root does not include it, and it does not depend on product code.
 
-## Build
+## Run the bundled binary
 
-Only the Rust toolchain is required:
+The repository includes `.agents/gritt-agent`. It is the executable
+used by `.mcp.json`; matching-platform clones do not need Rust or a build step.
+The currently bundled binary is for macOS Apple Silicon. A native binary
+must match its operating system and CPU; it cannot also run on Windows or Linux.
 
 ```bash
-cargo build --release --manifest-path .agents/cli/Cargo.toml
+./.agents/gritt-agent --help
 ```
 
-The binary is written to `.agents/cli/target/release/gritt-agent`. `.mcp.json`
-points at that path, so build before starting an MCP client.
+## Rebuild after source changes
+
+Maintainers use the pinned toolchain through rustup:
+
+```bash
+CARGO_BUILD_ARTIFACT_DIR=.agents cargo build --release --locked --manifest-path .agents/cli/Cargo.toml --bin gritt-agent
+```
+
+Cargo places the executable at `.agents/gritt-agent` (`.agents/gritt-agent.exe`
+on Windows). Commit the rebuilt executable with its source changes. Build caches under
+`.agents/cli/target/` are ignored and are never needed to run the bundled binary.
 
 ## Commands
 

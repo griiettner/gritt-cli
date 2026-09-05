@@ -2,19 +2,23 @@
 
 Gritt keeps sessions, events, continuation state, telemetry, analytics,
 and the optional content log in one embedded Turso/libSQL file. It is the
-same engine and, inside a repository that has an `.agents/` folder, the
-same file that the `gritt-agent` tooling uses for local memory (ADR-005,
-TKT-0008 plan).
+same engine that the `gritt-agent` tooling uses for local memory, with a
+separate file so the two processes can run together (ADR-005).
 
 ## Location
 
 | Case | Path |
 | --- | --- |
 | `--database PATH` | that file |
-| the workspace has `.agents/` | `<workspace>/.agents/brain/data/agent-memory.db` |
+| the workspace has `.agents/` | `<workspace>/.agents/brain/data/gritt.db` |
 | otherwise | the user data directory, `gritt/gritt.db` |
 
 `gritt doctor` prints the resolved path and which rule chose it.
+
+Older versions stored product sessions in `agent-memory.db`. Those sessions
+remain there. To access them, close the memory service and any database
+clients, then pass `--database .agents/brain/data/agent-memory.db`. Gritt
+does not copy an open database or move existing sessions automatically.
 
 ## Namespaces
 

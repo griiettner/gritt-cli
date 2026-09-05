@@ -5,6 +5,9 @@
 //! Print mode is the fallback every feature degrades to. The full-screen
 //! mode uses Ratatui 0.30 with its Crossterm 0.29 backend.
 
+// The native turn's nested futures need this depth for Send trait checking.
+#![recursion_limit = "256"]
+
 pub mod agent;
 pub mod connector_session;
 pub mod control;

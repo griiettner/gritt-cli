@@ -155,13 +155,12 @@ no query expansion and no generative model.
 From the repository root:
 
 ```bash
-cargo build --release --manifest-path .agents/cli/Cargo.toml
-.agents/cli/target/release/gritt-agent memory index
-.agents/cli/target/release/gritt-agent memory search "provider adapter"
+./gritt-agent memory index
+./gritt-agent memory search "provider adapter"
 ```
 
-The index command is safe to run repeatedly. The same commands work in
-PowerShell on Windows with the `.exe` suffix on the binary.
+The index command is safe to run repeatedly. Use the bundled executable on
+a matching platform. Windows uses a Windows build named `gritt-agent.exe`.
 
 ## MCP integration
 
@@ -178,10 +177,10 @@ gritt-local-memory
 ```
 
 The transport is stdio. Claude Code starts
-`.agents/cli/target/release/gritt-agent memory serve` when the project
+`./gritt-agent memory serve` when the project
 configuration loads. The server reindexes before it accepts requests. It is
-not a TCP server. Build the binary before the first client start, otherwise
-the client reports that the command does not exist.
+not a TCP server. The repository bundles the executable, so a matching-platform
+clone can start the client without building the CLI.
 
 ### Available MCP tools
 
@@ -248,7 +247,7 @@ required.
 Rebuild the index:
 
 ```bash
-.agents/cli/target/release/gritt-agent memory index
+./gritt-agent memory index
 ```
 
 Then retry the search. Remember that every query term must match; drop terms
@@ -274,7 +273,7 @@ Do not delete committed source files or `.agents/memory/` files.
 
 Check that:
 
-1. The binary exists at `.agents/cli/target/release/gritt-agent`.
+1. The binary exists at `./gritt-agent`.
 2. The workspace is opened at the repository root.
 3. The MCP configuration contains `gritt-local-memory`.
 4. The MCP client has reloaded the workspace configuration.

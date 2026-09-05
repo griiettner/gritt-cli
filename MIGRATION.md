@@ -28,7 +28,7 @@ Run from target repo root:
 ```bash
 git status --short
 cargo build --release --manifest-path .agents/cli/Cargo.toml
-.agents/cli/target/release/gritt-agent migrate cursor --help
+.agents/gritt-agent migrate cursor --help
 ```
 
 Checks:
@@ -40,7 +40,7 @@ Checks:
 ## 2) Dry-Run Migration
 
 ```bash
-.agents/cli/target/release/gritt-agent migrate cursor --source /absolute/path/to/source-repo --dry-run
+.agents/gritt-agent migrate cursor --source /absolute/path/to/source-repo --dry-run
 ```
 
 Review dry-run output:
@@ -52,13 +52,13 @@ Review dry-run output:
 If you need to intentionally replace non-migrator-owned destination files:
 
 ```bash
-.agents/cli/target/release/gritt-agent migrate cursor --source /absolute/path/to/source-repo --dry-run --force
+.agents/gritt-agent migrate cursor --source /absolute/path/to/source-repo --dry-run --force
 ```
 
 ## 3) Execute Migration
 
 ```bash
-.agents/cli/target/release/gritt-agent migrate cursor --source /absolute/path/to/source-repo
+.agents/gritt-agent migrate cursor --source /absolute/path/to/source-repo
 ```
 
 Expected immediate outcomes:
@@ -76,9 +76,9 @@ Expected immediate outcomes:
 
 Default behavior includes maintenance commands:
 
-1. `.agents/cli/target/release/gritt-agent skill sync`
-2. `.agents/cli/target/release/gritt-agent ticket sync`
-3. `.agents/cli/target/release/gritt-agent ticket validate`
+1. `.agents/gritt-agent skill sync`
+2. `.agents/gritt-agent ticket sync`
+3. `.agents/gritt-agent ticket validate`
 
 The migrator runs these through the same `gritt-agent` binary and records
 each command's exit code, stdout, and stderr in the manifest.
@@ -86,7 +86,7 @@ each command's exit code, stdout, and stderr in the manifest.
 To skip maintenance (not recommended except debugging):
 
 ```bash
-.agents/cli/target/release/gritt-agent migrate cursor --source /absolute/path/to/source-repo --no-sync
+.agents/gritt-agent migrate cursor --source /absolute/path/to/source-repo --no-sync
 ```
 
 ## 4) Post-Migration Validation
@@ -94,9 +94,9 @@ To skip maintenance (not recommended except debugging):
 Run explicitly even if maintenance was enabled:
 
 ```bash
-.agents/cli/target/release/gritt-agent skill sync
-.agents/cli/target/release/gritt-agent ticket sync
-.agents/cli/target/release/gritt-agent ticket validate
+.agents/gritt-agent skill sync
+.agents/gritt-agent ticket sync
+.agents/gritt-agent ticket validate
 ```
 
 Expected result:
@@ -172,7 +172,7 @@ Confirm:
 Re-run migration:
 
 ```bash
-.agents/cli/target/release/gritt-agent migrate cursor --source /absolute/path/to/source-repo
+.agents/gritt-agent migrate cursor --source /absolute/path/to/source-repo
 ```
 
 Expected:

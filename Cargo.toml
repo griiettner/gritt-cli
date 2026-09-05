@@ -7,6 +7,9 @@ members = [
   "crates/gritt-connector",
   "crates/gritt",
 ]
+# Plain `cargo build` produces just the application at the root.
+# Workspace-wide checks explicitly use `--workspace`.
+default-members = ["crates/gritt"]
 # The repository tooling crate is its own workspace root.
 exclude = [".agents/cli"]
 

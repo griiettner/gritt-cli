@@ -23,7 +23,7 @@ A bare `TKT-NNNN` prefers the current identity namespace, then a unique match ac
 Do not pick or skip ids manually. Create tickets with:
 
 ```bash
-.agents/cli/target/release/gritt-agent ticket new --title "Short title"
+./gritt-agent ticket new --title "Short title"
 ```
 
 Use `gritt-agent ticket new-chain` for chain-managed work. The tool resolves GitHub identity, allocates the next number in that login's contiguous sequence, and writes the folder. If an earlier id is missing, allocation fails until the gap is restored or explicitly accounted for.

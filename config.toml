@@ -1,0 +1,143 @@
+# Gritt configuration template.
+#
+# Copy this file to `config.toml` in a project (project config) or to
+# the user config path (`~/.config/gritt/config.toml` on Linux,
+# `~/Library/Application Support/gritt/config.toml` on macOS,
+# `%APPDATA%\gritt\config.toml` on Windows). Precedence is command-line
+# flags, then project config, then user config, then `GRITT_*` environment
+# variables, then built-in defaults (ADR-008).
+#
+# Every section below is optional. A section that is present replaces the
+# built-in default for that section as a whole, so `[policy]`, `[model_list]`,
+# `[interface]`, and `[logging]` must list all of their fields when used.
+#
+# The file names keys; it never holds one. A field named `api_key`, `key`,
+# `token`, or `secret` with a string value makes the file fail to load.
+# Store a key with `gritt key-set <profile>` or export the named variable.
+
+# Profile and model used when `--profile` and `--model` are not given.
+default_profile = "openrouter"
+default_model = "openai/gpt-5-nano"
+
+# Global aliases map a short name to `profile/model`.
+[aliases]
+fast = "openrouter/openai/gpt-5-nano"
+claude = "anthropic/claude-sonnet-5"
+
+# OpenRouter, or any OpenAI-compatible Chat Completions endpoint.
+[profiles.openrouter]
+name = "openrouter"
+protocol = "chat_completions"
+base_url = "https://openrouter.ai/api/v1"
+[profiles.openrouter.key]
+keychain_service_entry = "gritt/openrouter"
+env_var_name = "OPENROUTER_API_KEY"
+[profiles.openrouter.aliases]
+nano = "openai/gpt-5-nano"
+
+# OpenAI through the Responses API. Use `protocol = "chat_completions"`
+# with the same base URL for Chat Completions instead.
+[profiles.openai]
+name = "openai"
+protocol = "responses"
+base_url = "https://api.openai.com/v1"
+[profiles.openai.key]
+keychain_service_entry = "gritt/openai"
+env_var_name = "OPENAI_API_KEY"
+
+# Anthropic Messages. The base URL is the API root; Gritt appends
+# `/v1/messages` and `/v1/models`.
+[profiles.anthropic]
+name = "anthropic"
+protocol = "messages"
+base_url = "https://api.anthropic.com"
+[profiles.anthropic.key]
+keychain_service_entry = "gritt/anthropic"
+env_var_name = "ANTHROPIC_API_KEY"
+
+# A self-hosted or private OpenAI-compatible endpoint.
+[profiles.local]
+name = "local"
+protocol = "chat_completions"
+base_url = "http://127.0.0.1:8080/v1"
+[profiles.local.key]
+keychain_service_entry = "gritt/local"
+env_var_name = "LOCAL_LLM_KEY"
+
+# Model list cache: refresh at most once per interval; on a failed refresh
+# use the last cached list and mark it stale.
+[model_list]
+refresh_interval_secs = 86400
+stale_fallback = true
+
+# Tool permission policy for the native path. Rules are evaluated in order
+# and the first match wins; `fallback` applies when nothing matches.
+# Outcomes: "allow", "ask", "deny". Tools: "file_read", "file_write",
+# "shell", "network", or "*". Resources use `*` wildcards; a `workspace:`
+# prefix is resolved against the session workspace. A shell command that
+# reaches outside the workspace is always at least "ask" with the stronger
+# prompt, whatever the rules say. These rules are the built-in defaults.
+[policy]
+fallback = "deny"
+
+[[policy.rules]]
+tool = "file_read"
+resource = "workspace:**"
+outcome = "allow"
+reason = "read inside the workspace"
+
+[[policy.rules]]
+tool = "file_write"
+resource = "workspace:**"
+outcome = "ask"
+reason = "write inside the workspace"
+
+[[policy.rules]]
+tool = "shell"
+resource = "*"
+outcome = "ask"
+reason = "run a shell command"
+
+[[policy.rules]]
+tool = "network"
+resource = "*"
+outcome = "ask"
+reason = "network access"
+
+[[policy.rules]]
+tool = "*"
+resource = "*"
+outcome = "deny"
+reason = "outside the workspace"
+
+# Installed agent connectors: codex, claude, cursor, opencode. Every field
+# has a default and a partial section is valid.
+[connectors]
+# Executable overrides by connector id.
+executables = { codex = "codex", claude = "claude" }
+# Connectors launched through a pseudo-terminal instead of pipes.
+pty = []
+health_check_timeout_secs = 10
+task_timeout_secs = 1800
+
+# Extra arguments passed verbatim so you can pick the agent's own
+# permission mode. Arguments that carry a credential are refused.
+[connectors.extra_args]
+codex = []
+claude = []
+
+# Interface preferences. `default_mode` is "print", "repl", or "full_screen".
+[interface]
+default_mode = "print"
+color = true
+reduced_motion = false
+
+# Logs are content-free by default. Content logging, when enabled, keeps
+# prompts and responses (key-redacted) for `content_retention_days`.
+[logging]
+content_logging = false
+content_retention_days = 7
+
+# Embeddings and reranking are opt-in through the environment only and are
+# rejected in this file: set AGENT_EMBEDDING_PROVIDER, AGENT_RERANK_PROVIDER,
+# AGENT_MEMORY_API_KEY, and AGENT_MEMORY_BASE_URL. See docs/embeddings.md.

@@ -28,7 +28,7 @@ export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$ROOT=/build --remap-path-p
 cd "$ROOT"
 PINNED=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
 RUSTC_VERSION=$(rustc -vV | sed -n 's/^release: //p')
-if [ "$RUSTC_VERSION" != "$PINNED" ]; then
+if [ "$(rustc -vV)" != "$(rustup run "$PINNED" rustc -vV)" ]; then
   echo "rust-toolchain.toml pins $PINNED but rustc is $RUSTC_VERSION; run: rustup toolchain install $PINNED" >&2
   exit 1
 fi

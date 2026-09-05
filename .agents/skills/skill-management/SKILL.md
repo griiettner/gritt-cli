@@ -37,7 +37,7 @@ Example: `Formats git commit messages. Use when the user asks to create or edit 
 3. Scaffold:
 
 ```bash
-.agents/cli/target/release/gritt-agent skill new <skill-name> "<description>"
+./gritt-agent skill new <skill-name> "<description>"
 ```
 
 4. Replace the starter body with the real procedure. Keep it short: steps, rules, verification.
@@ -96,7 +96,7 @@ Promote a sub-skill to a top-level skill only when the user asks for it to be in
 After any skill change:
 
 ```bash
-.agents/cli/target/release/gritt-agent skill sync
+./gritt-agent skill sync
 ```
 
 ## Audit
@@ -104,7 +104,7 @@ After any skill change:
 Run the read-only semantic audit before handing off a new or edited skill:
 
 ```bash
-.agents/cli/target/release/gritt-agent skill audit --skill <skill-name>
+./gritt-agent skill audit --skill <skill-name>
 ```
 
 Audit the whole canonical tree with no `--skill`. Use `--strict` when the

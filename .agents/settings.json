@@ -8,7 +8,7 @@
       "Bash(git diff *)",
       "Bash(git log *)",
       "Bash(git add *)",
-      "Bash(.agents/cli/target/release/gritt-agent *)",
+      "Bash(./gritt-agent *)",
       "Bash(cargo build *)",
       "Bash(cargo test *)",
       "Bash(cargo clippy *)",

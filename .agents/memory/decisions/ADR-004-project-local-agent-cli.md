@@ -28,8 +28,13 @@ workspace.
 Local memory is a local Turso file at `.agents/brain/data/agent-memory.db`.
 Turso FTS is the retrieval baseline and the only retrieval path. The MCP server
 `gritt-local-memory` is `gritt-agent memory serve` over stdio, declared in
-`.mcp.json` as the release binary path. Each checkout builds it once with
-`cargo build --release --manifest-path .agents/cli/Cargo.toml`.
+`.mcp.json` as `./gritt-agent`. The root executable is included in Git, so a
+matching-platform clone runs without building. Maintainers rebuild it with
+`cargo build --release --locked --manifest-path .agents/cli/Cargo.toml --bin gritt-agent`
+and commit the updated executable with its source changes. Cargo's configured
+artifact directory places the executable at the repository root automatically.
+The bundled binary currently targets macOS Apple Silicon; native binaries
+for other operating systems or CPUs are separate artifacts.
 
 No Node script remains. TKT-0002 ported the last six to `gritt-agent`
 subcommands and deleted `.agents/tools/agent-tools/`, so the repository
@@ -43,7 +48,7 @@ tooling is Rust only.
   checkout buildable with nothing else installed.
 - A binary path in `.mcp.json` works when the MCP host does not have
   `~/.cargo/bin` on its PATH, which is common for desktop applications. The
-  cost is a documented one-time build.
+  executable is bundled, so ordinary users do not need a build toolchain.
 - Keeping the crate outside the product workspace means product crate rules
   (no I/O in core, provider neutrality) do not have to bend for tooling.
 - Local lexical search alone satisfies the retrieval contract in `.agents/brain/`. Embeddings

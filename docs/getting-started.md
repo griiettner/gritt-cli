@@ -7,18 +7,25 @@ Download the archive for your platform from a release, verify its checksum
 as described in [Reproducible builds](reproducible-builds.md), and put the
 binary on your `PATH`.
 
-To build from source you need only the Rust toolchain (1.88 or newer):
+To build from source, install Rust through rustup. The repository selects
+the dated nightly toolchain in `rust-toolchain.toml` automatically:
 
 ```bash
 cargo build --release --locked
-./target/release/gritt --version
+./gritt --version
 ```
+
+Cargo places the actual executable at the source checkout root, using the
+`build.artifact-dir` setting in `.cargo/config.toml`.
+On Windows, run `.\gritt.exe --version`. To install in another project, take
+the executable for that platform and a `config.toml`. The `target/` directory
+is only a build cache and is not needed to run Gritt.
 
 ## Configure a provider
 
 Gritt routes every request through a configured provider profile. It never
 guesses the provider from a model name. Create a project config at
-`.gritt/config.toml` in your workspace, or a user config at
+`config.toml` in your workspace, or a user config at
 `~/.config/gritt/config.toml` (Linux), `~/Library/Application
 Support/gritt/config.toml` (macOS), or `%APPDATA%\gritt\config.toml`
 (Windows):
@@ -36,6 +43,10 @@ base_url = "https://openrouter.ai/api/v1"
 keychain_service_entry = "gritt/openrouter"
 env_var_name = "OPENROUTER_API_KEY"
 ```
+
+A complete, annotated template with every section is at
+[config.example.toml](config.example.toml); copy it to `config.toml` and
+delete what you do not need.
 
 The config names the key. It never holds the key value, and a config that
 contains one fails to load. See [Keys](keys.md) for storing a key in the

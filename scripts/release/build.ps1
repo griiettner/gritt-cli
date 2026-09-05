@@ -26,7 +26,9 @@ Push-Location $Root
 try {
   $Pinned = (Get-Content (Join-Path $Root 'rust-toolchain.toml') | Select-String '^channel = "(.*)"').Matches[0].Groups[1].Value
   $RustcVersion = (rustc -vV | Select-String '^release: ' | ForEach-Object { $_.Line.Substring(9) })
-  if ($RustcVersion -ne $Pinned) { throw "rust-toolchain.toml pins $Pinned but rustc is $RustcVersion; run: rustup toolchain install $Pinned" }
+  $ExpectedCompiler = (rustup run $Pinned rustc -vV) -join "`n"
+  if ($LASTEXITCODE -ne 0) { throw "cannot read the pinned toolchain $Pinned" }
+  if (((rustc -vV) -join "`n") -ne $ExpectedCompiler) { throw "rust-toolchain.toml pins $Pinned but rustc is $RustcVersion; run: rustup toolchain install $Pinned" }
   $Commit = try { (git -C $Root rev-parse HEAD) } catch { 'unknown' }
   cargo build --release --locked --bin gritt --target $Target
   if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }

@@ -64,8 +64,8 @@ Invocable on their own. Each one **starts by reading this file**. Load **one**:
 After ticket or memory files change:
 
 ```bash
-.agents/cli/target/release/gritt-agent ticket sync
-.agents/cli/target/release/gritt-agent ticket validate
+./gritt-agent ticket sync
+./gritt-agent ticket validate
 ```
 
 ## Output

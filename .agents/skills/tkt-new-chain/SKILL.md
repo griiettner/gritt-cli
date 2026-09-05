@@ -21,7 +21,7 @@ Use [`tkt-new`](../tkt-new/SKILL.md) instead when the work is a small localized 
 Use the tool. Do not hand-write folders, and do not pick ids by reading `index.yaml`:
 
 ```bash
-.agents/cli/target/release/gritt-agent ticket new-chain \
+./gritt-agent ticket new-chain \
   --title "Chain title" \
   --step "contract:Freeze the request and response contract" \
   --step "skeleton:Add the service and route skeleton" \
@@ -75,7 +75,7 @@ The tool writes the structural ones. You still own the judgement ones:
 ## Verify before reporting
 
 ```bash
-.agents/cli/target/release/gritt-agent ticket validate
+./gritt-agent ticket validate
 ```
 
 A clean run means every chain ticket exists, the parent and child links agree, and no scaffold marker is left. Do not report the chain as created until this passes.

@@ -137,7 +137,7 @@ pub async fn report(
     let location = store.location();
     let kind = match location {
         DatabaseLocation::Explicit(_) => "explicit --database",
-        DatabaseLocation::Workspace(_) => "workspace .agents/brain (shared with gritt-agent)",
+        DatabaseLocation::Workspace(_) => "workspace product database",
         DatabaseLocation::UserData(_) => "user data directory",
     };
     report.line(format!("path: {} ({kind})", location.path().display()));
@@ -165,7 +165,7 @@ pub async fn report(
         if memory_present == MEMORY_OBJECTS.len() {
             "present".to_owned()
         } else if memory_present == 0 {
-            "absent (run `gritt-agent memory index` to create it)".to_owned()
+            "absent (expected in a separate product database)".to_owned()
         } else {
             format!(
                 "partial ({memory_present}/{} objects)",

@@ -21,12 +21,14 @@ default C compiler handles, so no target needs CMake or NASM.
 ## Toolchain
 
 `rust-toolchain.toml` at the repository root pins the exact compiler
-(currently `1.93.1`). `cargo` and `rustup` read it automatically, the
+(currently `nightly-2026-09-03`). `cargo` and `rustup` read it automatically, the
 `product` workflow installs that version for every job, and both release
 scripts refuse to run with any other `rustc`. Each build writes a
 `BUILD-INFO` file beside `SHA256SUMS` with the `rustc` release, the
 toolchain channel, the target, the commit, and `SOURCE_DATE_EPOCH`; the
-release job uploads it with the binary.
+release job uploads it with the binary. The dated nightly enables Cargo's
+`build.artifact-dir` setting, which places the executable at the repository
+root during an ordinary `cargo build --release --locked`.
 
 ## How a build is made deterministic
 

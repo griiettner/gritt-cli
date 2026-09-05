@@ -35,8 +35,8 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     workspace: Option<PathBuf>,
 
-    /// Database file override. Defaults to the workspace's `.agents/brain`
-    /// database or the user data directory.
+    /// Database file override. Defaults to `.agents/brain/data/gritt.db`
+    /// in agent workspaces or the user data directory.
     #[arg(long, global = true, value_name = "PATH")]
     database: Option<PathBuf>,
 
@@ -71,7 +71,7 @@ enum Command {
         #[arg(long)]
         verbose: bool,
     },
-    /// Full-screen mode.
+    /// Full-screen mode. Also runs when no subcommand is given.
     Tui {
         #[command(flatten)]
         session: SessionArgs,
@@ -92,7 +92,7 @@ enum Command {
     Telemetry,
 }
 
-#[derive(Args, Clone)]
+#[derive(Args, Clone, Default)]
 struct SessionArgs {
     /// Session name to create or resume.
     #[arg(long)]
@@ -739,7 +739,8 @@ async fn main() -> ExitCode {
     let database = cli.database.as_deref();
     let result = match cli.command {
         Some(Command::KeySet { profile }) => key_set(&workspace, &profile),
-        Some(Command::Config) | None => show_config(&workspace),
+        Some(Command::Config) => show_config(&workspace),
+        None => run_tui_mode(&workspace, database, &SessionArgs::default()).await,
         Some(Command::Run {
             prompt,
             session,
