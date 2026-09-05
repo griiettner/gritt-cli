@@ -2,10 +2,10 @@
   range: TKT-0001-0025
   file: .agents/tasks/griiettner/TKT-0001-0025/index.yaml
   count: 21
-  updated: 2026-09-04
+  updated: 2026-09-05
   statuses:
-    - done: 16
-    - planning: 5
+    - done: 17
+    - planning: 4
   areas:
     - .agents/cli
     - .agents/memory

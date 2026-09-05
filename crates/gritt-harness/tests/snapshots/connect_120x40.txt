@@ -1,0 +1,90 @@
+# connect 120x40
+
+## text
+
+ api-cleanup  coding  /work/gritt  fixture
+ you   Tidy the public API of the store module.                                          │ Gritt 0.1.0
+                                                                                         │
+ think Reading the module, then the callers.                                             │ Session
+                      ╭ Connect ─────────────────────────────────────────────────────────────────╮i-cleanup
+ gritt I read `store/m│› ▏                                                                       │ork/gritt
+       the crate uses.│Selecting does not install software or start a sign-in                    │oding
+       世界 renders at│AI providers                                                              │reaming
+                      │● openai                                                      [responses] │
+ tool  -> file_read st│    https://api.openai.com/v1                                             │
+                      │    key available · catalog fresh                                         │enai
+ tool  <- file_read ok│  anthropic                                                    [messages] │enai/gpt-5-nano
+                      │    https://api.anthropic.com/v1                                          │medium
+       tool output con│    key available · catalog not loaded                                    │
+                      │  openrouter                                           [chat completions] │
+                      │    https://openrouter.ai/api/v1                                          │480
+                      │    no key; set OPENROUTER_API_KEY or run setup · catalog not loaded      │10
+                      │                                                                          │ of context
+                      │Installed agents                                                          │
+                      │  codex                                                       [installed] │
+                      │    0.48.0                                                                │0.0412
+                      │    signed in · Managed by agent                                          │is session, listed p
+                      │  claude-code                                                 [installed] │
+                      │    2.1.4                                                                 │ files
+                      │    not signed in · Managed by agent                                      │s/gritt-harness/src/
+                      │  cursor-agent                                            [not installed] │ied
+                      │    version unknown  — install this agent to select it                    │E.md
+                      │    auth state not reported · Managed by agent                            │ied (pre-existing)
+                      │                                                                          │
+                      │                                                                          │tions
+                      │                                                                          │ocal-memory ready
+                      │                                                                          │ls
+                      │                                                                          │ocal-memory starting
+                      │                                                                          │cting and negotiatin
+                      │                                                                          │ve… awaiting approva
+                      ╰ type to filter · Enter selects · Esc closes ─────────────────────────────╯ng for approval to r
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │Ask Gritt to do something…                                                                                          │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ openai · openai/gpt-5-nano  effort medium  in 12480 out 3210  Enter sends · Ctrl-J newline · / commands
+
+## styles dark
+
+fg=Some(Reset) bg=Some(Reset) mod=NONE
+fg=Some(Rgb(122, 162, 247)) bg=Some(Rgb(20, 22, 26)) mod=BOLD
+fg=Some(Rgb(122, 162, 247)) bg=Some(Rgb(20, 22, 26)) mod=NONE
+fg=Some(Rgb(122, 162, 247)) bg=Some(Rgb(30, 33, 39)) mod=BOLD
+fg=Some(Rgb(122, 162, 247)) bg=Some(Rgb(30, 33, 39)) mod=NONE
+fg=Some(Rgb(125, 207, 138)) bg=Some(Rgb(20, 22, 26)) mod=NONE
+fg=Some(Rgb(135, 143, 156)) bg=Some(Rgb(20, 22, 26)) mod=DIM
+fg=Some(Rgb(135, 143, 156)) bg=Some(Rgb(20, 22, 26)) mod=ITALIC
+fg=Some(Rgb(135, 143, 156)) bg=Some(Rgb(20, 22, 26)) mod=NONE
+fg=Some(Rgb(135, 143, 156)) bg=Some(Rgb(30, 33, 39)) mod=DIM
+fg=Some(Rgb(135, 143, 156)) bg=Some(Rgb(30, 33, 39)) mod=NONE
+fg=Some(Rgb(221, 225, 230)) bg=Some(Rgb(20, 22, 26)) mod=NONE
+fg=Some(Rgb(221, 225, 230)) bg=Some(Rgb(30, 33, 39)) mod=NONE
+fg=Some(Rgb(221, 225, 230)) bg=Some(Rgb(45, 63, 100)) mod=BOLD
+fg=Some(Rgb(240, 113, 120)) bg=Some(Rgb(20, 22, 26)) mod=BOLD
+fg=Some(Rgb(240, 113, 120)) bg=Some(Rgb(30, 33, 39)) mod=BOLD
+
+## styles light
+
+fg=Some(Reset) bg=Some(Reset) mod=NONE
+fg=Some(Rgb(163, 29, 44)) bg=Some(Rgb(238, 239, 242)) mod=BOLD
+fg=Some(Rgb(163, 29, 44)) bg=Some(Rgb(250, 250, 248)) mod=BOLD
+fg=Some(Rgb(29, 111, 53)) bg=Some(Rgb(250, 250, 248)) mod=NONE
+fg=Some(Rgb(34, 37, 43)) bg=Some(Rgb(205, 218, 245)) mod=BOLD
+fg=Some(Rgb(34, 37, 43)) bg=Some(Rgb(238, 239, 242)) mod=NONE
+fg=Some(Rgb(34, 37, 43)) bg=Some(Rgb(250, 250, 248)) mod=NONE
+fg=Some(Rgb(43, 84, 168)) bg=Some(Rgb(238, 239, 242)) mod=BOLD
+fg=Some(Rgb(43, 84, 168)) bg=Some(Rgb(238, 239, 242)) mod=NONE
+fg=Some(Rgb(43, 84, 168)) bg=Some(Rgb(250, 250, 248)) mod=BOLD
+fg=Some(Rgb(43, 84, 168)) bg=Some(Rgb(250, 250, 248)) mod=NONE
+fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(238, 239, 242)) mod=DIM
+fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(238, 239, 242)) mod=NONE
+fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(250, 250, 248)) mod=DIM
+fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(250, 250, 248)) mod=ITALIC
+fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(250, 250, 248)) mod=NONE
+
+## styles no-color
+
+fg=Some(Reset) bg=Some(Reset) mod=BOLD
+fg=Some(Reset) bg=Some(Reset) mod=BOLD | REVERSED
+fg=Some(Reset) bg=Some(Reset) mod=DIM
+fg=Some(Reset) bg=Some(Reset) mod=ITALIC
+fg=Some(Reset) bg=Some(Reset) mod=NONE

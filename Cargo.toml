@@ -50,6 +50,10 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "
 toml = "1.1.5"
 # ADR-009 pins the full-screen stack.
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+# Grapheme boundaries for the composer and for wrapping. Already compiled:
+# `ratatui-core` and `ratatui-widgets` depend on it, so this direct edge adds
+# no new code to the build. MIT OR Apache-2.0, maintained by unicode-rs.
+unicode-segmentation = "1.13.3"
 crossterm = "0.29.0"
 diffy = "0.5.2"
 uuid = { version = "1.26.0", features = ["v4"] }

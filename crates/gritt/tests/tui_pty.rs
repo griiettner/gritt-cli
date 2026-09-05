@@ -317,18 +317,21 @@ fn approval_diff_palette_and_sessions_views_work_by_keyboard_without_color() {
     // close with Ctrl-P, Ctrl-S, and Esc.
     writer.write_all(&[0x10]).unwrap();
     writer.flush().unwrap();
-    wait_for(&rx, &mut seen, "command palette", Duration::from_secs(20));
+    // The panel hint is body text on a freshly cleared area, so it
+    // arrives whole; a panel title can be redrawn cell by cell.
+    wait_for(&rx, &mut seen, "same registry", Duration::from_secs(20));
     writer.write_all(&[0x1b]).unwrap();
     writer.flush().unwrap();
     thread::sleep(Duration::from_millis(200));
     writer.write_all(&[0x13]).unwrap();
     writer.flush().unwrap();
-    wait_for(
-        &rx,
-        &mut seen,
-        "sessions (Enter resumes",
-        Duration::from_secs(20),
-    );
+    wait_for(&rx, &mut seen, "Enter resumes", Duration::from_secs(20));
+    // The picker opens before the store answers. Its rows carry the
+    // session's timestamp, which nothing else on screen shows, so seeing
+    // one proves the loaded sessions reached the open list rather than
+    // only the state behind it.
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    wait_for(&rx, &mut seen, &today, Duration::from_secs(20));
     writer.write_all(&[0x1b]).unwrap();
     writer.flush().unwrap();
     thread::sleep(Duration::from_millis(200));
@@ -389,4 +392,247 @@ fn color_sgr_detection_recognizes_colors_but_not_modifiers() {
     assert!(contains_color_sgr("\x1b[33mtext\x1b[0m"));
     assert!(contains_color_sgr("\x1b[1;38;5;12mtext"));
     assert!(!contains_color_sgr("\x1b[1m\x1b[7mtext\x1b[0m\x1b[?1049h"));
+}
+
+type Master = Box<dyn portable_pty::MasterPty + Send>;
+type Child = Box<dyn portable_pty::Child + Send + Sync>;
+type Writer = Box<dyn Write + Send>;
+
+/// One fixture run: the terminal, the child, its output, and its input.
+struct Fixture {
+    master: Master,
+    child: Child,
+    output: mpsc::Receiver<Vec<u8>>,
+    input: Writer,
+}
+
+/// Spawns `gritt tui --fixture <screen>` in a pseudo-terminal of the
+/// given size.
+fn spawn_fixture(screen: &str, cols: u16, rows: u16) -> Fixture {
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_gritt"));
+    command.args(["tui", "--fixture", screen]);
+    command.env("TERM", "xterm-256color");
+    let child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let input = pair.master.take_writer().unwrap();
+    Fixture {
+        master: pair.master,
+        child,
+        output: rx,
+        input,
+    }
+}
+
+fn quit(child: &mut Child, rx: &mpsc::Receiver<Vec<u8>>, seen: &mut String, writer: &mut Writer) {
+    writer.write_all(&[0x11]).unwrap();
+    writer.flush().unwrap();
+    wait_for(rx, seen, ALT_SCREEN_OFF, Duration::from_secs(20));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the process did not exit after Ctrl-Q"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "exit status {status:?}");
+}
+
+/// The fixture walkthrough: home, `/connect`, `/models`, `/effort`,
+/// `/mcp`, and `/help`, driven by keyboard in a real pseudo-terminal at a
+/// wide size and then resized narrow.
+#[test]
+fn the_fixture_home_walkthrough_runs_by_keyboard_and_never_opens_a_session() {
+    let Fixture {
+        master,
+        mut child,
+        output: rx,
+        input: mut writer,
+    } = spawn_fixture("home", 120, 40);
+    let mut seen = String::new();
+    wait_for(&rx, &mut seen, ALT_SCREEN_ON, Duration::from_secs(20));
+    // The run is labelled a fixture and says what to do first.
+    wait_for(
+        &rx,
+        &mut seen,
+        "Use /connect to get started.",
+        Duration::from_secs(20),
+    );
+    wait_for(&rx, &mut seen, "fixture", Duration::from_secs(20));
+
+    // `/` opens suggestions and Enter runs the highlighted command.
+    writer.write_all(b"/connect\r").unwrap();
+    writer.flush().unwrap();
+    wait_for(&rx, &mut seen, "AI providers", Duration::from_secs(20));
+    wait_for(&rx, &mut seen, "Installed agents", Duration::from_secs(20));
+    // A connector says who owns its model, and an uninstalled one is not
+    // selectable.
+    wait_for(&rx, &mut seen, "Managed by agent", Duration::from_secs(20));
+    wait_for(&rx, &mut seen, "not installed", Duration::from_secs(20));
+
+    // Typing filters, and selecting a provider opens its model picker.
+    writer.write_all(b"openai\r").unwrap();
+    writer.flush().unwrap();
+    // Needles are body text, not panel titles: ratatui redraws only the
+    // cells that changed, so a title over a previous panel's border can
+    // reach the stream in pieces.
+    wait_for(&rx, &mut seen, "GPT-5 nano", Duration::from_secs(20));
+    wait_for(
+        &rx,
+        &mut seen,
+        "openai/gpt-5-codex-preview",
+        Duration::from_secs(20),
+    );
+    // The catalog state is visible, not implied by a blank list.
+    wait_for(&rx, &mut seen, "catalog fresh", Duration::from_secs(20));
+    writer.write_all(&[0x1b]).unwrap();
+    writer.flush().unwrap();
+    thread::sleep(Duration::from_millis(200));
+
+    writer.write_all(b"/effort\r").unwrap();
+    writer.flush().unwrap();
+    wait_for(&rx, &mut seen, "Model default", Duration::from_secs(20));
+    writer.write_all(&[0x1b]).unwrap();
+    writer.flush().unwrap();
+    thread::sleep(Duration::from_millis(200));
+
+    writer.write_all(b"/mcp\r").unwrap();
+    writer.flush().unwrap();
+    wait_for(
+        &rx,
+        &mut seen,
+        "gritt-local-memory",
+        Duration::from_secs(20),
+    );
+    wait_for(&rx, &mut seen, "awaiting approval", Duration::from_secs(20));
+    writer.write_all(&[0x1b]).unwrap();
+    writer.flush().unwrap();
+    thread::sleep(Duration::from_millis(200));
+
+    writer.write_all(b"/help\r").unwrap();
+    writer.flush().unwrap();
+    wait_for(&rx, &mut seen, "Limitations", Duration::from_secs(20));
+    writer.write_all(&[0x1b]).unwrap();
+    writer.flush().unwrap();
+    // Escape must land on its own: a byte written straight after it is
+    // read as part of an escape sequence, not as a keypress.
+    thread::sleep(Duration::from_millis(200));
+
+    // An unknown command is refused locally and the input is kept.
+    writer.write_all(b"/deploy\r").unwrap();
+    writer.flush().unwrap();
+    wait_for(&rx, &mut seen, "unknown", Duration::from_secs(20));
+    wait_for(&rx, &mut seen, "lists them", Duration::from_secs(20));
+
+    // The narrow size still draws.
+    let before = seen.len();
+    master
+        .resize(PtySize {
+            rows: 20,
+            cols: 60,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    thread::sleep(Duration::from_millis(400));
+    while let Ok(chunk) = rx.try_recv() {
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert!(seen.len() > before, "no redraw after the resize");
+
+    quit(&mut child, &rx, &mut seen, &mut writer);
+}
+
+/// The sidebar column appears at 111 columns and collapses at 109, in a
+/// real terminal and not only in a `TestBackend` buffer.
+#[test]
+fn the_fixture_conversation_shows_the_sidebar_only_above_110_columns() {
+    for (cols, expect_sidebar) in [(111u16, true), (109u16, false)] {
+        let Fixture {
+            master,
+            mut child,
+            output: rx,
+            input: mut writer,
+        } = spawn_fixture("conversation", cols, 30);
+        let mut seen = String::new();
+        wait_for(&rx, &mut seen, ALT_SCREEN_ON, Duration::from_secs(20));
+        wait_for(&rx, &mut seen, "api-cleanup", Duration::from_secs(20));
+        // Give the first frames time to arrive before judging the sidebar.
+        thread::sleep(Duration::from_millis(600));
+        while let Ok(chunk) = rx.try_recv() {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        let text = plain(&seen);
+        assert_eq!(
+            text.contains("Changed files"),
+            expect_sidebar,
+            "at {cols} columns the sidebar column expectation failed"
+        );
+        // Either way the transcript and the composer keep their space.
+        assert!(text.contains("Tidy the public API"), "at {cols} columns");
+        assert!(text.contains("effort medium"), "at {cols} columns");
+        if !expect_sidebar {
+            // `/sidebar` opens the drawer instead, then Escape closes it.
+            writer.write_all(b"/sidebar\r").unwrap();
+            writer.flush().unwrap();
+            wait_for(&rx, &mut seen, "Changed files", Duration::from_secs(20));
+            writer.write_all(&[0x1b]).unwrap();
+            writer.flush().unwrap();
+            thread::sleep(Duration::from_millis(200));
+
+            // Reopen it, then grow the terminal past the column threshold.
+            // The drawer is no longer drawn, so it must not still be
+            // taking the keyboard: what is typed has to reach the
+            // composer that is visible.
+            writer.write_all(b"/sidebar\r").unwrap();
+            writer.flush().unwrap();
+            thread::sleep(Duration::from_millis(300));
+            master
+                .resize(PtySize {
+                    rows: 40,
+                    cols: 120,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            thread::sleep(Duration::from_millis(500));
+            // Ctrl-P is ignored by the drawer and opens the palette from
+            // the main view, so the palette appearing proves the key
+            // reached the visible interface and not a stale overlay.
+            writer.write_all(&[0x10]).unwrap();
+            writer.flush().unwrap();
+            wait_for(&rx, &mut seen, "same registry", Duration::from_secs(20));
+            writer.write_all(&[0x1b]).unwrap();
+            writer.flush().unwrap();
+            thread::sleep(Duration::from_millis(200));
+        }
+        quit(&mut child, &rx, &mut seen, &mut writer);
+    }
 }

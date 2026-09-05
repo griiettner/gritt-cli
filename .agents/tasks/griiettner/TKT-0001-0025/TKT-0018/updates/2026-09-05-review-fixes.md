@@ -1,0 +1,440 @@
+---
+id: TKT-0018
+namespace: griiettner
+title: Resolve the PR #10 review findings
+artifact: update
+status: done
+owner: griiettner
+created: 2026-09-05
+updated: 2026-09-05
+chain_role: worker
+chain_parent: TKT-0015
+---
+
+# TKT-0018 Update: Resolve the PR #10 review findings
+
+## Trigger
+
+The semantic review of PR #10 returned `needs-fix` with one high and six
+medium findings, all confirmed against the branch. Findings are recorded in
+`/tmp/review-tkt-0018-findings.md`. The reviewer's summary: "slash
+completion can panic, session discovery regresses, and several renderer
+behaviors do not satisfy the keyboard contract."
+
+## Changes per finding
+
+**1 (high): slash completion could index past the end of the list.**
+`/`, Down, Tab completed `/models` and left the highlight on index 1, but
+the completed query matched one row, so Enter indexed a one-row list at 1
+and panicked out of the alternate screen. Three changes in
+`src/tui/app.rs`: Tab now resets `suggestion_index` after it rewrites the
+query; every composer edit that can change the filter (Backspace, Delete,
+Ctrl-W, Ctrl-U, paste) resets it too; and reads go through the new
+`App::highlighted_suggestion`, which uses `.get()` and falls back to the
+first row, so no path can index out of range. `suggestion_key` also clamps
+on entry and returns early on an empty list, which removes the `% count`
+division as well. Two regressions:
+`completing_a_suggestion_resets_the_highlight_so_enter_cannot_run_off_the_list`
+drives the reviewer's exact sequence, and
+`editing_the_slash_word_never_leaves_the_highlight_out_of_range` covers the
+backspace direction.
+
+**2 (medium): the first `/sessions` picker stayed empty.** The overlay is
+built before `Action::RefreshSessions` returns, and the runtime only
+assigned `app.sessions`, so the rows the user was looking at never filled
+in. Added `Picker::replace_rows`, which swaps rows while keeping the query
+and following the highlighted row by id (falling back to the current row,
+then clamping), and `App::load_sessions`, which updates the list and
+refreshes any open session picker. `run.rs` calls `load_sessions` instead
+of assigning the field. Covered by
+`sessions_loaded_after_the_picker_opened_appear_in_it`,
+`a_late_session_load_keeps_the_query_and_the_highlight`,
+`rows_arriving_late_keep_the_query_and_the_highlighted_row`, and a PTY
+assertion: the session row carries a timestamp that appears nowhere else
+on screen, so seeing it proves the rows reached the open list.
+
+**3 (medium): picker selection moved into rows that were not drawn.**
+`draw_picker` built every row from the top and let the paragraph clip, so
+at 60x20 the `/connect` golden showed the "Installed agents" heading with
+no agents under it. Rows are several lines tall and a group heading belongs
+to the row beneath it, so the window is now computed in lines: the renderer
+records each filtered row's line extent, then picks a start that keeps the
+highlighted row's whole block visible. A window that would end on a
+trailing heading trims it, so a heading is only drawn when a row follows it.
+Slash suggestions got the same treatment, since twelve commands do not fit
+the panel at 60x20. Covered by `a_picker_shows_the_highlighted_row_at_every_size`
+(walks every row at all three sizes),
+`the_connection_dialog_never_shows_a_group_heading_with_no_rows_under_it`,
+and `slash_suggestions_keep_the_highlighted_command_on_screen`.
+
+**4 (medium): scroll hold held an offset, not content.** The viewport was
+computed as `total - scroll`, so every wrapped line that arrived pushed the
+held view down by one. Held position is now measured from the top, where
+appends cannot move it: `App::scroll` became `App::top`, and `touch()`
+leaves it alone. The reducer needs the rendered line count and the pane
+height to answer "am I at the bottom", so `App` gained a `Metrics` cell the
+renderer fills each frame, and the viewport arithmetic moved into
+`App::visible_transcript`, which the renderer and the tests both call. The
+test now compares the visible lines before and after ten streamed lines
+rather than asserting an offset stayed `10`, and a second test proves
+scrolling back to the bottom resumes following.
+
+**5 (medium): the constrained home composer hid what was being typed.**
+The buffer was wrapped by `Paragraph` while the cursor was placed from
+unwrapped coordinates and clamped, so a draft past the 88 interior columns
+vanished under the box. The composer now wraps in `render.rs` through
+`composer_rows`, which hard-wraps each logical line at the drawn width and
+records where each row starts, so the cursor's visual row and column come
+from exactly the rows that are drawn. The view scrolls to keep the cursor's
+row on screen. Character wrapping, not word wrapping, is deliberate here:
+an editor cursor has to land on a predictable cell. Covered by
+`a_draft_longer_than_the_composer_scrolls_instead_of_disappearing`, which
+checks the single-line and multiline cases and that the cursor sits on the
+row holding the text.
+
+**6 (medium): `/sidebar` contradicted the placement rule.** It always
+pushed a drawer, and the renderer drew that drawer at any width, so on a
+wide terminal the command replaced the column with a modal instead of
+hiding it. `toggle_sidebar` now reads the measured terminal width: at 110
+columns or more it flips `sidebar_enabled` and pushes nothing; below that it
+opens the drawer as before. The renderer skips a drawer left open by a
+resize once the terminal is wide enough for the column. The column also
+hard-coded its scroll to zero, so Tab reached it and nothing moved;
+`draw_sidebar` now uses `sidebar_scroll` for both forms, and Up, Down,
+PageUp, and PageDown route to it when focus is on the sidebar. Covered by
+`on_a_wide_terminal_sidebar_toggles_the_column_and_never_opens_a_drawer`,
+`the_sidebar_column_scrolls_without_moving_the_transcript_or_the_draft`,
+and `hiding_the_sidebar_on_a_wide_terminal_widens_the_transcript`.
+
+**7 (medium): a refused phase change still changed the display.** `/plan`
+and `/code` set `status.phase` optimistically while the runtime rejects the
+change during a turn. The optimistic write is gone: the displayed phase now
+moves only in `set_session`, which the runtime calls after the driver
+applies it. A `changes_settings` guard also refuses `/connect`, `/models`,
+`/effort`, `/plan`, `/code`, and `/new` while a turn or an approval is
+active, with a notice naming which one is blocking, satisfying the plan's
+"do not permit settings changes while a turn or approval is active".
+Read-only commands (`/help`, `/mcp`, `/details`, `/sidebar`, `/sessions`,
+`/quit`) still work. Covered by
+`a_running_turn_refuses_settings_commands_and_shows_no_phase_change` and
+`a_pending_approval_refuses_settings_commands_too`.
+
+**Optional follow-up taken:** the narrow home status now drops the working
+directory and the phase before anything else and always keeps the session
+name and the `fixture` label, so a 60x20 screenshot cannot lose the label
+that marks it as fixture data. Covered by
+`the_fixture_label_survives_the_narrowest_home`.
+
+**Optional follow-ups recorded, not taken:** strengthening the runtime
+late-approval test beyond clearing `pending` needs the event loop under
+test, which is a runtime harness this ticket does not have; and `/new`
+still clears presentation while the live driver stays open. Both are in
+`report.md` under Follow-up.
+
+## Edge cases and failures found while fixing
+
+- Guarding settings during a turn broke
+  `escape_closes_the_top_overlay_first_and_then_cancels_the_turn`, which
+  opened its overlays after setting `running`. The test now opens them
+  while idle, which is what a user can actually do.
+- `Metrics.terminal_width` was never written, so the first version of the
+  wide-terminal sidebar test still saw a drawer. `render::draw` now records
+  the width before anything is laid out.
+- The new compact home status dropped the session name, which broke the
+  pre-existing PTY test that waits for it at 80 columns. The compact
+  variant keeps the session name; it drops the directory and phase instead.
+- A picker filter test asserted two matches for query `a` over rows
+  including `beta`, which also contains an `a`. The fixture rows were made
+  unambiguous rather than the assertion loosened.
+
+## Validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --no-fail-fast` | pass, 411 tests, 0 failed |
+| `cargo test -p gritt --test tui_pty` | pass, 6 tests |
+
+411 passing, up from 395: 16 tests added across the seven findings. Every
+snapshot golden was regenerated; the visible differences are the picker
+viewport, the trimmed trailing group heading, the composer's own wrapping,
+and the narrow home status.
+
+`.agents/gritt-agent ticket chain-check --ticket TKT-0018 --base main`:
+
+```text
+NOTE: current branch: tkt-0018-03-tui-foundation
+NOTE: base branch `main` sha: 77aaa22cb1c5
+NOTE: changed files against `main`: 61
+tkt_chain_check ok (0 warning(s))
+```
+
+The benchmark warning the first gate reported is gone now that this update
+states where the responsiveness work lives. Nothing was benchmarked here:
+the responsiveness fixture and its budgets are step 5 of the feature plan
+and outside this ticket. `ticket sync` then `ticket validate` reported
+`tkt_validate ok (0 warnings)`.
+
+## Round 2
+
+The re-review confirmed fixes 1, 2, 3, 4, and 7 and returned three new
+medium findings, all in the code round 1 introduced: the drawer and the
+composer wrapping. Findings are in `/tmp/review-tkt-0018-r2-findings.md`.
+
+**R2-1: an invisible drawer captured input after a resize.** Round 1 made
+the renderer skip a drawer at 110 columns or more, but left the overlay on
+the stack, and the reducer still routed keys into it. Opening `/sidebar` at
+80 columns and resizing to 120 left the visible composer deaf until Escape.
+Hiding something in the renderer while the reducer still believes in it was
+the mistake; the two now agree on one rule. `App::reconcile_layout` drops
+state the current size cannot support: it pops any drawer once the column
+fits, turning it into the column the user asked for, and moves focus off a
+sidebar that is not on screen. It runs from the new `App::on_resize`, which
+both event loops call on a `Resize` event, and again at the top of
+`on_key`, so a missed or coalesced resize cannot leave a key routed into
+something invisible. Covered by
+`a_drawer_left_open_by_a_resize_does_not_swallow_input`,
+`a_stale_drawer_is_reconciled_before_the_next_key_is_routed`,
+`a_drawer_becomes_the_column_when_the_terminal_grows` (through the
+renderer), and a PTY assertion: the fixture conversation opens the drawer
+at 109 columns, resizes to 120, and Ctrl-P still opens the palette, which a
+stale drawer would have swallowed.
+
+**R2-2: composer wrapping split combining marks from their characters.**
+`composer_rows` iterated Unicode scalars and forced a zero-width mark to
+one cell with `.max(1)`, so at 60x20 a combining acute after 57 characters
+was pushed onto a row of its own and the one-row composer scrolled the base
+text away. Wrapping, cursor movement, deletion, word navigation, transcript
+long-word splitting, and sidebar truncation now all step over grapheme
+clusters, and each cluster is charged its real display width rather than a
+forced minimum of one. Ratatui's own `styled_graphemes` was tried first and
+rejected: it filters control characters out of its output, so byte offsets
+computed from it desync on a pasted tab, and the composer needs exact
+offsets to place a cursor. Covered by
+`a_combining_mark_travels_with_the_character_it_modifies` (cursor and
+delete), `a_combining_mark_never_wraps_away_from_its_character` (the
+reviewer's exact 60x20 case, asserting the drawn text, that no row holds a
+lone mark, that the base text did not scroll away, and that the cursor is
+charged one cell), and
+`transcript_wrapping_keeps_combining_marks_with_their_characters`.
+
+**R2-3: a hidden sidebar consumed the scroll keys.** Tab and BackTab
+selected `Focus::Sidebar` unconditionally while PageUp and PageDown routed
+to the sidebar offset whenever focus was there, so in a narrow conversation
+Tab twice then PageUp moved nothing anyone could see. Focus now only stops
+on panes that are drawn: Tab and BackTab skip the sidebar unless
+`sidebar_column_visible()`, the scroll keys check the same predicate, and
+`reconcile_layout` normalizes focus when the column goes away by resize or
+by `/sidebar`. Covered by
+`focus_skips_the_sidebar_when_its_column_is_not_on_screen` (including the
+reviewer's Tab, Tab, PageUp sequence) and `hiding_the_column_moves_focus_off_it`
+(both the toggle and the resize path).
+
+### Dependency added
+
+`unicode-segmentation` 1.13.3, added to `[workspace.dependencies]` and to
+`gritt-harness`. The alternative, grouping scalars by zero display width,
+would have handled the reported combining-mark case but not clusters
+generally, and the reviewer asked for grapheme boundaries.
+
+The CLI skill requires a recorded check before adding a crate. Checked on
+2026-09-05, against the vendored source in the local registry
+(`~/.cargo/registry/src/index.crates.io-*/unicode-segmentation-1.13.3/`)
+and this repository's `Cargo.lock`:
+
+| Question | Evidence | Source |
+| --- | --- | --- |
+| Licence | `license = "MIT OR Apache-2.0"`, with `LICENSE-MIT`, `LICENSE-APACHE`, and `COPYRIGHT` in the package | vendored `Cargo.toml` and package root |
+| Owner | `repository = "https://github.com/unicode-rs/unicode-segmentation"`, the unicode-rs working group that also publishes `unicode-width` | vendored `Cargo.toml` |
+| Already in the build | `ratatui-core` 0.1.2 and `ratatui-widgets` 0.3.2 both list it, and so do `unicode-truncate` 2.0.1 and `convert_case` 0.10.0 | `Cargo.lock` |
+| Cost of the edge | `Cargo.lock` grew by exactly one line, the new edge; no package was added or bumped | `git diff --stat Cargo.lock` |
+| Size | 400 KiB of source, mostly generated Unicode tables; 712 KiB including tests and benches | `du -sh` on the vendored package |
+| Transitive deps | none at build time; its only dependencies are dev-dependencies for its own tests | vendored `Cargo.toml` |
+| Platform support | `#![no_std]` with an explicit no-std section in its documentation, so nothing is platform-specific | vendored `src/lib.rs:35,55` |
+| Safety | `#![deny(missing_docs, unsafe_code)]`; no `unsafe` block in the crate | vendored `src/lib.rs:50` |
+| Toolchain | `edition = "2018"`, `rust-version = "1.85.0"`, below this workspace's 1.88 floor | vendored `Cargo.toml` |
+| Registry only | plain version requirement in `[workspace.dependencies]`; no Git dependency | this repository's `Cargo.toml` |
+
+Release history and downloads were not checked: this environment has no
+network access, so crates.io could not be read. The reviewer independently
+consulted
+[the upstream package page](https://docs.rs/crate/unicode-segmentation/1.13.3)
+in round 3 and accepted the addition on that basis, noting its release
+history and no-std support. Everything in the table above was verified
+locally and can be re-checked from the paths named.
+
+### Round 2 validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --no-fail-fast` | pass, 419 tests, 0 failed |
+| `cargo test -p gritt --test tui_pty` | pass, 6 tests |
+
+419 passing, up from 411: 8 tests added. No snapshot golden changed, which
+is itself worth recording: the grapheme rewrite altered no fixture
+rendering, because the fixtures hold CJK and long identifiers but no
+combining marks, and those already wrapped correctly.
+
+`.agents/gritt-agent ticket chain-check --ticket TKT-0018 --base main`:
+
+```text
+NOTE: current branch: tkt-0018-03-tui-foundation
+NOTE: base branch `main` sha: 77aaa22cb1c5
+NOTE: changed files against `main`: 64
+tkt_chain_check ok (0 warning(s))
+```
+
+## Round 3
+
+The third review confirmed round 2's drawer and grapheme fixes and accepted
+the dependency, and returned two medium findings: one an incomplete fix
+from round 2, one a performance regression introduced by it. Findings are
+in `/tmp/review-tkt-0018-r3-findings.md`.
+
+**R3-1: wide home still allowed focus onto a sidebar it never draws.**
+Round 2 made focus depend on `terminal_width` and `sidebar_enabled`, which
+is the placement rule for the conversation layout. Home is a centred
+wordmark and composer and draws neither the column nor a transcript pane,
+so at 120 columns Tab twice still parked focus on the sidebar and Up moved
+an invisible scroll offset instead of the composer cursor. The predicate
+now requires the conversation layout, and the same reasoning applies to the
+transcript pane, which home does not draw either: `focus_is_available`
+answers for all three panes, `next_focus` walks the cycle and stops only on
+a pane that is drawn, and `reconcile_layout` normalizes focus off any pane
+that is not. On home the cycle is the composer alone, so the arrow keys
+always belong to the cursor. Covered by
+`home_keeps_focus_on_the_composer_however_wide_the_terminal`, which drives
+the reviewer's exact sequence (multiline paste, Tab, Tab, Up) and asserts
+the cursor moved and `sidebar_scroll` did not, and by
+`focus_left_on_a_pane_that_home_does_not_draw_is_normalized`, which covers
+`/new` returning home while focus sits on the sidebar and on the transcript.
+
+**R3-2: backward word editing became quadratic.** Round 2 replaced
+scalar stepping with `cluster_start`, which scans forward from the start of
+the buffer for every backward boundary. `word_start` calls that once per
+grapheme, so a Ctrl-W or Ctrl-Left after a long unbroken paste did work
+proportional to the square of the draft length, synchronously on the
+interface thread. The forward scan is gone: `last_cluster_len` uses
+`graphemes(true).next_back()`, so a backward step costs the length of the
+cluster it crosses rather than the length of everything before it, and
+`word_start` becomes linear in the word. Covered by
+`backward_word_editing_does_not_rescan_the_whole_draft`, which builds a
+100,000-character unbroken draft and bounds Ctrl-Left, Ctrl-W, and ten
+thousand Left presses at five seconds each. The bound is deliberately loose
+so a slow machine cannot make it flaky; the quadratic form needed on the
+order of a hundred million grapheme visits for the same draft and fails the
+bound by orders of magnitude. The whole composer suite runs in 0.05s.
+
+This one was mine to catch and I did not: round 2 changed how far a
+backward step scans and I only checked that it landed in the right place.
+
+### Round 3 validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --no-fail-fast` | pass, 422 tests, 0 failed |
+| `cargo test -p gritt --test tui_pty` | pass, 6 tests |
+
+422 passing, up from 419: 3 tests added. No snapshot golden changed; the
+focus and traversal rules are reducer behaviour and alter no drawn frame.
+
+The two optional follow-ups were taken: the dependency check above now
+records dated, sourced evidence for each question the CLI skill asks, and
+`report.md` no longer claims no dependency was added.
+
+`.agents/gritt-agent ticket chain-check --ticket TKT-0018 --base main`:
+
+```text
+NOTE: current branch: tkt-0018-03-tui-foundation
+NOTE: base branch `main` sha: 77aaa22cb1c5
+NOTE: changed files against `main`: 64
+tkt_chain_check ok (0 warning(s))
+```
+
+## Round 4
+
+The fourth review confirmed the focus fix and returned one medium finding,
+again in the traversal round 3 rewrote. Findings are in
+`/tmp/review-tkt-0018-r4-findings.md`.
+
+**R4-1: backward word traversal was still quadratic for adjacent flag
+emoji.** Round 3 fixed the cost of a single backward step for ordinary
+text, but `word_start` still asked for the previous boundary once per
+cluster, and each ask built a fresh grapheme cursor. That is cheap for
+ASCII and it is not cheap for regional indicators: whether two of them are
+one flag or two halves depends on how many precede them, so a fresh cursor
+counts backwards through the whole run before it can answer. A word scan
+over a long paste of `🇺🇸` therefore rescanned a shrinking prefix per
+cluster. The round 3 regression used ASCII only and could not see it.
+
+`word_start` now carries one reverse iterator across the whole scan and
+subtracts each cluster's length as it goes, so the regional-indicator count
+the cursor keeps stays alive between steps and the scan costs the text it
+crosses. `word_end` is the forward mirror, rewritten the same way for the
+same reason. Verified against the vendored source before choosing the
+approach rather than assumed: `GraphemeCursor` caches `ris_count` and
+reuses it on a subsequent `prev_boundary`
+(`unicode-segmentation-1.13.3/src/grapheme.rs:214,822`), while a fresh
+cursor starts at `None` and counts the run (`:317,519`), and
+`Graphemes::next_back` steps one cursor it owns (`:125`).
+
+Covered by `backward_word_editing_stays_linear_across_a_run_of_flag_emoji`,
+which builds 20,000 adjacent flags with no whitespace and bounds Ctrl-Left,
+Ctrl-W, and Ctrl-Right at five seconds each, and by
+`word_moves_still_land_between_flags_and_words`, which checks the
+correctness the speed fix must not break: a flag is one character to step
+over, to delete, and to stop beside. The whole composer suite runs in
+0.03s.
+
+### A residual worth naming
+
+Fixing the word scan does not make a *single* backward step cheap on a flag
+run, because one step still builds one cursor that counts the indicators
+behind it. Measured in a debug build on this machine, 2,000 Left presses
+took 520 ms over 5,000 flags, 1.14 s over 10,000, and 2.41 s over 20,000:
+linear in the draft for each press, about 1.2 ms per press at 20,000 flags.
+That stays inside the plan's 50 ms input-to-frame budget for any draft a
+person is likely to type, and it is the same shape of cost the reviewer
+found, one exponent lower.
+
+It is not fixed here. Removing it means giving `Composer` a persistent
+grapheme cursor, which changes the shape of a type that is currently plain
+cloneable data compared by value, and doing that in the middle of a review
+round is a worse trade than recording the number. It is in `report.md` as a
+follow-up with these measurements, so the responsiveness work in step 5 of
+the feature plan can decide it against real budgets rather than a guess.
+
+### Round 4 validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --no-fail-fast` | pass, 424 tests, 0 failed |
+| `cargo test -p gritt --test tui_pty` | pass, 6 tests |
+
+424 passing, up from 422: 2 tests added. No snapshot golden changed.
+
+`.agents/gritt-agent ticket chain-check --ticket TKT-0018 --base main`:
+
+```text
+NOTE: current branch: tkt-0018-03-tui-foundation
+NOTE: base branch `main` sha: 77aaa22cb1c5
+NOTE: changed files against `main`: 64
+tkt_chain_check ok (0 warning(s))
+```
+
+## Remaining follow-up
+
+The `Picker::window` helper is now unused by the picker renderer, which
+computes its window in lines instead of rows; it stays because the row-based
+form is still the right shape for a flat list and is covered by its own
+test. Grapheme clusters are handled through `unicode-segmentation`, so
+emoji sequences and flags wrap as single units; terminal support for
+drawing them still varies, which is a rendering limit rather than a Gritt
+one. Everything else remaining is the follow-up list in `report.md`.
