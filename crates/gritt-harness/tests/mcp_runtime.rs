@@ -5,7 +5,7 @@
 //! so the fixtures use names no product code could know.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -928,9 +928,11 @@ mod http_fixture {
                         calls += 1;
                         if mode == Mode::StallNotifications {
                             // Slow enough that the caller cancels first, which
-                            // is what produces the notification this mode
-                            // then refuses to answer.
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            // is what produces the notification this mode then
+                            // refuses to answer, and short enough that a
+                            // burst of them does not monopolise this
+                            // single-threaded endpoint.
+                            tokio::time::sleep(Duration::from_millis(300)).await;
                         }
                         match mode {
                             Mode::SessionLost => {
@@ -2231,7 +2233,7 @@ async fn stalled_auxiliary_posts_cannot_accumulate() {
     // Every cancellation produces a notification POST this endpoint accepts
     // and never answers. Far more than the auxiliary budget allows.
     let mut attempts = Vec::new();
-    for _ in 0..60 {
+    for _ in 0..12 {
         let runtime = Arc::clone(&runtime);
         let frozen = frozen.clone();
         attempts.push(tokio::spawn(async move {
@@ -2247,21 +2249,48 @@ async fn stalled_auxiliary_posts_cannot_accumulate() {
     for attempt in attempts {
         let _ = attempt.await;
     }
+    // The endpoint answers one connection at a time, so wait for it to work
+    // through whatever was actually sent rather than sampling mid-flight.
+    let count = || {
+        endpoint
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(line, _)| line.contains("notifications/cancelled"))
+            .count()
+    };
+    let mut notifications = 0;
+    for _ in 0..150 {
+        notifications = count();
+        if notifications > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     tokio::time::sleep(Duration::from_millis(500)).await;
+    let notifications = notifications.max(count());
 
     // Admission is bounded, so only a handful of those POSTs were ever sent;
     // the rest were dropped rather than queued up with their payloads.
-    let notifications = endpoint
-        .seen
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(line, _)| line.contains("notifications/cancelled"))
-        .count();
     assert!(
         notifications <= 16,
         "stalled notifications accumulated: {notifications} reached the endpoint"
     );
+    assert!(
+        notifications > 0,
+        "no notification was sent, so this proves nothing"
+    );
+
+    // Admission, not just execution, is what is bounded: the request budget
+    // is untouched by the stalled auxiliary work, so ordinary calls still go
+    // through while all of it is parked.
+    let working = CancellationToken::new();
+    let result = runtime
+        .call(&frozen, &serde_json::json!({}), &working)
+        .await
+        .expect("stalled auxiliary work blocked an ordinary call");
+    assert!(result.output.starts_with("call "), "{}", result.output);
 
     // And the stalled work is released rather than held to the end.
     let began = std::time::Instant::now();
@@ -2271,4 +2300,218 @@ async fn stalled_auxiliary_posts_cannot_accumulate() {
         "shutdown waited on stalled auxiliary work for {:?}",
         began.elapsed()
     );
+}
+
+// --- Round 4 review fixes ----------------------------------------------
+
+/// Every pid a fixture recorded under `dir`, for tests where some servers
+/// are still queued and never start at all.
+fn recorded_pids(paths: &[PathBuf]) -> Vec<u32> {
+    paths
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .filter_map(|text| text.trim().parse().ok())
+        .collect()
+}
+
+#[tokio::test]
+async fn shutdown_during_a_queued_startup_leaves_nothing_running() {
+    // More servers than the concurrency limit, so some are still queued when
+    // shutdown arrives and others are mid-handshake. A queued launch that is
+    // refused must not spawn, and one that already spawned must be owned.
+    let dir = tempfile::tempdir().unwrap();
+    let mut entries = serde_json::Map::new();
+    let mut pid_files = Vec::new();
+    for index in 0..8 {
+        let pid_file = dir.path().join(format!("server-{index}.pid"));
+        entries.insert(
+            format!("queued-{index}"),
+            serde_json::json!({
+                "command": FIXTURE,
+                "args": ["slowinit"],
+                "env": {"FIXTURE_PID": pid_file.to_string_lossy()},
+            }),
+        );
+        pid_files.push(pid_file);
+    }
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        serde_json::json!({ "mcpServers": entries }).to_string(),
+    )
+    .unwrap();
+    let runtime = Arc::new(
+        McpRuntime::new(
+            dir.path(),
+            McpRuntimeSettings {
+                max_concurrent_init: 2,
+                init_timeout: Duration::from_secs(120),
+                ..settings()
+            },
+        )
+        .with_trust(MemoryTrustStore::trust_all()),
+    );
+    let config = runtime.read_config().unwrap();
+    runtime.load(&config).await.unwrap();
+
+    let starter = Arc::clone(&runtime);
+    let token = CancellationToken::new();
+    let starting = tokio::spawn(async move { starter.start(&token).await });
+    // Long enough for the first batch to be running and the rest to be
+    // waiting their turn.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    runtime.shutdown().await;
+
+    // Whatever had started is already gone when shutdown returns; the signal
+    // handler exits the process immediately afterwards.
+    let started = recorded_pids(&pid_files);
+    assert!(
+        !started.is_empty(),
+        "no server ever started, so this proves nothing"
+    );
+    assert_gone_now(&started, "a queued-startup child outlived shutdown");
+
+    let snapshots = starting.await.unwrap();
+    assert!(
+        snapshots.iter().all(|snapshot| !snapshot.state.is_ready()),
+        "a server was installed after shutdown: {snapshots:?}"
+    );
+    assert!(runtime.tool_set().await.is_empty());
+    assert!(runtime.child_pids().await.is_empty());
+    // Nothing started after shutdown began either.
+    assert_gone_now(
+        &recorded_pids(&pid_files),
+        "a server started during shutdown",
+    );
+}
+
+#[tokio::test]
+async fn a_stale_startup_result_is_gone_before_start_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("stale.pid");
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        serde_json::json!({"mcpServers": {"stale": {
+            "command": FIXTURE,
+            "args": ["slowinit"],
+            "env": {"FIXTURE_PID": pid_file.to_string_lossy()},
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let runtime =
+        Arc::new(McpRuntime::new(dir.path(), settings()).with_trust(MemoryTrustStore::trust_all()));
+    let config = runtime.read_config().unwrap();
+    runtime.load(&config).await.unwrap();
+
+    let starter = Arc::clone(&runtime);
+    let token = CancellationToken::new();
+    let starting = tokio::spawn(async move { starter.start(&token).await });
+    // The entry moves on while its handshake is still running, so the result
+    // that arrives belongs to a definition nobody is waiting for.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    runtime.stop("stale").await.unwrap();
+    let snapshots = starting.await.unwrap();
+
+    assert_eq!(state_of(&snapshots, "stale"), &McpServerState::Stopped);
+    // `start` closes a stale result before it returns, so the child is gone
+    // by the time the caller sees the snapshots.
+    assert_gone_now(
+        &recorded_pids(&[pid_file]),
+        "a stale startup result outlived the call that discarded it",
+    );
+    assert!(runtime.child_pids().await.is_empty());
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_cancellation_survives_a_flood_of_later_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("guarded-was-called");
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        serde_json::json!({"mcpServers": {"paused": {
+            "command": FIXTURE,
+            "args": ["pausedreader"],
+            "env": {"FIXTURE_MARKER": marker.to_string_lossy()},
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let runtime = Arc::new(
+        McpRuntime::new(
+            dir.path(),
+            McpRuntimeSettings {
+                init_timeout: Duration::from_secs(10),
+                call_timeout: Duration::from_secs(120),
+                ..settings()
+            },
+        )
+        .with_trust(MemoryTrustStore::trust_all()),
+    );
+    let cancel = CancellationToken::new();
+    runtime.open(&cancel).await.unwrap();
+    let tools = runtime.tool_set().await;
+    let filler = tools.lookup("mcp__paused__filler").cloned().unwrap();
+    let guarded = tools.lookup("mcp__paused__guarded").cloned().unwrap();
+
+    // Block the writer, then queue the call under test behind it.
+    let padding = serde_json::json!({"text": "f".repeat(64 * 1024)});
+    let filling = CancellationToken::new();
+    let mut backlog = Vec::new();
+    for _ in 0..40 {
+        let runtime = Arc::clone(&runtime);
+        let filler = filler.clone();
+        let padding = padding.clone();
+        let token = filling.clone();
+        backlog.push(tokio::spawn(async move {
+            let _ = runtime.call(&filler, &padding, &token).await;
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let guarded_token = CancellationToken::new();
+    let calling = Arc::clone(&runtime);
+    let held = guarded.clone();
+    let token = guarded_token.clone();
+    let guarded_call = tokio::spawn(async move {
+        calling
+            .call(&held, &serde_json::json!({"text": "go"}), &token)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    guarded_token.cancel();
+    assert!(guarded_call.await.unwrap().is_err());
+
+    // Far more later cancellations than any fixed-size record of them could
+    // hold. The one above must survive all of them.
+    let mut flood = Vec::new();
+    for _ in 0..1500 {
+        let runtime = Arc::clone(&runtime);
+        let filler = filler.clone();
+        flood.push(tokio::spawn(async move {
+            let token = CancellationToken::new();
+            let canceller = token.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                canceller.cancel();
+            });
+            let _ = runtime
+                .call(&filler, &serde_json::json!({"text": "x"}), &token)
+                .await;
+        }));
+    }
+    for task in flood {
+        let _ = task.await;
+    }
+
+    // The server wakes and drains whatever is still queued.
+    filling.cancel();
+    for task in backlog {
+        let _ = task.await;
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(
+        !marker.exists(),
+        "a cancellation was forgotten under load and the call reached the server"
+    );
+    runtime.shutdown().await;
 }
