@@ -542,3 +542,77 @@ Two of the new regressions were checked against the unfixed code: restoring
 the unregister-before-close ordering fails the stale-cleanup test, and
 neutralising the pre-write cancellation check fails the queued-cancellation
 test.
+
+---
+
+# 2026-09-05 Round 5 review fixes
+
+## Trigger
+
+The fifth review returned `needs-fix` with a single confirmed High defect.
+Round-4 fixes 2 and 3 were confirmed resolved. The remaining defect was the
+last gap in the same launch-ownership work: the drain loop was fixed to hold
+reservations but still decided when it was finished by looking at the wrong
+thing.
+
+## Changes per finding
+
+**1. High — shutdown ignored reserved launches before attachment.** Round 4
+reserved a launch slot before spawning and let it hold `None` until the
+connection existed, but the drain loop still asked whether the *connections*
+it could see were empty. A slot holding `None` therefore read as nothing left
+to do. A launch that had reserved its place and was inside spawning was
+invisible: its child existed, or was about to, and shutdown could return
+while it lived, after which the signal handler exits the process.
+
+The loop now ends on the count of *slots*, not the count of attached
+connections, and closes whatever is attached on each pass. A slot clears
+either because spawning failed and released it or because the connection was
+attached and then closed, so waiting for the map to empty is what makes
+shutdown mean every child is gone.
+
+Observing that window needed a seam: it is a few microseconds in production
+and cannot be hit reliably by timing. `McpRuntime::with_launch_gate` takes a
+semaphore the runtime acquires between creating a process and registering it;
+production never sets it. The regression holds every launch there with a
+semaphore that has no permits, waits until the child's pid file proves it is
+running, starts a shutdown, and asserts it has *not* returned while the
+launch is held. Releasing the gate lets the launch attach, shutdown closes
+it, and the child is asserted gone the moment shutdown returns. Restoring the
+old loop condition fails that test.
+
+## Optional follow-ups applied
+
+Both.
+
+`stalled_auxiliary_posts_cannot_accumulate` had drifted: an earlier retune
+dropped the burst to 12 while the assertion still allowed 16, so it could no
+longer detect unbounded admission at all. The burst is back to 40 against a
+cap of 8, the endpoint's stall is shortened so that stays quick, and the
+bound is now 8. Unbounded admission would send all 40.
+
+A second shutdown regression exercises the stale-result path *during*
+cleanup rather than after: the entry is stopped while its handshake is in
+flight and shutdown lands while `start` is still working through the
+discarded result, asserting the child is gone when shutdown returns.
+
+## Validation
+
+- `cargo fmt --all --check`: pass.
+- `cargo clippy --workspace --all-targets -- -D warnings`: pass.
+- `cargo test --workspace --no-fail-fast`: pass, 331 tests, 0 failed, over
+  three consecutive runs.
+- `GRITT_LIVE_MCP_TESTS=1 cargo test -p gritt-harness --test mcp_live_smoke`:
+  pass. The single configured entry, `gritt`, is ready on protocol
+  `2025-06-18` with 3 tools. No tool was called.
+
+Two tests were added and one repaired. The new gated-launch regression was
+checked against the unfixed code and fails there.
+
+## Note on the seam
+
+`with_launch_gate` exists only so this window can be tested. It is a builder
+method that production code never calls, and the runtime does nothing with it
+when unset. The alternative was to leave the guarantee unverified, or to time
+a race that lasts microseconds; neither is worth preferring to one unused
+parameter.
