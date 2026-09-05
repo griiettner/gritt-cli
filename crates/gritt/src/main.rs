@@ -696,17 +696,50 @@ async fn run_tui_mode(
     if builder.approval == ApprovalMode::DenyAll && !args.deny_all {
         builder.approval = ApprovalMode::Ask;
     }
-    if connector.is_none() {
-        warm_catalog(&builder, args).await;
-    }
     let mcp = builder.mcp().cloned();
     // Installed before the first launch. Raw mode is not on yet, so an
     // interrupt here arrives as a signal, and the children sit in their own
     // process groups: without this they would survive it.
     let slot: CancelSlot = Arc::new(Mutex::new(None));
     let _ = install_ctrl_c(Arc::clone(&slot), mcp.clone());
+    // Neither the model list nor the MCP servers are waited for here. The
+    // plan's launch budget is a usable composer independent of provider and
+    // MCP readiness, and an unreachable endpoint or a server that never
+    // answers `initialize` would otherwise hold a blank terminal for its
+    // whole deadline. Both are started in the background; the full-screen
+    // mode loads catalogs on demand and subscribes to MCP lifecycle, so
+    // each result arrives as a message and is drawn when it lands
+    // (TKT-0020).
+    if connector.is_none() {
+        let warming = builder.clone();
+        let selector = selector(args);
+        let profile = args.profile.clone();
+        let model = args.model.clone();
+        let skip = args.no_models;
+        tokio::spawn(async move {
+            if skip {
+                return;
+            }
+            // Deliberately silent: stderr belongs to the alternate screen
+            // now. A stale or missing list is reported inside the
+            // interface instead.
+            if let Ok(profile) = warming
+                .session_profile(&selector, profile.as_deref(), model.as_deref())
+                .await
+            {
+                let _ = warming.load_catalog(&profile).await;
+            }
+        });
+    }
     if runs_on_native(&builder, &selector(args), connector).await {
-        start_mcp(&builder, false).await;
+        if let Some(runtime) = mcp.clone() {
+            tokio::spawn(async move {
+                // `start_mcp` reports each server on stderr, which the
+                // alternate screen owns from here on. The interface reads
+                // the same states from the lifecycle subscription.
+                let _ = runtime.open(&gritt_harness::CancellationToken::new()).await;
+            });
+        }
     }
     let result = tui_session(builder, args, connector).await;
     stop_mcp(&mcp).await;
