@@ -28,7 +28,7 @@ pub mod trust;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -153,6 +153,14 @@ pub struct McpRuntime {
     state: Mutex<RuntimeState>,
     generations: AtomicU64,
     launches: AtomicU64,
+    /// Serializes first-use decisions. Two decisions racing each other could
+    /// otherwise persist in one order and apply in the other, leaving the
+    /// stored decision disagreeing with the live one.
+    decisions: Mutex<()>,
+    /// Whether the workspace file has been read and its approved servers
+    /// started. A session that begins on a connector never opens the
+    /// runtime; entering a native session later does.
+    opened: AtomicBool,
 }
 
 impl McpRuntime {
@@ -167,6 +175,8 @@ impl McpRuntime {
             state: Mutex::new(RuntimeState::default()),
             generations: AtomicU64::new(1),
             launches: AtomicU64::new(1),
+            decisions: Mutex::new(()),
+            opened: AtomicBool::new(false),
         }
     }
 
@@ -350,6 +360,10 @@ impl McpRuntime {
     /// connection is closed, so a denial revokes live access rather than only
     /// preventing the next launch.
     pub async fn decide(&self, server: &str, decision: TrustDecision) -> Result<()> {
+        // One decision at a time. Without this, two decisions can persist in
+        // one order and apply in the other, and the store ends up disagreeing
+        // with the state the user sees.
+        let _decisions = self.decisions.lock().await;
         let (fingerprint, observed) = {
             let state = self.state.lock().await;
             let entry = state.servers.get(server).ok_or_else(|| {
@@ -363,6 +377,21 @@ impl McpRuntime {
             }
             (entry.fingerprint.clone(), entry.generation)
         };
+        // Checked before the write, not after it. A decision that is already
+        // stale must not reach the store at all: returning an error after
+        // persisting would leave an approval recorded for a definition the
+        // user has since denied.
+        {
+            let state = self.state.lock().await;
+            let current = state.servers.get(server);
+            if current.map(|entry| (&entry.fingerprint, entry.generation))
+                != Some((&fingerprint, observed))
+            {
+                return Err(Error::config(format!(
+                    "`{server}` changed while the decision was being made; review it again"
+                )));
+            }
+        }
         self.trust
             .record(TrustRecord {
                 workspace: self.workspace_key(),
@@ -437,7 +466,7 @@ impl McpRuntime {
         let outcomes: Vec<(String, u64, std::result::Result<Established, String>)> =
             futures::stream::iter(pending.into_iter().map(|(config, generation)| async move {
                 let name = config.name.clone();
-                let outcome = self.connect(&config, cancel).await;
+                let outcome = self.connect_inner(&config, cancel).await;
                 (name, generation, outcome)
             }))
             .buffer_unordered(limit)
@@ -447,11 +476,18 @@ impl McpRuntime {
         {
             let mut state = self.state.lock().await;
             for (name, generation, outcome) in outcomes {
+                // Whatever happens next, this connection stops being a
+                // pending launch and becomes either installed or closed, in
+                // this one critical section.
+                if let Ok(established) = &outcome {
+                    state.launching.remove(&established.launch);
+                }
                 let current = state.servers.get(&name).map(|entry| entry.generation);
-                if current != Some(generation) {
+                if current != Some(generation) || state.closing {
                     // Reloaded, denied, stopped, or shut down while this was
                     // connecting. The result belongs to a definition that is
-                    // no longer configured under this name.
+                    // no longer configured under this name, or to a runtime
+                    // that is going away.
                     if let Ok(established) = outcome {
                         stale.push(established.connection);
                     }
@@ -494,9 +530,30 @@ impl McpRuntime {
 
     /// Loads the workspace file and starts every already-approved server.
     pub async fn open(&self, cancel: &CancellationToken) -> Result<Vec<McpServerSnapshot>> {
+        self.opened.store(true, Ordering::SeqCst);
         let config = self.read_config()?;
         self.load(&config).await?;
         Ok(self.start(cancel).await)
+    }
+
+    /// Opens the runtime the first time it is needed and does nothing after.
+    ///
+    /// A run that starts on an external agent never opens it: that agent owns
+    /// its own MCP clients. Switching to a native session later, through a
+    /// resume, is the first moment Gritt needs its own servers, and this is
+    /// what starts them then rather than leaving the session without tools.
+    pub async fn ensure_open(&self, cancel: &CancellationToken) -> Result<Vec<McpServerSnapshot>> {
+        if self.opened.swap(true, Ordering::SeqCst) {
+            return Ok(self.snapshots().await);
+        }
+        let config = self.read_config()?;
+        self.load(&config).await?;
+        Ok(self.start(cancel).await)
+    }
+
+    /// True once the workspace file has been read and its servers started.
+    pub fn is_open(&self) -> bool {
+        self.opened.load(Ordering::SeqCst)
     }
 
     /// Stops one server and connects it again.
@@ -868,27 +925,6 @@ impl McpRuntime {
         }
     }
 
-    /// Opens a transport, negotiates the protocol, and discovers tools,
-    /// all inside the initialization deadline.
-    async fn connect(
-        &self,
-        config: &McpServerConfig,
-        cancel: &CancellationToken,
-    ) -> std::result::Result<Established, String> {
-        match tokio::time::timeout(
-            self.settings.init_timeout,
-            self.connect_inner(config, cancel),
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(_) => Err(format!(
-                "the server was not ready within {}s",
-                self.settings.init_timeout.as_secs()
-            )),
-        }
-    }
-
     async fn connect_inner(
         &self,
         config: &McpServerConfig,
@@ -938,16 +974,36 @@ impl McpRuntime {
             connection.shutdown().await;
             return Err("the runtime is shutting down".to_owned());
         }
-        let outcome = self.negotiate(&connection, config, cancel).await;
-        self.finish_launch(launch).await;
+        // The overall deadline wraps the negotiation only. Wrapping the whole
+        // function would drop it while it still owned the connection, and
+        // nothing would then close that child or release its registration.
+        let outcome = match tokio::time::timeout(
+            self.settings.init_timeout,
+            self.negotiate(&connection, config, cancel),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => Err(Error::config(format!(
+                "the server was not ready within {}",
+                connection::human(self.settings.init_timeout)
+            ))),
+        };
         let handshake = match outcome {
             Ok(handshake) => handshake,
             Err(error) => {
+                // Closed and released together, so a failed launch leaves
+                // nothing behind for shutdown to find.
                 connection.shutdown().await;
+                self.finish_launch(launch).await;
                 return Err(tail(error.message));
             }
         };
+        // The launch registration is deliberately not released here. It
+        // travels with the result and is dropped by `start`, under the lock
+        // that installs the connection.
         Ok(Established {
+            launch,
             connection,
             pid,
             protocol_version: handshake.protocol_version,
@@ -992,8 +1048,10 @@ impl McpRuntime {
         true
     }
 
-    /// Releases a launch. The connection is either installed by `start` or
-    /// closed by the caller from here on.
+    /// Releases a launch whose connection has already been closed.
+    ///
+    /// A launch that succeeded keeps its registration until `start` installs
+    /// or closes it; see [`Established::launch`].
     async fn finish_launch(&self, launch: u64) {
         self.state.lock().await.launching.remove(&launch);
     }
@@ -1142,8 +1200,32 @@ fn entry_secrets(server: &McpServerConfig) -> Vec<Secret> {
                         "authorization" | "proxy-authorization" | "cookie" | "x-auth-token"
                     ))
         })
-        .map(|(_, value)| Secret::new(value.clone()))
+        .flat_map(|(_, value)| credential_variants(value))
         .collect()
+}
+
+/// The forms of one credential a server could echo back.
+///
+/// Redaction is exact-string replacement, so registering only the configured
+/// value misses the part that actually is the secret. `Authorization` is
+/// commonly set to a whole `Bearer <token>` string, and a server that logs
+/// just the token would otherwise leak it. Both the complete value and the
+/// part after an authentication scheme are registered.
+fn credential_variants(value: &str) -> Vec<Secret> {
+    let mut variants = vec![Secret::new(value.to_owned())];
+    if let Some((scheme, rest)) = value.split_once(char::is_whitespace) {
+        let rest = rest.trim();
+        // A scheme is a short word; the remainder is the credential. The
+        // length floor keeps a stray short word from being redacted out of
+        // every message.
+        let looks_like_scheme = !scheme.is_empty()
+            && scheme.len() <= 16
+            && scheme.chars().all(|c| c.is_ascii_alphabetic());
+        if looks_like_scheme && rest.len() >= 4 && !rest.contains(char::is_whitespace) {
+            variants.push(Secret::new(rest.to_owned()));
+        }
+    }
+    variants
 }
 
 /// The credentials a freshly installed connection should carry.
@@ -1188,6 +1270,10 @@ struct Negotiated {
 }
 
 struct Established {
+    /// The registration this connection still holds. It is released only
+    /// under the same lock that installs or closes the connection, so there
+    /// is no window in which shutdown can see neither.
+    launch: u64,
     connection: Arc<Connection>,
     pid: Option<u32>,
     protocol_version: String,

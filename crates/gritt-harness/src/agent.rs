@@ -417,6 +417,12 @@ impl NativeAgent {
         let Some(mcp) = self.mcp.clone() else {
             return;
         };
+        // A run that began on an external agent never opened the runtime,
+        // because that agent owns its own MCP clients. This turn is native,
+        // so this is the moment Gritt needs its own servers. Opening is
+        // idempotent; a configuration error leaves the entries visible in the
+        // snapshots rather than failing the turn.
+        let _ = mcp.ensure_open(&self.cancel).await;
         mcp.refresh(&self.cancel).await;
         self.mcp_tools = mcp.tool_set().await;
     }
