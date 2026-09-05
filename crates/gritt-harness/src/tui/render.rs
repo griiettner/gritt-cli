@@ -151,6 +151,8 @@ pub fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 }
 
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
+    // One frame, counted for the deterministic timing harness.
+    app.count_frame();
     let area = frame.area();
     // The reducer needs the terminal width to know whether `/sidebar`
     // toggles a column or opens a drawer, and only the frame knows it.

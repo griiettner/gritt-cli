@@ -1516,3 +1516,27 @@ fn settings_wait_for_a_turn_and_loading_is_cancellable() {
     // Escape with nothing open cancels the work the loading line names.
     assert_eq!(app.on_key(key(KeyCode::Esc)), Action::Cancel);
 }
+
+/// The seam TKT-0020's deterministic timing harness needs: synthetic
+/// events and keys already go in through the reducer, and the renderer
+/// counts the frames they cost.
+#[test]
+fn synthetic_events_and_a_frame_counter_are_reachable_without_a_terminal() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = plain();
+    assert_eq!(app.frames(), 0);
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    for index in 0..50 {
+        app.on_event(&event(EventKind::TextDelta {
+            text: format!("delta {index} "),
+        }));
+        terminal
+            .draw(|frame| crate::tui::render::draw(frame, &app))
+            .unwrap();
+    }
+    assert_eq!(app.frames(), 50, "a frame went uncounted");
+    // Coalescing: fifty deltas are one transcript entry, not fifty.
+    assert_eq!(app.entries.len(), 1);
+}

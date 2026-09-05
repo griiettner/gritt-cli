@@ -554,6 +554,14 @@ pub struct App {
     /// them to answer "is the viewport at the bottom" and "is the sidebar
     /// a column here", and only the renderer knows them.
     metrics: Cell<Metrics>,
+    /// Frames drawn since this state was created.
+    ///
+    /// The responsiveness work (TKT-0020) needs to know how many frames a
+    /// burst of events actually cost, and a deterministic harness cannot
+    /// read that from a terminal. Feeding synthetic events is already
+    /// possible through [`App::on_event`] and [`App::on_key`]; this is the
+    /// other half of that seam. Nothing in the interface reads it.
+    frames: Cell<u64>,
 }
 
 /// Measurements the last frame took, for reducers that need geometry.
@@ -609,7 +617,18 @@ impl App {
             revision: 0,
             cache: RefCell::new(LayoutCache::default()),
             metrics: Cell::new(Metrics::default()),
+            frames: Cell::new(0),
         }
+    }
+
+    /// Frames drawn so far. See the field for why this exists.
+    pub fn frames(&self) -> u64 {
+        self.frames.get()
+    }
+
+    /// Counts a frame. Called once by the renderer per draw.
+    pub fn count_frame(&self) {
+        self.frames.set(self.frames.get() + 1);
     }
 
     /// The composition for this frame. The home screen is what an empty
