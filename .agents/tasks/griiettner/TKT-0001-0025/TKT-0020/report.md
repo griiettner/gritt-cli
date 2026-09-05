@@ -187,18 +187,20 @@ involved and no human ran any of it.
 | --- | --- |
 | `cargo fmt --all --check` | pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | pass, no warnings |
-| `cargo test --workspace --no-fail-fast` | pass, 490 passed, 0 failed |
+| `cargo test --workspace --no-fail-fast` | pass, 494 passed, 0 failed |
 | `cargo test --manifest-path .agents/cli/Cargo.toml` | pass, 107 passed, 0 failed |
-| `cargo test -p gritt --test tui_pty` | pass, 11 passed, 0 failed |
+| `cargo test -p gritt --test tui_pty` | pass, 13 passed, 0 failed |
 | `GRITT_LIVE_MCP_TESTS=1 cargo test -p gritt-harness --test mcp_live_smoke` | pass, 1 passed (see below) |
 | `GRITT_LIVE_CONNECTOR_TESTS=1 cargo test -p gritt-connector --test live` | pass, 3 passed |
 | `GRITT_LIVE_TESTS=1 cargo test -p gritt-provider --test live` | pass, 3 skipped honestly |
+| `GRITT_BENCH=1 cargo test --release -p gritt-harness --test tui_load -- --nocapture --test-threads 1` | pass, 1 passed |
 | `GRITT_BENCH=1 cargo test --release -p gritt-harness --test tui_responsiveness -- --nocapture --test-threads 1` | pass, 6 passed |
-| `GRITT_BENCH=1 cargo test --release -p gritt --test tui_bench -- --nocapture --test-threads 1` | pass, 4 passed |
+| `GRITT_BENCH=1 cargo test --release -p gritt --test tui_bench -- --nocapture --test-threads 1` | pass, 5 passed |
 
-Workspace test count moved from 478 (TKT-0019) to 490: six in
-`tui_responsiveness`, four in `tui_bench`, and one process-cleanup test in
-`tui_pty`.
+Workspace test count moved from 478 (TKT-0019) to 494: six microbenchmarks in
+`tui_responsiveness`, the combined-load case in `tui_load`, five in
+`tui_bench`, and three in `tui_pty` (process cleanup with a hung MCP server,
+catalog readiness on the eager path, and malformed MCP configuration).
 
 Docs link check: the repository has no link checker, in `scripts/`, in CI
 configuration, or in the agent CLI. An ad-hoc check of every relative
@@ -236,67 +238,111 @@ in this environment, so no request was made to any provider.
 ## Benchmarks
 
 Recorded with `GRITT_BENCH=1` in a release build on the machine described
-above. The deterministic harness is
-`crates/gritt-harness/tests/tui_responsiveness.rs`, driven through
-`App::on_key`, `App::on_event`, and `render::draw` against a `TestBackend` at
-120x40. The process measurements are `crates/gritt/tests/tui_bench.rs`,
-driven against the real binary in a pseudo-terminal.
+above. There are three harnesses and they do not carry equal weight.
+
+- **`crates/gritt-harness/tests/tui_load.rs` is the authoritative one.** It
+  runs the plan's whole scenario as one workload against `LoopHarness`, which
+  forwards to the same `on_message` and `on_action` the product calls, with
+  streaming produced through the production `Ui` on the real channel. Queue
+  depth, drain rate, and input latency under load come from here.
+- **`crates/gritt/tests/tui_bench.rs`** measures the two budgets that belong
+  to the process rather than the reducer, launch and idle, against the real
+  binary in a pseudo-terminal.
+- **`crates/gritt-harness/tests/tui_responsiveness.rs` holds
+  microbenchmarks.** Each case isolates the reducer or the renderer. They are
+  useful for attributing a regression and are not evidence about the loop;
+  the first review of this ticket correctly rejected an earlier version of
+  this report for quoting them as though they were.
 
 ### Against the plan's budget table
 
 | Scenario | Budget | Measured | Verdict |
 | --- | --- | --- | --- |
-| Launch with existing config | first usable composer within 500 ms, independent of provider and MCP readiness | 40 ms (alternate screen at 39 ms) | **MET** |
-| Typing, input to frame | p95 below 50 ms | p50 2.151 ms, **p95 2.267 ms**, max 2.490 ms, n=500 | **MET** |
-| Picker navigation, input to frame | p95 below 50 ms | p50 2.466 ms, **p95 2.618 ms**, max 3.749 ms, n=500 | **MET** |
-| Scrolling, input to frame | p95 below 50 ms | p50 2.158 ms, **p95 2.298 ms**, max 2.400 ms, n=500 | **MET** |
-| Sustained output, render work at 120x40 | p95 below 16 ms | p50 14.468 ms, **p95 14.979 ms**, max 28.967 ms, n=690 | **MET**, by 1.0 ms |
-| Cancel under load | visible canceling state within 100 ms | **20.529 ms** worst of 50 rounds | **MET** |
-| Idle CPU over 30 s | below 1% of one core | **0.2%** | **MET** (2.5% before the fix) |
-| Idle screen, no continuous full redraw | no redraw | **0 bytes** written to the terminal over 30 idle seconds | **MET** (16,281 bytes before the fix) |
-| Resident memory plateau over a five-minute soak with history paging | a stable plateau | baseline 33,616 KiB, peak **852,016 KiB**; middle third 527,152 KiB, last third 852,016 KiB | **NOT MET** |
+| Launch with existing config | first usable composer within 500 ms | 39 ms | **MET** |
+| Launch, model list requested and never answered | independent of provider readiness | 30 ms | **MET** |
+| Typing, input to frame (idle transcript, micro) | p95 below 50 ms | p50 2.155 ms, **p95 2.271 ms**, n=500 | **MET** |
+| Picker navigation (micro) | p95 below 50 ms | p50 2.492 ms, **p95 2.660 ms**, n=500 | **MET** |
+| Scrolling (micro) | p95 below 50 ms | p50 2.171 ms, **p95 2.306 ms**, n=500 | **MET** |
+| Input to frame under 1,000 deltas/s (integrated) | p95 below 50 ms | p50 47.204 ms, **p95 52.488 ms**, n=98 | **NOT MET**, by 2.5 ms |
+| Sustained output, delta drain rate (integrated) | keep up with 1,000/s | **975/s** | **MET** |
+| Sustained output, render work at 120x40 (micro) | p95 below 16 ms | p50 14.511 ms, **p95 15.083 ms**, n=686 | **MET**, by 0.9 ms |
+| Render cap under load (integrated) | 30 fps | **20 fps**, 198 frames in 10 s | **MET** |
+| Bounded queues under load (integrated) | bounded, nothing dropped | peak **52**, final **0** | **MET** |
+| Cancel under load (integrated) | visible canceling state within 100 ms | **2.664 ms**, cancellation token fired, frame changed | **MET** |
+| Idle CPU over 30 s | below 1% of one core | **0.2%** | **MET** |
+| Idle screen, no continuous full redraw | no redraw | **0 bytes** over 30 idle seconds | **MET** |
+| Resident memory plateau over a five-minute soak | a stable plateau | baseline 38,800 KiB, peak **762,336 KiB**; middle third 532,352 KiB, last third 762,336 KiB | **NOT MET** |
 
-### The plateau gap, stated specifically
+Two budgets are missed. Both are named below rather than softened.
 
-Over 300 seconds the harness delivered 2,796,000 text deltas into a
-10,000-message transcript and consumed 294 s of CPU. Resident memory rose from
-33,616 KiB to 852,016 KiB and was still rising: the last third of the run
-peaked 324,864 KiB above the middle third. Growth is linear and steady at
-**300 bytes per delta**, which is what the regression test bounds (at 2 KiB
-per delta, an order of magnitude of headroom).
+### What the integrated run changed
 
-The cause is not a leak. `render::transcript_lines` builds wrapped `Line`
-values for every entry in the transcript on each cache rebuild, the app then
-slices the roughly 35 visible lines out of the result, and every incoming
-delta invalidates the cache. History paging, which the plan asks for
+Before this ticket's loop fixes, measured on the same harness:
+
+| Measure | Before | After |
+| --- | --- | --- |
+| Messages handled | 693 of 9,552 produced (69/s) | 9,755 of 9,752 produced (**975/s**) |
+| Queue peak | 8,863 | **52** |
+| Queue at end | 8,862 | **0** |
+| Frames in 10 s | 777 (78 fps) | **198 (20 fps)** |
+| 1 MiB tool result delivered | no, still queued | **yes** |
+
+The loop drew a frame per message and a turn emits a text delta per token
+through the same channel, so throughput was capped at the frame rate while
+the queue grew without bound. It now caps drawing at 30 fps, handles every
+waiting message before the next draw, and takes input ahead of a queued
+message. Nothing is dropped: every message reaches the same handler in the
+same order, and only the intermediate frames between them are skipped.
+
+An earlier version of this report claimed the `UiMsg` channel's producers
+were "only discrete completions rather than a stream". That was wrong.
+`ChannelUi::event` sends every streaming event through it, which is exactly
+why the queue grew.
+
+### The two misses, stated specifically
+
+**Input to frame under sustained load: 52.488 ms against 50 ms.** One cycle
+is a coalesced drain of about fifty deltas plus one frame, and the frame is a
+full-transcript rebuild. A keypress waits for the cycle in progress. The load
+is 1,000 deltas per second, which is roughly ten to twenty times what a
+provider actually streams; the microbenchmark figure of 2.271 ms is what
+typing costs when output is not saturating the channel. Both numbers are
+reported because neither alone describes the product.
+
+**Resident memory over the five-minute soak.** Over 300 seconds the harness
+delivered 2,791,000 text deltas into a 10,000-message transcript and consumed
+294 s of CPU. Resident memory rose from 38,800 KiB to 762,336 KiB and was
+still rising: the last third of the run peaked 229,984 KiB above the middle
+third. Growth is linear and steady at **265 bytes per delta**, which is what
+the regression test bounds, at 2 KiB per delta. This soak is a saturating
+reducer and renderer loop delivering roughly 9,300 deltas a second, not the
+integrated 1,000 a second scenario, and its numbers are scoped to that.
+
+The cause of both is the same. `render::transcript_lines` builds wrapped
+`Line` values for every entry in the transcript on each cache rebuild, the
+app then slices the roughly 35 visible lines out of the result, and every
+incoming delta invalidates the cache. History paging, which the plan asks for
 ("page old history rather than keeping every rendered line in memory"), does
-not exist: the transcript view holds every entry it has ever been given. So
-memory tracks transcript size, which under a continuous stream never stops
-growing.
-
-The same cause sets the sustained-output render work at 14.979 ms against a
-16 ms budget. Both numbers move together, and limiting rendering to visible
-content is the single change that would fix them. It is follow-up 1.
+not exist. Limiting rendering to visible content is the single change that
+would close the plateau, the 0.9 ms render-work margin, and the 2.5 ms input
+overshoot together. It is follow-up 1.
 
 ### Other recorded figures
 
 | Measurement | Result |
 | --- | --- |
-| First frame after loading a 10,000-message transcript | 12.917 ms (a load cost, kept out of the input series) |
-| Sustained delta rate achieved | 9,986 deltas in 10.0 s = **999/s** against the plan's 1,000/s |
-| Queue depth under that load | peak backlog **29** deltas, 690 frames; the loop drains the whole backlog before each frame, so the queue is bounded by what one frame's work admits |
-| 1 MiB tool result | reduce 3.204 ms, next frame 3.040 ms. Held as entry detail and drawn only when `/details` is on, so frame cost is not proportional to result size |
-| Several MCP servers plus one hung server | 3 of 4 reached `Ready`; the hung entry became `Failed { "initialize did not answer within 5s" }` and did not hold the others |
-| Frames drawn while MCP initialized | p50 1.106 ms, p95 4.385 ms, max 16.567 ms, n=367 |
-| Soak CPU | 294 s over 300 s wall, a saturating producer loop rather than an idle measurement |
+| First frame after loading a 10,000-message transcript | 13.250 ms (a load cost, kept out of the input series) |
+| 1 MiB tool result (micro) | reduce 3.876 ms, next frame 2.755 ms. Held as entry detail and drawn only when `/details` is on |
+| 1 MiB tool result (integrated) | delivered through the real channel mid-stream and present in the transcript at the end of the run |
+| Several MCP servers plus one hung server, under load | 3 of 4 reached `Ready`; the hung entry became `Failed { "initialize did not answer within 5s" }` and did not hold the others |
+| Cancel under load (micro, reducer only) | 18.149 ms worst of 50 rounds |
 
-Queue bounds in the product, for the record: the MCP lifecycle broadcast is
-bounded at 32 messages and every message carries the whole snapshot list, so a
-lagged subscriber loses intermediate frames and never correctness. The
-`UiMsg` channel from background work into the loop is **unbounded**; nothing
-in the measured scenarios made it grow, because every producer is a discrete
-completion rather than a stream, but it is not a bounded queue with
-backpressure as the plan's wording asks for. Recorded as follow-up 2.
+Queue bounds, for the record: the MCP lifecycle broadcast is bounded at 32
+messages and every message carries the whole snapshot list, so a lagged
+subscriber loses intermediate frames and never correctness. The `UiMsg`
+channel is still an unbounded channel; what changed is that the loop now
+drains it every iteration, so under the plan's load it stays at a peak of 52
+and returns to zero. A capacity that makes growth impossible is follow-up 2.
 
 ## Regression review
 
@@ -316,7 +362,28 @@ backpressure as the plan's wording asks for. Recorded as follow-up 2.
    `quitting_the_full_screen_mode_leaves_no_mcp_server_running`, which
    configures a server that never speaks MCP and could not have reached its
    first frame before this change.
-3. **An overstated secret guarantee in a doc comment**
+3. **No coalescing, no frame cap, and an unbounded queue under load**
+   (`crates/gritt-harness/src/tui/run.rs`). Found by the reviewer and
+   confirmed by measuring the real loop: it drew a frame per message, so a
+   turn streaming a delta per token through the same channel drained at 69
+   messages a second against 1,000 produced, and the queue reached 8,863 and
+   never recovered. A 1 MiB tool result produced mid-stream was still queued
+   when the run ended. The loop now caps drawing at 30 fps, handles every
+   waiting message before the next draw, and biases its `select!` so input is
+   taken before a queued message. Drain rate 975/s, queue peak 52, final 0.
+   See the [review fixes update](updates/2026-09-05-review-fixes.md).
+4. **Catalog readiness on the eager path** (`crates/gritt/src/main.rs`).
+   Moving the catalog warm off the launch path let `tui --session NAME
+   --model retired-id` resolve against an empty catalog and persist the
+   retired identifier. The warm is awaited on the eager path, which resolves
+   and persists a model before the first frame, and stays in the background
+   on the lazy path.
+5. **Discarded MCP startup errors** (`crates/gritt/src/main.rs`,
+   `crates/gritt-harness/src/tui/run.rs`). A malformed `.mcp.json` failed
+   before any entry was published, so the interface said no servers were
+   configured. Opening moved into the interface, and a failure arrives as a
+   message that shows the configuration error.
+6. **An overstated secret guarantee in a doc comment**
    (`crates/gritt-harness/src/mcp/mod.rs`). `definition_summary` claimed a
    value reaching an *argument* through `${TOKEN}` could not be echoed. It
    cannot, but because arguments are never interpolated at all, not because
@@ -426,21 +493,30 @@ exit status 0. The configured key string appeared nowhere in either stream.
 
 ## Completion Gate
 
-- **Acceptance:** Partial, and deliberately so. Docs match the implemented
-  commands and limitations, verified against source; benchmark evidence
-  records p50/p95 latency, CPU, memory, and queue behaviour; the single
-  `.mcp.json` entry has an honest result; full validation is green. One of
-  the plan's nine budgets, the resident-memory plateau, is not met. The plan's
-  own acceptance criterion permits a recorded run that "identifies specific
-  remaining performance gaps", and the gap is identified with its cause,
-  its magnitude, and the change that would close it. Next action: follow-up 1.
-- **Scope:** Held. Three fixes, all of them responsiveness or secret-accuracy
-  defects the parent criteria require. No new product capability, no change to
+- **Acceptance:** Partial, and stated precisely. Docs match the implemented
+  commands and limitations, verified against source and corrected after
+  review; benchmark evidence now measures the production load path and
+  records p50/p95 latency, CPU, memory, queue depth, and drain rate; the
+  single `.mcp.json` entry has an honest result; full validation is green.
+  Two of the plan's budgets are not met: the resident-memory plateau, and
+  input-to-frame under a sustained 1,000 deltas per second, which overshoots
+  by 2.5 ms. Both have the same cause, named in follow-up 1. The plan's own
+  acceptance criterion permits a recorded run that "identifies specific
+  remaining performance gaps". **One verification is outstanding rather than
+  failed: the real-terminal walkthrough by a human has not been performed.**
+  No agent can perform it. It stays pending with the checklist below, and the
+  chain's verification contract is not satisfied until a human completes and
+  records it. Next actions: follow-up 1, and the human walkthrough.
+- **Scope:** Held. Six fixes, all of them responsiveness, startup-correctness,
+  or secret-accuracy defects the parent criteria require, three of them found
+  by review. No new product capability, no change to
   the provider or session contract beyond recording it, no LSP or skill
   execution, no test or criterion weakened. No new dependency.
-- **Validation:** Ten commands, all pass. Counts and environment above. The
+- **Validation:** Eleven commands, all pass. Counts and environment above. The
   live MCP smoke needed the server's index to complete once before it could
-  pass; that is recorded rather than hidden.
+  pass; that is recorded rather than hidden. Two regressions found by the
+  reviewer were reproduced before being fixed, and their guard tests were
+  verified to fail with the fix reverted.
 - **Security and safety:** No new unsafe file or network access, no injection
   path, no auth bypass, no destructive behaviour, no dependency added. The
   audit found no reachable secret leak. One doc comment overstating a
@@ -461,16 +537,20 @@ exit status 0. The configured key string appeared nowhere in either stream.
 
 1. **Limit rendering to visible content.** `render::transcript_lines` builds
    every entry's wrapped lines on each rebuild and the app slices out the ~35
-   visible ones; every delta invalidates the cache. This is the cause of both
-   the failed memory plateau (300 bytes per delta, 852 MB after five minutes)
-   and the 14.979 ms render work against a 16 ms budget. Fixing it needs a
-   line index over entries so a rebuild can start at the first visible entry,
-   and it will churn the 19 snapshot goldens. Highest-value remaining
-   performance work.
-2. **The `UiMsg` channel into the run loop is unbounded.** The plan asks for
-   bounded queues with backpressure. Nothing measured made it grow, because
-   every producer is a discrete completion rather than a stream, but it is not
-   what the plan specifies.
+   visible ones; every delta invalidates the cache. It is now the cause of
+   three separate misses and margins: the failed memory plateau, the
+   render-work figure sitting 0.9 ms inside a 16 ms budget, and the 2.5 ms
+   overshoot on input-to-frame under sustained load, because a full rebuild
+   is most of the cycle a keypress waits for. Fixing it needs a line index
+   over entries so a rebuild can start at the first visible entry, and it will
+   churn the 19 snapshot goldens. Highest-value remaining performance work by
+   a wide margin.
+2. **The `UiMsg` channel into the run loop is still an unbounded channel.**
+   The loop now drains it every iteration, so under the plan's load it peaks
+   at 52 and returns to zero, which is what the earlier unbounded growth
+   needed. What is still missing against the plan's wording is a capacity:
+   backpressure on the producer rather than a consumer that happens to keep
+   up. Any producer faster than the drain would still grow it.
 3. **Wire `McpRuntimeSettings` into `config.toml`** (carried from TKT-0017 and
    TKT-0019). Without it the 30 s initialization deadline cannot be raised for
    a server that legitimately needs longer on a cold start, and this
@@ -510,3 +590,7 @@ writes (TKT-0016), newer MCP protocol revisions (TKT-0017), HTTP resumability
 (TKT-0017), OS clipboard and mouse support (TKT-0018), the flag-emoji cursor
 cost (TKT-0018), the diff overlay's missing word wrap (TKT-0019), and the
 REPL's stale-approval read window (pre-existing).
+
+## Updates
+
+- [2026-09-05 review fixes](updates/2026-09-05-review-fixes.md)
