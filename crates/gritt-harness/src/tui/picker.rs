@@ -176,13 +176,37 @@ impl Picker {
         &self.rows
     }
 
-    /// Replaces the rows, keeping the query. Used when a refresh lands
-    /// while the user is already typing.
+    /// Replaces the rows and starts the highlight over. Used when the
+    /// list is a different list, not a fresher copy of the same one.
     pub fn set_rows(&mut self, rows: Vec<PickerRow>) {
         self.rows = rows;
         self.highlight = 0;
         self.scroll = 0;
         self.highlight_current();
+    }
+
+    /// Replaces the rows of a list the user is already looking at: the
+    /// query stays, and the highlight follows the row it was on by id, or
+    /// clamps into the new list when that row is gone.
+    pub fn replace_rows(&mut self, rows: Vec<PickerRow>) {
+        let held = self.selected().map(|row| row.id.clone());
+        self.rows = rows;
+        match held
+            .and_then(|id| {
+                self.visible()
+                    .iter()
+                    .position(|index| self.rows[*index].id == id)
+            })
+            .or_else(|| {
+                // Nothing was highlighted before, so fall back to the row
+                // that is currently in effect.
+                self.visible()
+                    .iter()
+                    .position(|index| self.rows[*index].current)
+            }) {
+            Some(position) => self.highlight = position,
+            None => self.clamp(),
+        }
     }
 
     /// Indices into `rows` that match the query, in row order.
@@ -384,6 +408,38 @@ mod tests {
         assert_eq!(picker.visible().len(), 3);
         picker.set_rows(Vec::new());
         assert!(picker.is_empty());
+    }
+
+    #[test]
+    fn rows_arriving_late_keep_the_query_and_the_highlighted_row() {
+        let mut picker = Picker::new("sessions", Vec::new());
+        picker.type_char('a');
+        picker.type_char('l');
+        // The list was empty when it opened; the load lands afterwards.
+        picker.replace_rows(vec![
+            PickerRow::new("1", "alpha"),
+            PickerRow::new("2", "bravo"),
+            PickerRow::new("3", "almond"),
+        ]);
+        assert_eq!(picker.query.text(), "al");
+        assert_eq!(picker.visible().len(), 2);
+        assert_eq!(picker.selected().unwrap().id, "1");
+        picker.move_down();
+        assert_eq!(picker.selected().unwrap().id, "3");
+        // A second load keeps the highlight on the same row by id.
+        picker.replace_rows(vec![
+            PickerRow::new("3", "almond"),
+            PickerRow::new("1", "alpha"),
+            PickerRow::new("4", "apex"),
+        ]);
+        assert_eq!(picker.selected().unwrap().id, "3");
+        // When that row disappears the highlight clamps instead of
+        // pointing past the end.
+        picker.replace_rows(vec![PickerRow::new("1", "alpha")]);
+        assert_eq!(picker.selected().unwrap().id, "1");
+        picker.replace_rows(Vec::new());
+        assert!(picker.selected().is_none());
+        assert_eq!(picker.highlight(), 0);
     }
 
     #[test]

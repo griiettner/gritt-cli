@@ -20,7 +20,7 @@ use gritt_core::event::{ApprovalId, ApprovalRequest};
 use gritt_core::policy::PolicyOutcome;
 use gritt_harness::draft::CatalogState;
 use gritt_harness::policy::Decision;
-use gritt_harness::tui::app::{App, PendingApproval, View};
+use gritt_harness::tui::app::{App, Metrics, PendingApproval, View};
 use gritt_harness::tui::command::Command;
 use gritt_harness::tui::render::draw;
 use gritt_harness::tui::theme::{Theme, ThemeMode};
@@ -132,7 +132,22 @@ fn build(name: &str, theme: Theme) -> App {
         }
         "sidebar_drawer" => {
             let mut app = fixture::conversation(theme);
+            // A narrow terminal: `/sidebar` opens the drawer there.
+            app.set_metrics(Metrics {
+                transcript_lines: 40,
+                transcript_height: 10,
+                terminal_width: 80,
+            });
             app.dispatch(Command::Sidebar, None);
+            app
+        }
+        "home_long_draft" => {
+            let mut app = fixture::home(theme);
+            type_text(
+                &mut app,
+                "Refactor the session store so the draft validation and the catalog \
+                 warm-up share one code path, then explain what changed and why.",
+            );
             app
         }
         other => panic!("unknown screen {other}"),
@@ -238,7 +253,7 @@ fn check(name: &str, width: u16, height: u16) {
     );
 }
 
-const SCREENS: [&str; 12] = [
+const SCREENS: [&str; 13] = [
     "home",
     "conversation",
     "command_search",
@@ -251,6 +266,7 @@ const SCREENS: [&str; 12] = [
     "mcp",
     "help",
     "sidebar_drawer",
+    "home_long_draft",
 ];
 
 #[test]
@@ -388,4 +404,149 @@ fn a_picker_is_reachable_from_both_the_palette_and_a_slash_command() {
         from_slash.top_overlay().unwrap().picker_kind(),
         Some(PickerKind::Connect)
     );
+}
+
+/// Finding 3: keyboard selection must stay on screen. At 60x20 the
+/// connection dialog used to draw the "Installed agents" heading with
+/// every agent row clipped off the bottom.
+#[test]
+fn a_picker_shows_the_highlighted_row_at_every_size() {
+    for (width, height) in SIZES {
+        let mut app = fixture::conversation(Theme::new(ThemeMode::Dark));
+        app.dispatch(Command::Connect, None);
+        // Walk the whole list; every stop must be visible on screen.
+        let rows = match app.top_overlay() {
+            Some(gritt_harness::tui::Overlay::Picker { picker, .. }) => picker.rows().len(),
+            other => panic!("expected the connection picker, got {other:?}"),
+        };
+        for step in 0..rows {
+            let label = match app.top_overlay() {
+                Some(gritt_harness::tui::Overlay::Picker { picker, .. }) => {
+                    picker.selected().unwrap().label.clone()
+                }
+                _ => unreachable!(),
+            };
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            let text = text_of(terminal.backend().buffer());
+            assert!(
+                text.contains(&label),
+                "at {width}x{height} step {step}: the highlighted row {label:?} \
+                 is not on screen:\n{text}"
+            );
+            app.on_key(key(KeyCode::Down));
+        }
+    }
+}
+
+/// Finding 3, the concrete regression the reviewer found in the golden.
+#[test]
+fn the_connection_dialog_never_shows_a_group_heading_with_no_rows_under_it() {
+    for (width, height) in SIZES {
+        let mut app = fixture::conversation(Theme::new(ThemeMode::Dark));
+        app.dispatch(Command::Connect, None);
+        // Move to the first installed agent, which is what a reader does
+        // when they want one.
+        for _ in 0..3 {
+            app.on_key(key(KeyCode::Down));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = text_of(terminal.backend().buffer());
+        if text.contains("Installed agents") {
+            assert!(
+                text.contains("codex") || text.contains("claude-code") || text.contains("cursor"),
+                "at {width}x{height} the heading has no rows under it:\n{text}"
+            );
+        }
+        assert!(text.contains("codex"), "at {width}x{height}:\n{text}");
+    }
+}
+
+/// Finding 3 for the slash list: it is taller than its panel at 60x20.
+#[test]
+fn slash_suggestions_keep_the_highlighted_command_on_screen() {
+    let mut app = fixture::home(Theme::new(ThemeMode::Dark));
+    app.on_key(key(KeyCode::Char('/')));
+    let total = app.suggestions().len();
+    for _ in 0..total {
+        let name = app.highlighted_suggestion().unwrap().name;
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = text_of(terminal.backend().buffer());
+        assert!(
+            text.contains(&format!("/{name}")),
+            "the highlighted command /{name} is not on screen:\n{text}"
+        );
+        app.on_key(key(KeyCode::Down));
+    }
+}
+
+/// Finding 5: a draft longer than the composer's interior must stay
+/// visible, and the cursor must sit on the character being typed.
+#[test]
+fn a_draft_longer_than_the_composer_scrolls_instead_of_disappearing() {
+    let mut app = fixture::home(Theme::new(ThemeMode::Dark));
+    let draft = "word ".repeat(60);
+    type_text(&mut app, &draft);
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let text = text_of(terminal.backend().buffer());
+    // The tail the user is typing is what has to be on screen.
+    assert!(text.contains("word word"), "the draft vanished:\n{text}");
+    let cursor = terminal.get_cursor_position().unwrap();
+    let rows: Vec<&str> = text.lines().collect();
+    assert!(
+        rows[cursor.y as usize].trim_end().contains("word"),
+        "the cursor is not on the row holding the draft tail:\n{text}"
+    );
+
+    // Multiline overflow behaves the same way.
+    let mut app = fixture::home(Theme::new(ThemeMode::Dark));
+    for index in 0..30 {
+        type_text(&mut app, &format!("line {index}"));
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+    }
+    type_text(&mut app, "the last line");
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let text = text_of(terminal.backend().buffer());
+    assert!(text.contains("the last line"), "{text}");
+}
+
+/// Finding 6: hiding the column on a wide terminal gives its space to the
+/// transcript rather than covering it with a modal drawer.
+#[test]
+fn hiding_the_sidebar_on_a_wide_terminal_widens_the_transcript() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::Dark));
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let with_column = text_of(terminal.backend().buffer());
+    assert!(with_column.contains("Changed files"), "{with_column}");
+
+    app.dispatch(Command::Sidebar, None);
+    assert!(
+        app.overlays.is_empty(),
+        "a wide terminal must get no drawer"
+    );
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let without = text_of(terminal.backend().buffer());
+    assert!(!without.contains("Changed files"), "{without}");
+    assert!(without.contains("Tidy the public API"), "{without}");
+    // The transcript now uses the full width, so it wraps later.
+    let widest = |text: &str| text.lines().map(|line| line.chars().count()).max().unwrap();
+    assert!(widest(&without) >= widest(&with_column));
+}
+
+/// The `fixture` label is the one thing a narrow home may not clip.
+#[test]
+fn the_fixture_label_survives_the_narrowest_home() {
+    for (width, height) in SIZES {
+        let text = text_of(&render("home", ThemeMode::Dark, width, height));
+        assert!(
+            text.contains("fixture"),
+            "the fixture label was clipped at {width}x{height}:\n{text}"
+        );
+    }
 }

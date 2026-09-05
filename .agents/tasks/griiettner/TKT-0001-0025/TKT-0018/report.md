@@ -312,11 +312,9 @@ What a human should still check, because a PTY byte stream cannot:
    events. `SidebarModel::generation` and `accepts()` are there for
    rejecting late updates after a session switch, and nothing calls them
    yet.
-2. **Picker scrolling is partial.** `Picker::window` computes the visible
-   range and is tested, but `draw_picker` renders every row into a
-   `Paragraph` and lets it clip. A list longer than the panel cannot be
-   scrolled past the bottom. Worth a ticket before a provider with a
-   hundred models is real.
+2. **Picker scrolling** was partial at review time and is now fixed; see
+   the 2026-09-05 update. The renderer computes its window in lines so a
+   highlighted row stays visible at every size.
 3. **No OS clipboard.** Ctrl-Y fills Gritt's own buffer. A real system
    clipboard needs a dependency and a platform review.
 4. **Mouse support.** The plan mentions mouse scrolling and tool expansion
@@ -328,5 +326,17 @@ What a human should still check, because a PTY byte stream cannot:
 6. **Responsiveness is unmeasured.** Plan step 5 owns the budgets. The
    layout cache and event-driven redraw are in place to meet them, but
    nothing was timed here.
-7. **Pre-existing, untouched:** the REPL's stale-approval read window is
+7. **`/new` clears presentation, not the session.** It empties the
+   transcript view and the draft state, but the live driver and its
+   continuation state stay open until TKT-0019 wires a real fresh session.
+   Opening one here would be out of scope.
+8. **The late-approval guarantee is tested at the reducer, not the
+   runtime.** The test clears `pending` the way the loop does; proving the
+   queued race would need the event loop under test, which needs a runtime
+   harness this ticket does not build.
+9. **Pre-existing, untouched:** the REPL's stale-approval read window is
    still recorded in `docs/terminal-modes.md` as a known follow-up.
+
+## Updates
+
+- [2026-09-05 review fixes](updates/2026-09-05-review-fixes.md)

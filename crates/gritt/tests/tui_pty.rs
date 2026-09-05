@@ -326,6 +326,12 @@ fn approval_diff_palette_and_sessions_views_work_by_keyboard_without_color() {
     writer.write_all(&[0x13]).unwrap();
     writer.flush().unwrap();
     wait_for(&rx, &mut seen, "Enter resumes", Duration::from_secs(20));
+    // The picker opens before the store answers. Its rows carry the
+    // session's timestamp, which nothing else on screen shows, so seeing
+    // one proves the loaded sessions reached the open list rather than
+    // only the state behind it.
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    wait_for(&rx, &mut seen, &today, Duration::from_secs(20));
     writer.write_all(&[0x1b]).unwrap();
     writer.flush().unwrap();
     thread::sleep(Duration::from_millis(200));

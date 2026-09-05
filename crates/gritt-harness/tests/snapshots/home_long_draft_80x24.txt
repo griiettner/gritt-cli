@@ -1,4 +1,4 @@
-# home 80x24
+# home_long_draft 80x24
 
 ## text
 
@@ -16,7 +16,7 @@
                           Use /connect to get started.
 
  ╭────────────────────────────────────────────────────────────────────────────╮
- │Type here; /connect chooses a provider or an installed agent                │
+ │hare one code path, then explain what changed and why.                      │
  ╰────────────────────────────────────────────────────────────────────────────╯
                        not connected  effort auto  fixture
 
@@ -33,7 +33,6 @@ fg=Some(Rgb(122, 162, 247)) bg=Some(Rgb(20, 22, 26)) mod=NONE
 fg=Some(Rgb(122, 162, 247)) bg=Some(Rgb(30, 33, 39)) mod=NONE
 fg=Some(Rgb(135, 143, 156)) bg=Some(Rgb(20, 22, 26)) mod=DIM
 fg=Some(Rgb(135, 143, 156)) bg=Some(Rgb(20, 22, 26)) mod=NONE
-fg=Some(Rgb(135, 143, 156)) bg=Some(Rgb(30, 33, 39)) mod=DIM
 fg=Some(Rgb(221, 225, 230)) bg=Some(Rgb(20, 22, 26)) mod=NONE
 fg=Some(Rgb(221, 225, 230)) bg=Some(Rgb(30, 33, 39)) mod=NONE
 fg=Some(Rgb(240, 113, 120)) bg=Some(Rgb(20, 22, 26)) mod=BOLD
@@ -45,7 +44,6 @@ fg=Some(Rgb(34, 37, 43)) bg=Some(Rgb(238, 239, 242)) mod=NONE
 fg=Some(Rgb(34, 37, 43)) bg=Some(Rgb(250, 250, 248)) mod=NONE
 fg=Some(Rgb(43, 84, 168)) bg=Some(Rgb(238, 239, 242)) mod=NONE
 fg=Some(Rgb(43, 84, 168)) bg=Some(Rgb(250, 250, 248)) mod=NONE
-fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(238, 239, 242)) mod=DIM
 fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(250, 250, 248)) mod=DIM
 fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(250, 250, 248)) mod=NONE
 

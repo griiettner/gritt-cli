@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::tui::fixture;
+use crate::tui::sidebar::SidebarPlacement;
 use crate::tui::theme::{Theme, ThemeMode};
 use chrono::Utc;
 use gritt_core::event::EventSource;
@@ -202,10 +203,11 @@ fn overlay_priority_is_approval_then_picker_then_suggestions() {
 #[test]
 fn escape_closes_the_top_overlay_first_and_then_cancels_the_turn() {
     let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
-    app.running = true;
+    // Open both while idle: settings overlays are refused during a turn.
     app.dispatch(Command::Help, None);
     app.dispatch(Command::Connect, None);
     assert_eq!(app.overlays.len(), 2);
+    app.running = true;
     assert_eq!(app.on_key(key(KeyCode::Esc)), Action::None);
     assert_eq!(app.overlays.len(), 1);
     assert_eq!(app.on_key(key(KeyCode::Esc)), Action::None);
@@ -228,23 +230,70 @@ fn a_cancelled_approval_cannot_be_answered_by_a_late_key() {
 }
 
 #[test]
-fn scrolling_up_holds_the_viewport_and_flags_new_output() {
+fn scrolling_up_holds_the_same_lines_while_output_streams_in() {
     let mut app = plain();
-    app.push(EntryKind::Assistant, "first");
+    for index in 0..40 {
+        app.push(EntryKind::Assistant, format!("line {index}"));
+    }
+    // A frame has to happen before the reducer knows the geometry.
+    let held = |app: &App| {
+        app.visible_transcript(40, 6, crate::tui::render::transcript_lines)
+            .1
+    };
+    let text = |lines: &[ratatui::text::Line<'static>]| {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    let bottom = text(&held(&app));
+    assert!(bottom.contains("line 39"), "{bottom}");
     assert!(app.follow);
+
     app.on_key(key(KeyCode::PageUp));
     assert!(!app.follow);
-    assert_eq!(app.scroll, 10);
-    app.on_event(&event(EventKind::TextDelta {
-        text: "streamed".into(),
-    }));
-    // The viewport did not jump back to the bottom.
-    assert_eq!(app.scroll, 10);
+    let before = text(&held(&app));
+    assert!(!before.contains("line 39"), "{before}");
+
+    // Ten more lines arrive. The reader is still looking at the same
+    // content, not at a viewport that slid down under them.
+    for index in 40..50 {
+        app.on_event(&event(EventKind::TextDelta {
+            text: format!("streamed {index}\n"),
+        }));
+    }
+    let after = text(&held(&app));
+    assert_eq!(after, before, "the held viewport moved while streaming");
     assert!(app.new_output);
-    // Return to latest is explicit.
+
+    // Return to latest is explicit and lands back on the newest line.
     assert_eq!(app.on_key(ctrl('g')), Action::None);
-    assert_eq!(app.scroll, 0);
     assert!(app.follow);
+    assert!(!app.new_output);
+    let latest = text(&held(&app));
+    assert!(latest.contains("streamed 49"), "{latest}");
+}
+
+#[test]
+fn scrolling_back_to_the_bottom_resumes_following() {
+    let mut app = plain();
+    for index in 0..40 {
+        app.push(EntryKind::Assistant, format!("line {index}"));
+    }
+    app.visible_transcript(40, 6, crate::tui::render::transcript_lines);
+    app.on_key(key(KeyCode::PageUp));
+    assert!(!app.follow);
+    for _ in 0..3 {
+        app.on_key(key(KeyCode::PageDown));
+        app.visible_transcript(40, 6, crate::tui::render::transcript_lines);
+    }
+    assert!(app.follow, "reaching the bottom resumes following");
     assert!(!app.new_output);
 }
 
@@ -472,19 +521,70 @@ fn the_palette_and_a_slash_command_reach_the_same_action() {
 #[test]
 fn the_drawer_restores_focus_and_scroll_when_it_closes() {
     let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    // A narrow terminal: `/sidebar` opens the drawer here.
+    app.set_metrics(Metrics {
+        transcript_lines: 40,
+        transcript_height: 10,
+        terminal_width: 80,
+    });
     app.focus = Focus::Transcript;
     app.scroll_up(6);
+    let held = app.top;
     app.dispatch(Command::Sidebar, None);
     assert!(matches!(app.top_overlay(), Some(Overlay::Drawer { .. })));
     // The drawer scrolls on its own without touching the transcript.
     app.on_key(key(KeyCode::Char('j')));
     assert_eq!(app.sidebar_scroll, 1);
-    assert_eq!(app.scroll, 6);
+    assert_eq!(app.top, held);
     app.focus = Focus::Sidebar;
     app.on_key(key(KeyCode::Esc));
     assert!(app.overlays.is_empty());
     assert_eq!(app.focus, Focus::Transcript, "focus is restored");
-    assert_eq!(app.scroll, 6, "the transcript position is restored");
+    assert_eq!(app.top, held, "the transcript position is restored");
+}
+
+/// Finding 6: on a wide terminal `/sidebar` hides and shows the column.
+/// It must not replace it with a modal drawer.
+#[test]
+fn on_a_wide_terminal_sidebar_toggles_the_column_and_never_opens_a_drawer() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.set_metrics(Metrics {
+        transcript_lines: 40,
+        transcript_height: 10,
+        terminal_width: 120,
+    });
+    assert!(app.sidebar_enabled);
+    app.dispatch(Command::Sidebar, None);
+    assert!(app.overlays.is_empty(), "a wide terminal gets no drawer");
+    assert!(!app.sidebar_enabled);
+    assert_eq!(app.sidebar_placement(120), SidebarPlacement::Hidden);
+    app.dispatch(Command::Sidebar, None);
+    assert!(app.sidebar_enabled);
+    assert_eq!(app.sidebar_placement(120), SidebarPlacement::Column);
+}
+
+/// Finding 6: the column has its own scroll offset, reached with Tab.
+#[test]
+fn the_sidebar_column_scrolls_without_moving_the_transcript_or_the_draft() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.set_metrics(Metrics {
+        transcript_lines: 40,
+        transcript_height: 10,
+        terminal_width: 120,
+    });
+    type_text(&mut app, "a draft");
+    app.scroll_up(4);
+    let held = app.top;
+    app.focus = Focus::Sidebar;
+    app.on_key(key(KeyCode::Down));
+    app.on_key(key(KeyCode::Down));
+    assert_eq!(app.sidebar_scroll, 2);
+    app.on_key(key(KeyCode::Up));
+    assert_eq!(app.sidebar_scroll, 1);
+    app.on_key(key(KeyCode::PageDown));
+    assert_eq!(app.sidebar_scroll, 11);
+    assert_eq!(app.top, held, "the transcript did not move");
+    assert_eq!(app.composer.text(), "a draft", "the draft did not change");
 }
 
 #[test]
@@ -629,4 +729,147 @@ fn the_mcp_overlay_accounts_for_every_configured_entry() {
         .find(|row| row.id == "legacy-sse")
         .unwrap();
     assert!(unsupported.note.contains("Streamable HTTP"));
+}
+
+/// Finding 1, the reviewer's exact sequence: `/`, Down, Tab, Enter. Tab
+/// completes `/models`, which narrows the list to one row; the highlight
+/// must come back with it instead of pointing past the end.
+#[test]
+fn completing_a_suggestion_resets_the_highlight_so_enter_cannot_run_off_the_list() {
+    let mut app = plain();
+    app.on_key(key(KeyCode::Char('/')));
+    assert_eq!(app.suggestions().len(), crate::tui::command::COMMANDS.len());
+    app.on_key(key(KeyCode::Down));
+    assert_eq!(app.suggestion_index, 1);
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!(app.composer.text(), "/models");
+    assert_eq!(app.suggestions().len(), 1);
+    assert_eq!(app.suggestion_index, 0);
+    // This is the keystroke that used to index a one-row list at 1.
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.top_overlay().and_then(Overlay::picker_kind),
+        Some(PickerKind::Connect),
+        "with no provider drafted, /models routes to /connect first"
+    );
+}
+
+/// The same class of defect from the other direction: a backspace can
+/// widen or narrow the list under a highlight set a keystroke ago.
+#[test]
+fn editing_the_slash_word_never_leaves_the_highlight_out_of_range() {
+    let mut app = plain();
+    type_text(&mut app, "/s");
+    let count = app.suggestions().len();
+    assert!(count > 1);
+    for _ in 0..count - 1 {
+        app.on_key(key(KeyCode::Down));
+    }
+    app.on_key(key(KeyCode::Backspace));
+    assert_eq!(app.suggestion_index, 0);
+    assert!(app.highlighted_suggestion().is_some());
+    // Every reachable highlight resolves to a real row.
+    type_text(&mut app, "quit");
+    assert_eq!(app.suggestions().len(), 1);
+    assert_eq!(app.highlighted_suggestion().unwrap().name, "quit");
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Action::Quit);
+}
+
+/// Finding 2: the picker opens before the store answers, so the rows have
+/// to arrive into the list the user is already looking at.
+#[test]
+fn sessions_loaded_after_the_picker_opened_appear_in_it() {
+    let mut app = plain();
+    let loaded = fixture::conversation(Theme::new(ThemeMode::NoColor)).sessions;
+    assert_eq!(
+        app.dispatch(Command::Sessions, None),
+        Action::RefreshSessions
+    );
+    match app.top_overlay() {
+        Some(Overlay::Picker { picker, .. }) => assert!(picker.rows().is_empty()),
+        other => panic!("expected the session picker, got {other:?}"),
+    }
+    // What the runtime does when the store answers.
+    app.load_sessions(loaded.clone());
+    match app.top_overlay() {
+        Some(Overlay::Picker { picker, .. }) => {
+            assert_eq!(picker.rows().len(), loaded.len());
+            assert_eq!(picker.selected().unwrap().label, "api-cleanup");
+        }
+        other => panic!("expected the session picker, got {other:?}"),
+    }
+    // And it resumes without being closed and reopened first.
+    assert_eq!(
+        app.on_key(key(KeyCode::Enter)),
+        Action::Resume(loaded[0].id.clone())
+    );
+}
+
+#[test]
+fn a_late_session_load_keeps_the_query_and_the_highlight() {
+    let mut app = plain();
+    let loaded = fixture::conversation(Theme::new(ThemeMode::NoColor)).sessions;
+    app.dispatch(Command::Sessions, None);
+    type_text(&mut app, "docs");
+    app.load_sessions(loaded);
+    match app.top_overlay() {
+        Some(Overlay::Picker { picker, .. }) => {
+            assert_eq!(picker.query.text(), "docs");
+            assert_eq!(picker.visible().len(), 1);
+            assert_eq!(picker.selected().unwrap().label, "docs-pass");
+        }
+        other => panic!("expected the session picker, got {other:?}"),
+    }
+}
+
+/// Finding 7: the runtime refuses a phase change during a turn, so the
+/// interface must not show one either.
+#[test]
+fn a_running_turn_refuses_settings_commands_and_shows_no_phase_change() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    assert_eq!(app.status.phase, "coding");
+    app.running = true;
+    assert_eq!(app.dispatch(Command::Plan, None), Action::None);
+    assert_eq!(app.status.phase, "coding", "a refused change showed anyway");
+    assert!(app.notice.as_deref().unwrap().contains("a turn is running"));
+    for command in [
+        Command::Connect,
+        Command::Models,
+        Command::Effort,
+        Command::New,
+    ] {
+        assert_eq!(app.dispatch(command, None), Action::None);
+        assert!(app.overlays.is_empty(), "{command:?} opened during a turn");
+    }
+    // Reading the interface is still allowed.
+    app.dispatch(Command::Help, None);
+    assert!(matches!(app.top_overlay(), Some(Overlay::Help { .. })));
+    app.overlays.clear();
+
+    // Idle, the command is dispatched and the phase still waits for the
+    // runtime to apply it.
+    app.running = false;
+    assert_eq!(
+        app.dispatch(Command::Plan, None),
+        Action::SetPhase(Phase::Planning)
+    );
+    assert_eq!(
+        app.status.phase, "coding",
+        "the phase moved before the runtime applied it"
+    );
+    // `set_session` is where the runtime commits it.
+    let mut session = app.sessions[0].clone();
+    session.phase = Phase::Planning;
+    app.set_session(&session);
+    assert_eq!(app.status.phase, "planning");
+}
+
+#[test]
+fn a_pending_approval_refuses_settings_commands_too() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.request_approval(approval());
+    assert_eq!(app.dispatch(Command::Effort, None), Action::None);
+    assert!(app.notice.as_deref().unwrap().contains("approval"));
+    assert!(app.overlays.is_empty());
+    assert!(!app.settings_are_editable());
 }

@@ -6,7 +6,7 @@
 //! the choices a user has made and the values the harness handed it. It
 //! never resolves a model, reads a config file, or opens a session.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use gritt_core::connector::ConnectorId;
@@ -320,8 +320,11 @@ pub struct App {
     pub overlays: Vec<Overlay>,
     pub focus: Focus,
     pub sessions: Vec<Session>,
-    /// Lines scrolled up from the bottom of the transcript.
-    pub scroll: usize,
+    /// The first rendered transcript line on screen while the viewport is
+    /// held. Held position is measured from the top, not the bottom: new
+    /// output is appended below, so a top anchor keeps the same content on
+    /// screen and a bottom offset would not.
+    pub top: usize,
     pub diff_scroll: usize,
     /// True while the viewport sits at the bottom and follows streaming.
     pub follow: bool,
@@ -357,6 +360,19 @@ pub struct App {
     assistant_open: bool,
     revision: u64,
     cache: RefCell<LayoutCache>,
+    /// What the last frame measured: wrapped transcript lines, the height
+    /// of the transcript area, and the terminal width. The reducer needs
+    /// them to answer "is the viewport at the bottom" and "is the sidebar
+    /// a column here", and only the renderer knows them.
+    metrics: Cell<Metrics>,
+}
+
+/// Measurements the last frame took, for reducers that need geometry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Metrics {
+    pub transcript_lines: usize,
+    pub transcript_height: usize,
+    pub terminal_width: u16,
 }
 
 impl App {
@@ -370,7 +386,7 @@ impl App {
             overlays: Vec::new(),
             focus: Focus::Composer,
             sessions: Vec::new(),
-            scroll: 0,
+            top: 0,
             diff_scroll: 0,
             follow: true,
             new_output: false,
@@ -395,6 +411,7 @@ impl App {
             assistant_open: false,
             revision: 0,
             cache: RefCell::new(LayoutCache::default()),
+            metrics: Cell::new(Metrics::default()),
         }
     }
 
@@ -414,12 +431,42 @@ impl App {
 
     /// Where the sidebar goes at this terminal width.
     pub fn sidebar_placement(&self, width: u16) -> SidebarPlacement {
-        let drawer = matches!(self.overlays.last(), Some(Overlay::Drawer { .. }));
+        let drawer = self
+            .overlays
+            .iter()
+            .any(|overlay| matches!(overlay, Overlay::Drawer { .. }));
         sidebar::placement(width, self.sidebar_enabled, drawer)
+    }
+
+    /// What the last frame measured. Zero before the first draw.
+    pub fn metrics(&self) -> Metrics {
+        self.metrics.get()
+    }
+
+    /// Records the geometry of the frame being drawn.
+    pub fn set_metrics(&self, metrics: Metrics) {
+        self.metrics.set(metrics);
+    }
+
+    /// True when this terminal is wide enough for the sidebar column, so
+    /// `/sidebar` toggles the column rather than opening a drawer.
+    fn sidebar_fits_beside(&self) -> bool {
+        self.metrics.get().terminal_width >= sidebar::SIDEBAR_MIN_TERMINAL_WIDTH
     }
 
     pub fn top_overlay(&self) -> Option<&Overlay> {
         self.overlays.last()
+    }
+
+    /// The highlighted `/` suggestion, or `None` when the list is empty.
+    /// Indexing is checked: a completion or a backspace can shrink the
+    /// list under a highlight that was valid a keystroke ago.
+    pub fn highlighted_suggestion(&self) -> Option<&'static command::CommandSpec> {
+        let suggestions = self.suggestions();
+        suggestions
+            .get(self.suggestion_index)
+            .or_else(|| suggestions.first())
+            .copied()
     }
 
     /// `/` suggestions, open only when nothing above them is.
@@ -452,12 +499,10 @@ impl App {
 
     fn touch(&mut self) {
         self.revision += 1;
-        if self.follow {
-            self.scroll = 0;
-            self.new_output = false;
-        } else {
-            self.new_output = true;
-        }
+        // A held viewport keeps its top anchor, so appended output cannot
+        // push the lines the reader is looking at off the screen; it only
+        // raises the indicator that says there is more below.
+        self.new_output = !self.follow;
     }
 
     /// Replays stored events into the transcript on resume.
@@ -468,7 +513,7 @@ impl App {
         self.assistant_open = false;
         self.running = false;
         self.follow = true;
-        self.scroll = 0;
+        self.top = 0;
         self.new_output = false;
     }
 
@@ -839,6 +884,17 @@ impl App {
     pub fn dispatch(&mut self, cmd: Command, argument: Option<String>) -> Action {
         self.notice = None;
         self.suggestions_dismissed = false;
+        // An approval or a running turn owns the session: the plan keeps
+        // both modal, so a settings command explains the refusal instead
+        // of changing a draft the runtime would reject.
+        if changes_settings(cmd) && !self.settings_are_editable() {
+            self.notice = Some(if self.pending.is_some() {
+                "answer the approval first; settings cannot change during it".into()
+            } else {
+                "a turn is running; Esc cancels it before settings change".to_owned()
+            });
+            return Action::None;
+        }
         match cmd {
             Command::Connect => {
                 self.open_picker(PickerKind::Connect);
@@ -857,14 +913,11 @@ impl App {
                 self.open_picker(PickerKind::Effort);
                 Action::None
             }
-            Command::Plan => {
-                self.status.phase = "planning".into();
-                Action::SetPhase(Phase::Planning)
-            }
-            Command::Code => {
-                self.status.phase = "coding".into();
-                Action::SetPhase(Phase::Coding)
-            }
+            // The displayed phase is not changed here. The runtime applies
+            // the change and calls `set_session`, which is the only place
+            // the shown phase moves; a refused change shows nothing.
+            Command::Plan => Action::SetPhase(Phase::Planning),
+            Command::Code => Action::SetPhase(Phase::Coding),
             Command::Sessions => {
                 self.view = View::Sessions;
                 self.open_picker(PickerKind::Sessions);
@@ -882,7 +935,7 @@ impl App {
                 // view is cleared and the composer draft is kept.
                 self.entries.clear();
                 self.revision += 1;
-                self.scroll = 0;
+                self.top = 0;
                 self.follow = true;
                 self.new_output = false;
                 self.session_pinned = false;
@@ -914,8 +967,32 @@ impl App {
         }
     }
 
-    /// `/sidebar`. On a wide terminal it toggles the column; on a narrow
-    /// one it opens the drawer, which restores focus and scroll on close.
+    /// Whether settings may change right now.
+    pub fn settings_are_editable(&self) -> bool {
+        !self.running && self.pending.is_none()
+    }
+
+    /// Takes a freshly loaded session list. When the session picker is
+    /// already open, its rows are rebuilt in place so the list the user is
+    /// looking at fills in, keeping the query typed so far and the row
+    /// highlighted before the load landed.
+    pub fn load_sessions(&mut self, sessions: Vec<Session>) {
+        self.sessions = sessions;
+        let rows = self.session_picker().rows().to_vec();
+        for overlay in self.overlays.iter_mut() {
+            if let Overlay::Picker {
+                kind: PickerKind::Sessions,
+                picker,
+            } = overlay
+            {
+                picker.replace_rows(rows.clone());
+            }
+        }
+    }
+
+    /// `/sidebar`. At 110 columns or more the column is simply shown or
+    /// hidden; below that the same information opens as a drawer, which
+    /// restores the focus and scroll it covered when it closes.
     fn toggle_sidebar(&mut self) {
         if let Some(position) = self
             .overlays
@@ -925,22 +1002,19 @@ impl App {
             self.close_drawer(position);
             return;
         }
-        if self.sidebar_enabled {
-            self.sidebar_enabled = false;
-            // The column is off; a narrow terminal gets the drawer.
-            self.overlays.push(Overlay::Drawer {
-                scroll: self.sidebar_scroll,
-                restore_focus: self.focus,
-                restore_scroll: self.scroll,
-            });
-        } else {
-            self.sidebar_enabled = true;
-            self.overlays.push(Overlay::Drawer {
-                scroll: self.sidebar_scroll,
-                restore_focus: self.focus,
-                restore_scroll: self.scroll,
-            });
+        if self.sidebar_fits_beside() {
+            self.sidebar_enabled = !self.sidebar_enabled;
+            self.sidebar_scroll = 0;
+            if !self.sidebar_enabled && self.focus == Focus::Sidebar {
+                self.focus = Focus::Composer;
+            }
+            return;
         }
+        self.overlays.push(Overlay::Drawer {
+            scroll: self.sidebar_scroll,
+            restore_focus: self.focus,
+            restore_scroll: self.top,
+        });
     }
 
     fn close_drawer(&mut self, position: usize) {
@@ -951,7 +1025,7 @@ impl App {
         } = self.overlays.remove(position)
         {
             self.focus = restore_focus;
-            self.scroll = restore_scroll;
+            self.top = restore_scroll;
         }
     }
 
@@ -988,6 +1062,7 @@ impl App {
             Some(_) => {}
             None => {
                 self.composer.insert_paste(pasted);
+                self.suggestion_index = 0;
                 // A pasted line beginning with `/` must not open the
                 // suggestion list and must not run on submit.
                 self.suggestions_dismissed = self.composer.is_multiline();
@@ -1037,6 +1112,12 @@ impl App {
 
     fn suggestion_key(&mut self, key: KeyEvent) -> Option<Action> {
         let count = self.suggestions().len();
+        if count == 0 {
+            return None;
+        }
+        // The highlight can only be stale, never out of range: it is
+        // clamped here and every edit below resets it.
+        self.suggestion_index = self.suggestion_index.min(count - 1);
         match key.code {
             KeyCode::Down => {
                 self.suggestion_index = (self.suggestion_index + 1) % count;
@@ -1052,13 +1133,15 @@ impl App {
             }
             KeyCode::Tab => {
                 // Tab completes the highlighted suggestion instead of
-                // moving focus while the list is open.
-                let name = self.suggestions()[self.suggestion_index].name;
+                // moving focus while the list is open. Completing narrows
+                // the list, so the highlight returns to its first row.
+                let name = self.highlighted_suggestion()?.name;
                 self.composer.set_text(format!("/{name}"));
+                self.suggestion_index = 0;
                 Some(Action::None)
             }
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                let command = self.suggestions()[self.suggestion_index].command;
+                let command = self.highlighted_suggestion()?.command;
                 self.composer.clear();
                 self.suggestion_index = 0;
                 Some(self.dispatch(command, None))
@@ -1363,17 +1446,16 @@ impl App {
             }
             (KeyCode::Char('w'), true) => {
                 self.composer.delete_word_back();
+                self.suggestion_index = 0;
                 Action::None
             }
             (KeyCode::Char('u'), true) => {
                 self.composer.delete_to_line_start();
+                self.suggestion_index = 0;
                 Action::None
             }
             (KeyCode::Char('g'), true) => {
-                // Return to latest.
-                self.scroll = 0;
-                self.follow = true;
-                self.new_output = false;
+                self.follow_latest();
                 Action::None
             }
             (KeyCode::Esc, _) => {
@@ -1413,10 +1495,12 @@ impl App {
             }
             (KeyCode::Backspace, _) => {
                 self.composer.backspace();
+                self.suggestion_index = 0;
                 Action::None
             }
             (KeyCode::Delete, _) => {
                 self.composer.delete_forward();
+                self.suggestion_index = 0;
                 Action::None
             }
             (KeyCode::Left, true) => {
@@ -1436,15 +1520,20 @@ impl App {
                 Action::None
             }
             (KeyCode::Up, _) => {
-                // The transcript pane scrolls outright; from the
-                // composer, a move with nowhere to go scrolls instead.
-                if self.focus == Focus::Transcript || !self.composer.move_up(shift) {
+                // The sidebar column scrolls on its own; the transcript
+                // pane scrolls outright; from the composer, a move with
+                // nowhere to go scrolls the transcript instead.
+                if self.focus == Focus::Sidebar {
+                    self.sidebar_scroll = self.sidebar_scroll.saturating_sub(1);
+                } else if self.focus == Focus::Transcript || !self.composer.move_up(shift) {
                     self.scroll_up(1);
                 }
                 Action::None
             }
             (KeyCode::Down, _) => {
-                if self.focus == Focus::Transcript || !self.composer.move_down(shift) {
+                if self.focus == Focus::Sidebar {
+                    self.sidebar_scroll = self.sidebar_scroll.saturating_add(1);
+                } else if self.focus == Focus::Transcript || !self.composer.move_down(shift) {
                     self.scroll_down(1);
                 }
                 Action::None
@@ -1458,11 +1547,19 @@ impl App {
                 Action::None
             }
             (KeyCode::PageUp, _) => {
-                self.scroll_up(10);
+                if self.focus == Focus::Sidebar {
+                    self.sidebar_scroll = self.sidebar_scroll.saturating_sub(10);
+                } else {
+                    self.scroll_up(10);
+                }
                 Action::None
             }
             (KeyCode::PageDown, _) => {
-                self.scroll_down(10);
+                if self.focus == Focus::Sidebar {
+                    self.sidebar_scroll = self.sidebar_scroll.saturating_add(10);
+                } else {
+                    self.scroll_down(10);
+                }
                 Action::None
             }
             (KeyCode::Char(c), false) => {
@@ -1500,8 +1597,7 @@ impl App {
                 self.push(EntryKind::User, prompt.clone());
                 self.running = true;
                 self.assistant_open = false;
-                self.follow = true;
-                self.scroll = 0;
+                self.follow_latest();
                 Action::Submit(prompt)
             }
         }
@@ -1512,18 +1608,67 @@ impl App {
         self.composer.set_text(draft);
     }
 
-    /// Scrolling up holds the viewport: streaming stops following.
+    /// The top line the viewport would show if it were following the
+    /// bottom, from the last frame's measurements.
+    fn bottom_top(&self) -> usize {
+        let metrics = self.metrics.get();
+        metrics
+            .transcript_lines
+            .saturating_sub(metrics.transcript_height)
+    }
+
+    /// Scrolling up holds the viewport: streaming stops following and the
+    /// anchor stays on the same content while output is appended below.
     pub fn scroll_up(&mut self, lines: usize) {
-        self.scroll = self.scroll.saturating_add(lines);
+        if self.follow {
+            self.top = self.bottom_top();
+        }
+        self.top = self.top.saturating_sub(lines);
         self.follow = false;
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
-        self.scroll = self.scroll.saturating_sub(lines);
-        if self.scroll == 0 {
-            self.follow = true;
-            self.new_output = false;
+        if self.follow {
+            return;
         }
+        self.top = self.top.saturating_add(lines);
+        if self.top >= self.bottom_top() {
+            self.follow_latest();
+        }
+    }
+
+    /// Return to latest: the viewport goes back to the bottom and follows
+    /// streaming again.
+    pub fn follow_latest(&mut self) {
+        self.follow = true;
+        self.top = self.bottom_top();
+        self.new_output = false;
+    }
+
+    /// The transcript lines visible in an area `width` by `height`, and
+    /// the index of the first one. The renderer draws exactly this, and a
+    /// test can assert on the same thing the reader sees.
+    pub fn visible_transcript(
+        &self,
+        width: usize,
+        height: usize,
+        render: impl Fn(&App, usize) -> Vec<Line<'static>>,
+    ) -> (usize, Vec<Line<'static>>) {
+        let lines = self.transcript_lines(width, render);
+        let metrics = Metrics {
+            transcript_lines: lines.len(),
+            transcript_height: height,
+            terminal_width: self.metrics.get().terminal_width,
+        };
+        self.metrics.set(metrics);
+        let bottom = lines.len().saturating_sub(height);
+        let start = if self.follow {
+            bottom
+        } else {
+            self.top.min(bottom)
+        };
+        let end = (start + height).min(lines.len());
+        (start, lines[start..end].to_vec())
     }
 
     pub fn set_session(&mut self, session: &Session) {
@@ -1561,6 +1706,20 @@ impl App {
             }
         }
     }
+}
+
+/// Commands that change the session draft or the transcript the runtime
+/// owns, and so must wait for an active turn or approval to finish.
+fn changes_settings(command: Command) -> bool {
+    matches!(
+        command,
+        Command::Connect
+            | Command::Models
+            | Command::Effort
+            | Command::Plan
+            | Command::Code
+            | Command::New
+    )
 }
 
 fn protocol_word(protocol: Protocol) -> &'static str {

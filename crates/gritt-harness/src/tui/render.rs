@@ -10,12 +10,13 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::app::{
-    App, Entry, EntryKind, Focus, Layout, Notice, Overlay, PickerKind, SetupField, SetupForm, View,
+    App, Entry, EntryKind, Focus, Layout, Metrics, Notice, Overlay, PickerKind, SetupField,
+    SetupForm, View,
 };
 use super::command;
 use super::composer::display_width;
 use super::picker::{ListStatus, Picker};
-use super::sidebar::{SidebarPlacement, SIDEBAR_GUTTER, SIDEBAR_WIDTH};
+use super::sidebar::{SidebarPlacement, SIDEBAR_GUTTER, SIDEBAR_MIN_TERMINAL_WIDTH, SIDEBAR_WIDTH};
 use super::theme::Theme;
 use crate::modes::print::approval_text;
 
@@ -149,6 +150,12 @@ pub fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
+    // The reducer needs the terminal width to know whether `/sidebar`
+    // toggles a column or opens a drawer, and only the frame knows it.
+    app.set_metrics(Metrics {
+        terminal_width: area.width,
+        ..app.metrics()
+    });
     frame.render_widget(Block::default().style(app.theme.screen()), area);
     match app.layout() {
         Layout::Home => draw_home(frame, app, area),
@@ -243,7 +250,7 @@ fn draw_home(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
     let status = centered_column(rows[5], CONTENT_WIDTH);
     frame.render_widget(
-        Paragraph::new(Text::from(home_status(app))).alignment(Alignment::Center),
+        Paragraph::new(Text::from(home_status(app, area.width))).alignment(Alignment::Center),
         status,
     );
 }
@@ -256,8 +263,38 @@ fn home_subtitle(app: &App) -> String {
     }
 }
 
-fn home_status(app: &App) -> Vec<Line<'static>> {
+fn home_status(app: &App, width: u16) -> Vec<Line<'static>> {
     let theme = &app.theme;
+    // A narrow home drops the directory and the phase before it drops the
+    // fixture label, which is the one thing that must never be cut.
+    if width < COMPACT_WIDTH {
+        let mut parts = Vec::new();
+        if !app.status.session.is_empty() {
+            parts.push(Span::styled(app.status.session.clone(), theme.heading()));
+            parts.push(Span::styled("  ", theme.dim()));
+        }
+        parts.push(Span::styled(
+            if app.is_connected() {
+                app.status.model.clone()
+            } else {
+                "not connected".to_owned()
+            },
+            if app.is_connected() {
+                theme.text()
+            } else {
+                theme.dim()
+            },
+        ));
+        parts.push(Span::styled(
+            format!("  effort {}", app.status.effort),
+            theme.muted(),
+        ));
+        if let Some(label) = &app.fixture {
+            parts.push(Span::styled("  ", theme.dim()));
+            parts.push(Span::styled(label.clone(), theme.error()));
+        }
+        return vec![Line::from(parts)];
+    }
     let mut parts = Vec::new();
     // A named session is shown even before its first turn, so `gritt tui
     // --session NAME` says which session the composer will write to.
@@ -373,12 +410,10 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn draw_transcript(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let lines = app.transcript_lines(area.width as usize, transcript_lines);
-    let height = area.height as usize;
-    let total = lines.len();
-    let end = total.saturating_sub(app.scroll);
-    let start = end.saturating_sub(height);
-    let mut visible: Vec<Line<'static>> = lines[start.min(total)..end.min(total)].to_vec();
+    // The app owns the viewport arithmetic so a test can assert on the
+    // same visible lines the reader gets.
+    let (_, mut visible) =
+        app.visible_transcript(area.width as usize, area.height as usize, transcript_lines);
     // A held viewport says so, and offers the way back.
     if app.new_output && !visible.is_empty() {
         visible.pop();
@@ -412,31 +447,95 @@ fn draw_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .style(theme.raised());
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let text = if app.composer.is_empty() {
-        Text::from(Line::from(Span::styled(
-            if app.is_connected() {
-                "Ask Gritt to do something…"
-            } else {
-                "Type here; /connect chooses a provider or an installed agent"
-            }
-            .to_owned(),
-            theme.dim(),
-        )))
+    if app.composer.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                if app.is_connected() {
+                    "Ask Gritt to do something…"
+                } else {
+                    "Type here; /connect chooses a provider or an installed agent"
+                }
+                .to_owned(),
+                theme.dim(),
+            ))),
+            inner,
+        );
+        if focused {
+            frame.set_cursor_position((inner.x, inner.y));
+        }
+        return;
+    }
+    // The composer wraps here rather than in `Paragraph`, so the cursor's
+    // visual position is computed from exactly the rows that are drawn.
+    let width = inner.width.max(1) as usize;
+    let rows = composer_rows(app.composer.text(), width);
+    let cursor_row = rows
+        .iter()
+        .rposition(|row| row.start <= app.composer.cursor())
+        .unwrap_or(0);
+    let height = inner.height.max(1) as usize;
+    // Keep the cursor's row on screen; a draft longer than the box scrolls
+    // instead of disappearing under it.
+    let top = if cursor_row >= height {
+        cursor_row + 1 - height
     } else {
-        Text::from(
-            app.composer
-                .text()
-                .split('\n')
-                .map(|line| Line::from(Span::styled(line.to_owned(), theme.text())))
-                .collect::<Vec<_>>(),
-        )
+        0
     };
-    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
+    let visible: Vec<Line<'static>> = rows
+        .iter()
+        .skip(top)
+        .take(height)
+        .map(|row| Line::from(Span::styled(row.text.clone(), theme.text())))
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(visible)), inner);
     if focused {
-        let x = inner.x + (app.composer.column() as u16).min(inner.width.saturating_sub(1));
-        let y = inner.y + (app.composer.row() as u16).min(inner.height.saturating_sub(1));
+        let row = &rows[cursor_row];
+        let column = display_width(&row.text[..app.composer.cursor() - row.start]);
+        let x = inner.x + (column as u16).min(inner.width.saturating_sub(1));
+        let y = inner.y + (cursor_row - top) as u16;
         frame.set_cursor_position((x, y));
     }
+}
+
+/// One drawn row of the composer: where it starts in the buffer and the
+/// text on it.
+struct ComposerRow {
+    start: usize,
+    text: String,
+}
+
+/// Splits the composer buffer into the rows it is drawn on. Logical lines
+/// break first, then each is hard-wrapped at `width` display cells; an
+/// editor's cursor has to land on a predictable cell, so this does not
+/// wrap on words the way the transcript does.
+fn composer_rows(text: &str, width: usize) -> Vec<ComposerRow> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut line_start = 0;
+    for line in text.split('\n') {
+        let mut chunk = String::new();
+        let mut chunk_start = line_start;
+        let mut used = 0;
+        for (offset, c) in line.char_indices() {
+            let cell = display_width(c.encode_utf8(&mut [0u8; 4])).max(1);
+            if used + cell > width {
+                rows.push(ComposerRow {
+                    start: chunk_start,
+                    text: std::mem::take(&mut chunk),
+                });
+                chunk_start = line_start + offset;
+                used = 0;
+            }
+            chunk.push(c);
+            used += cell;
+        }
+        rows.push(ComposerRow {
+            start: chunk_start,
+            text: chunk,
+        });
+        line_start += line.len() + 1;
+    }
+    rows
 }
 
 fn draw_suggestions(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -450,11 +549,24 @@ fn draw_suggestions(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
+    // The list can be taller than the panel, so it scrolls with the
+    // highlight instead of clipping it off the bottom.
+    let height = inner.height.max(1) as usize;
+    let focus = app
+        .suggestion_index
+        .min(suggestions.len().saturating_sub(1));
+    let top = if focus >= height {
+        focus + 1 - height
+    } else {
+        0
+    };
     let lines: Vec<Line<'static>> = suggestions
         .iter()
         .enumerate()
+        .skip(top)
+        .take(height)
         .map(|(index, spec)| {
-            let style = if index == app.suggestion_index {
+            let style = if index == focus {
                 theme.selection()
             } else {
                 theme.text()
@@ -522,7 +634,10 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, drawer: bool) {
     let theme = &app.theme;
-    let scroll = if drawer { app.sidebar_scroll } else { 0 };
+    // The column scrolls on its own too: Tab reaches it and the arrow
+    // keys move it without touching the composer or the transcript.
+    let scroll = app.sidebar_scroll;
+    let _ = drawer;
     let block = Block::default()
         .borders(if drawer { Borders::ALL } else { Borders::LEFT })
         .border_type(BorderType::Rounded)
@@ -569,6 +684,11 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App, overlay: &Overlay, area: Rect)
         Overlay::Notice(notice) => draw_notice(frame, app, notice, area),
         Overlay::Help { scroll } => draw_help(frame, app, *scroll, area),
         Overlay::Drawer { .. } => {
+            // At 110 columns or more the column is the sidebar, so a
+            // drawer left open by a resize is not drawn over it.
+            if area.width >= SIDEBAR_MIN_TERMINAL_WIDTH {
+                return;
+            }
             let width = (area.width * 3 / 4).min(SIDEBAR_WIDTH + 8);
             let drawer = Rect {
                 x: area.x + area.width.saturating_sub(width),
@@ -655,17 +775,26 @@ fn draw_picker(frame: &mut Frame<'_>, app: &App, kind: PickerKind, picker: &Pick
         return;
     }
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // Which lines are a group heading or blank, so the window never ends
+    // on a heading with nothing under it.
+    let mut headings: Vec<bool> = Vec::new();
+    // Where each filtered row's block begins and ends in `lines`, so the
+    // viewport can keep a whole row visible, group heading and all.
+    let mut extents: Vec<(usize, usize)> = Vec::new();
     let mut group: Option<String> = None;
     let body_width = rows[2].width as usize;
     for (position, index) in visible.iter().enumerate() {
+        let block_start = lines.len();
         let row = &picker.rows()[*index];
         if row.group != group {
             group.clone_from(&row.group);
             if let Some(name) = &group {
                 if !lines.is_empty() {
                     lines.push(Line::default());
+                    headings.push(true);
                 }
                 lines.push(Line::from(Span::styled(name.clone(), theme.heading())));
+                headings.push(true);
             }
         }
         let selected = position == picker.highlight();
@@ -691,6 +820,7 @@ fn draw_picker(frame: &mut Frame<'_>, app: &App, kind: PickerKind, picker: &Pick
             Span::styled(" ".repeat(pad), base),
             Span::styled(badge, theme.muted()),
         ]));
+        headings.push(false);
         let mut second = Vec::new();
         if !row.detail.is_empty() {
             second.push(Span::styled(format!("    {}", row.detail), theme.muted()));
@@ -703,15 +833,33 @@ fn draw_picker(frame: &mut Frame<'_>, app: &App, kind: PickerKind, picker: &Pick
         }
         if !second.is_empty() {
             lines.push(Line::from(second));
+            headings.push(false);
         }
         if !row.note.is_empty() {
             lines.push(Line::from(Span::styled(
                 format!("    {}", row.note),
                 theme.dim(),
             )));
+            headings.push(false);
         }
+        extents.push((block_start, lines.len()));
     }
-    frame.render_widget(Paragraph::new(Text::from(lines)), rows[2]);
+    // Rows are several lines tall and a group heading belongs to the row
+    // under it, so the window is computed in lines, not in rows.
+    let height = rows[2].height.max(1) as usize;
+    let focus = picker.highlight().min(extents.len().saturating_sub(1));
+    let (row_start, row_end) = extents[focus];
+    let mut top = row_end.saturating_sub(height);
+    if top > row_start {
+        top = row_start;
+    }
+    let mut end = (top + height).min(lines.len());
+    // A heading is only worth its line when a row follows it on screen.
+    while end > top && end <= headings.len() && headings[end - 1] && end - 1 > row_end - 1 {
+        end -= 1;
+    }
+    let window: Vec<Line<'static>> = lines[top..end].to_vec();
+    frame.render_widget(Paragraph::new(Text::from(window)), rows[2]);
 }
 
 fn draw_setup(frame: &mut Frame<'_>, app: &App, form: &SetupForm, area: Rect) {

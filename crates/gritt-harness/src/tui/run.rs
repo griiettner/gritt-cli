@@ -290,7 +290,10 @@ async fn event_loop(
                 }
             }
             Action::RefreshSessions => {
-                app.sessions = plane.builder.store.list().await.unwrap_or_default();
+                // Into the picker that is already open, not just into the
+                // list behind it: the overlay opens before the store
+                // answers, so it has to fill in where the user is looking.
+                app.load_sessions(plane.builder.store.list().await.unwrap_or_default());
             }
             Action::Resume(id) => {
                 match plane

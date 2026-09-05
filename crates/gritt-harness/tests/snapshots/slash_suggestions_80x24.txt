@@ -22,7 +22,7 @@
  │ /code       Switch to the coding phase                                     │
  │ /sessions   Search and resume sessions for this workspace                  │
  ╰────────────────────────────────────────────────────────────────────────────╯
-       /work/gritt  ·  not connected  ·  effort auto  ·  plan  ·  fixture
+                       not connected  effort auto  fixture
 
 
 

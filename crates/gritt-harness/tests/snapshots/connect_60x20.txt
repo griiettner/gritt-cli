@@ -18,7 +18,7 @@ t│  openrouter                         [chat completions] │
  │    https://openrouter.ai/api/v1                        │
  │    no key; set OPENROUTER_API_KEY or run setup · catalo│
  │                                                        │
-╭│Installed agents                                        │╮
+╭│                                                        │╮
 │╰ type to filter · Enter selects · Esc closes ───────────╯│
 ╰──────────────────────────────────────────────────────────╯
 openai · openai/gpt-5-nano  effort medium
