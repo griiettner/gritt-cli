@@ -83,14 +83,23 @@ open it is their answer rather than a screen that quietly does nothing.
 This also means `/connect` works in a workspace with no configuration at
 all, which the eager path could not do because it failed before drawing.
 
-**Every asynchronous result carries the token it started under.** Two
-tokens, because two different things go stale. `App::selection` moves on
+**Every asynchronous result carries the token it started under.** Three
+tokens, because three different things go stale. `App::selection` moves on
 every provider selection and guards catalog loads;
-`SidebarModel::generation` moves on every session change and guards
-change scans, draft opens, and resumes. `apply_catalog`, `apply_changes`,
-and the `Opened` message all check before they write, and all three
-return whether they accepted, which is what the tests assert on. The
-generation existed unused from TKT-0018; this is its caller.
+`SidebarModel::generation` moves on every session change and guards change
+scans, turn events, approvals, and turn completions; and an operation id
+guards the session change itself, so a superseded or cancelled open closes
+its driver instead of adopting it. A session change is reserved rather
+than merely requested: the driver being replaced is held by the
+reservation, so a prompt submitted mid-switch cannot start a turn on the
+session being left.
+
+The first version of this shipped with only the first two tokens and no
+reservation, and the review found the race that leaves: submitting during
+a resume ran a turn on the old driver, whose untagged events and
+completion then populated the new session and put the old driver back.
+The reservation and the generation stamp on turn messages are what closes
+it; see the [review-fixes update](updates/2026-09-05-review-fixes.md).
 
 **MCP state is delivered, not polled.** TKT-0017 left this open and
 recorded it as the cheapest remaining improvement. `McpRuntime` now owns
@@ -134,17 +143,22 @@ restarting are exactly what a user opens `/mcp` for, and both apply to
 entries that are not running. The availability moved to the action rows,
 where an inapplicable action says why instead of being hidden.
 
-**Context occupancy has one source and it is named.** The prompt tokens
-of the most recent request are the tokens that were in the model's
-context for it. The cumulative totals are not, and the sidebar keeps them
-in separate fields, as TKT-0018's types already insisted. Without a
-catalog there is no limit, so occupancy stays unavailable rather than
-being derived from the cumulative total.
+**Context occupancy has no source, and says so.** The first version used
+the most recent request's prompt tokens for it. The review was right that
+this is not the value: the driver may add tool results and continuation
+state after that request, and a provider that caches prompt tokens reports
+them differently again, so it is a lower bound at best. Occupancy is now
+unavailable on the live path, and the last request's prompt tokens appear
+under their own label as a fact about that request. The fixture screens
+still show occupancy because they state their own source.
 
 **Cost is an estimate from listed prices or nothing.** Both
 `input_price_per_million` and `output_price_per_million` must be reported
-for the active model, and both token counts must exist. Otherwise the
-section is unavailable. It is always labelled an estimate with its scope.
+for the active model, and both token counts must exist and be complete.
+The first version turned an unreported count into a zero, which made an
+incomplete total look like a reported one and priced it; a count the
+provider did not report is now left unknown, and a turn that reported half
+its usage marks the totals a floor and withholds the estimate.
 
 ## Alternatives Considered
 
@@ -176,9 +190,9 @@ section is unavailable. It is always labelled an estimate with its scope.
    eager path whenever flags were given; that would have made `/connect`
    unusable in an unconfigured workspace, which the acceptance criteria
    require.
-2. **Context occupancy is the last request's prompt tokens.** If that is
-   judged too indirect, the field can be set to `None` and only the
-   cumulative totals shown; nothing else depends on it.
+2. ~~**Context occupancy is the last request's prompt tokens.**~~
+   Withdrawn after review: it is a lower bound, not the value. Occupancy
+   is unavailable and the figure has its own label. See the update file.
 3. **Preset endpoints and protocols are copied from the shipped
    `config.toml` template** (`openrouter`, `openai`, `anthropic`,
    `local`). A provider not in that list is set up as a custom endpoint.
@@ -251,9 +265,9 @@ Run from `/Users/griiettner/Projects/grittflow/gritt-cli-tkt-0019`:
 | --- | --- |
 | `cargo fmt --all --check` | pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | pass |
-| `cargo test -p gritt-harness` | pass, 293 tests over 10 targets |
+| `cargo test -p gritt-harness` | pass, 301 tests over 10 targets |
 | `cargo test -p gritt --test tui_pty` | pass, 10 tests |
-| `cargo test --workspace --no-fail-fast` | pass, 458 tests, 0 failed |
+| `cargo test --workspace --no-fail-fast` | pass, 466 tests, 0 failed |
 | `GRITT_LIVE_MCP_TESTS=1 cargo test -p gritt-harness --test mcp_live_smoke` | pass, 1 test, after the note below |
 
 The live smoke check failed on its first run in this worktree with
@@ -265,10 +279,11 @@ files on a fresh worktree, measured here at 41 s before it answers
 check passed in 1.08 s. Wiring `McpRuntimeSettings` to `config.toml`
 remains TKT-0017's follow-up.
 
-New test counts: 15 reducer tests in `src/tui/app/tests.rs`, 10 in the
-new `tests/tui_integration.rs`, 4 PTY tests in
-`crates/gritt/tests/tui_pty.rs`, 3 new snapshot screens at 5 sizes each,
-and 4 unit tests in `src/changes.rs`.
+New test counts: 18 reducer tests in `src/tui/app/tests.rs`, 5
+runtime-handler tests in `src/tui/run.rs`, 10 in the new
+`tests/tui_integration.rs`, 4 PTY tests in `crates/gritt/tests/tui_pty.rs`,
+3 new snapshot screens at 5 sizes each, and 5 unit tests in
+`src/changes.rs`. The counts above are after the review fixes.
 
 `.agents/gritt-agent ticket chain-check --ticket TKT-0019 --base main`:
 
@@ -331,12 +346,19 @@ What a human should still check in a real terminal:
 
 ## Completion Gate
 
-- **Acceptance:** yes. A fresh TUI connects to configured providers or
-  installed agents, creates and resumes sessions, selects model and
-  effort, shows every MCP server state, invokes approved native MCP
-  tools, preserves the composer draft and scroll through dialogs, keeps
-  connector authority separate, and rejects late async work for a
-  superseded session or selection.
+- **Acceptance:** yes, after the review fixes. The first version was
+  overstated on three of these and the review was right: installed agents
+  could not actually be selected, connector sessions could not resume, and
+  late asynchronous work was only partly rejected — catalogs and scans
+  were guarded, session opening and turn completion were not. All three
+  are closed and covered by tests; see the update file. A fresh TUI now
+  connects to configured providers or installed agents, creates and
+  resumes native and connector sessions, selects model and effort, shows
+  every MCP server state, approves a server launch through the shared
+  modal overlay, invokes approved native MCP tools, preserves the composer
+  draft and scroll through dialogs and through a cancelled open, keeps
+  connector authority separate, and rejects every late asynchronous
+  result.
 - **Scope:** yes. No new MCP protocol feature, no provider request
   mapping change, no LSP or skill execution, no visual redesign, and no
   user documentation. No cost or context figure whose source is unknown.
@@ -398,6 +420,13 @@ What a human should still check in a real terminal:
    renderer cannot drift apart.
 8. **`App::frames()`** - a frame counter for TKT-0020's deterministic
    timing harness. Nothing in the interface reads it.
+9. **`McpRuntime::definition_summary()`** - a redacted summary of what
+   approving an entry would run or connect to, so a launch approval can
+   show it. Only the shape leaves: a command and its arguments, or an
+   endpoint without its query, plus environment and header names without
+   their values, redacted against that entry's own credentials. Added for
+   the review fix; it extends the same ADR-008 boundary as the trust
+   record.
 
 ## Follow-up
 
@@ -410,7 +439,13 @@ What a human should still check in a real terminal:
 2. **The measured responsiveness run is TKT-0020's.** The seams are
    here: `App::on_event` and `App::on_key` take synthetic input,
    `App::frames()` counts what they cost, and `render::draw` works
-   against a `TestBackend`. Nothing was timed in this ticket.
+   against a `TestBackend`. Nothing was timed in this ticket. The
+   reviewer's note belongs with it: a reducer frame count does not cover
+   what the real loop costs. The pre-terminal catalog and MCP waits the
+   binary still performs before the first draw, the continuous draw
+   attempt on every loop iteration, the unbounded `UiMsg` channel, and
+   loading a full history on every adopt are all outside what these seams
+   measure, and TKT-0020 should measure the loop itself.
 3. **The change scan is not incremental.** Every scan runs a full
    `git status --porcelain --untracked-files=all`. On a very large
    repository that is the cost of the sidebar refreshing after a turn. It
@@ -435,3 +470,7 @@ What a human should still check in a real terminal:
 9. **The `.cargo/config.toml` `artifact-dir = "."` trap** cost nothing
    this time but is still recorded by TKT-0016 and TKT-0017 as worth its
    own ticket.
+
+## Updates
+
+- [2026-09-05 review fixes](updates/2026-09-05-review-fixes.md)
