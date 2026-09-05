@@ -733,6 +733,13 @@ async fn assert_all_gone(pids: &[u32], message: &str) {
     }
 }
 
+#[cfg(not(unix))]
+fn is_alive(_pid: u32) -> bool {
+    // No portable probe without a dependency; the gated test's precondition
+    // is simply not asserted on this platform.
+    true
+}
+
 #[cfg(unix)]
 fn is_alive(pid: u32) -> bool {
     // `kill -0` reports whether the process exists without signalling it.
@@ -932,7 +939,7 @@ mod http_fixture {
                             // refuses to answer, and short enough that a
                             // burst of them does not monopolise this
                             // single-threaded endpoint.
-                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            tokio::time::sleep(Duration::from_millis(150)).await;
                         }
                         match mode {
                             Mode::SessionLost => {
@@ -2233,7 +2240,7 @@ async fn stalled_auxiliary_posts_cannot_accumulate() {
     // Every cancellation produces a notification POST this endpoint accepts
     // and never answers. Far more than the auxiliary budget allows.
     let mut attempts = Vec::new();
-    for _ in 0..12 {
+    for _ in 0..40 {
         let runtime = Arc::clone(&runtime);
         let frozen = frozen.clone();
         attempts.push(tokio::spawn(async move {
@@ -2273,9 +2280,11 @@ async fn stalled_auxiliary_posts_cannot_accumulate() {
 
     // Admission is bounded, so only a handful of those POSTs were ever sent;
     // the rest were dropped rather than queued up with their payloads.
+    // None of these ever complete, so the cap on admission is the only thing
+    // that can hold the number down. Unbounded admission would send all 40.
     assert!(
-        notifications <= 16,
-        "stalled notifications accumulated: {notifications} reached the endpoint"
+        notifications <= 8,
+        "stalled notifications accumulated: {notifications} of 40 reached the endpoint"
     );
     assert!(
         notifications > 0,
@@ -2514,4 +2523,112 @@ async fn a_cancellation_survives_a_flood_of_later_ones() {
         "a cancellation was forgotten under load and the call reached the server"
     );
     runtime.shutdown().await;
+}
+
+// --- Round 5 review fixes ----------------------------------------------
+
+#[tokio::test]
+async fn shutdown_waits_for_a_launch_that_has_not_attached_yet() {
+    // The window between reserving a launch slot and registering the process
+    // against it. The child exists; the slot still holds nothing. Shutdown
+    // must treat that as work in progress, because the signal handler exits
+    // the process the moment shutdown returns.
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("gated.pid");
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        serde_json::json!({"mcpServers": {"gated": {
+            "command": FIXTURE,
+            "args": ["basic"],
+            "env": {"FIXTURE_PID": pid_file.to_string_lossy()},
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    // No permits, so every launch stops in that window until this test says
+    // otherwise.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let runtime = Arc::new(
+        McpRuntime::new(dir.path(), settings())
+            .with_trust(MemoryTrustStore::trust_all())
+            .with_launch_gate(Arc::clone(&gate)),
+    );
+    let config = runtime.read_config().unwrap();
+    runtime.load(&config).await.unwrap();
+
+    let starter = Arc::clone(&runtime);
+    let token = CancellationToken::new();
+    let starting = tokio::spawn(async move { starter.start(&token).await });
+
+    // Wait until the child really exists, which is what makes this window
+    // dangerous rather than merely untidy.
+    let child = recorded_pid(&pid_file).await;
+    assert!(is_alive(child), "the fixture should be running");
+
+    let closing = Arc::clone(&runtime);
+    let shutting = tokio::spawn(async move { closing.shutdown().await });
+
+    // Shutdown cannot finish while the launch is held here: its slot is
+    // reserved and its child is alive.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        !shutting.is_finished(),
+        "shutdown returned while a reserved launch still owned a live child"
+    );
+
+    // Releasing the gate lets the launch attach; shutdown then closes it.
+    gate.add_permits(8);
+    tokio::time::timeout(Duration::from_secs(30), shutting)
+        .await
+        .expect("shutdown never finished after the launch attached")
+        .unwrap();
+    assert_gone_now(&[child], "a gated launch outlived shutdown");
+    assert!(runtime.child_pids().await.is_empty());
+
+    let snapshots = starting.await.unwrap();
+    assert!(
+        snapshots.iter().all(|snapshot| !snapshot.state.is_ready()),
+        "a server was installed after shutdown: {snapshots:?}"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_during_stale_cleanup_still_takes_the_child() {
+    // The stale path runs inside `start`: the entry moved on while its
+    // handshake was in flight, so the result is discarded. Shutdown arriving
+    // in the middle of that cleanup must still leave nothing behind.
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("stale.pid");
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        serde_json::json!({"mcpServers": {"stale": {
+            "command": FIXTURE,
+            "args": ["slowinit"],
+            "env": {"FIXTURE_PID": pid_file.to_string_lossy()},
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let runtime =
+        Arc::new(McpRuntime::new(dir.path(), settings()).with_trust(MemoryTrustStore::trust_all()));
+    let config = runtime.read_config().unwrap();
+    runtime.load(&config).await.unwrap();
+
+    let starter = Arc::clone(&runtime);
+    let token = CancellationToken::new();
+    let starting = tokio::spawn(async move { starter.start(&token).await });
+    let child = recorded_pid(&pid_file).await;
+    // Makes the in-flight result stale, then shuts down while `start` is
+    // still working through it.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    runtime.stop("stale").await.unwrap();
+    runtime.shutdown().await;
+
+    assert_gone_now(
+        &[child],
+        "a child outlived a shutdown that raced stale-result cleanup",
+    );
+    assert!(runtime.child_pids().await.is_empty());
+    let _ = starting.await.unwrap();
+    assert!(runtime.tool_set().await.is_empty());
 }
