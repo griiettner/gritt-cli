@@ -548,6 +548,15 @@ pub struct App {
     pub composer: Composer,
     pub status: StatusBar,
     pub pending: Option<PendingApproval>,
+    /// How many approvals have been installed on `pending`, ever.
+    ///
+    /// The identity of the request on screen, not merely whether one is
+    /// there. The loop must not let a decision key answer an approval that
+    /// has not been drawn, and presence alone cannot tell one request from
+    /// the next: answering A and installing B in the same iteration leaves
+    /// `pending` `Some` throughout, so B would inherit A's visibility
+    /// (TKT-0020).
+    pending_installs: u64,
     pub view: View,
     pub overlays: Vec<Overlay>,
     pub focus: Focus,
@@ -663,6 +672,7 @@ impl App {
             composer: Composer::new(),
             status,
             pending: None,
+            pending_installs: 0,
             view: View::Transcript,
             overlays: Vec::new(),
             focus: Focus::Composer,
@@ -1044,7 +1054,21 @@ impl App {
     pub fn request_approval(&mut self, pending: PendingApproval) {
         self.diff_scroll = 0;
         self.mcp_approval = None;
+        self.install_pending(pending);
+    }
+
+    /// Puts a request on screen and stamps it with a fresh identity.
+    fn install_pending(&mut self, pending: PendingApproval) {
         self.pending = Some(pending);
+        self.pending_installs = self.pending_installs.wrapping_add(1);
+    }
+
+    /// The identity of the approval currently on screen, if any.
+    ///
+    /// A caller that has drawn this value has drawn *this* request. The
+    /// next install changes it, so nothing carries over.
+    pub fn pending_install(&self) -> Option<u64> {
+        self.pending.as_ref().map(|_| self.pending_installs)
     }
 
     /// Puts a first-use MCP launch in front of the user, with the
@@ -1055,7 +1079,7 @@ impl App {
     /// and its arguments are shown before anything starts.
     pub fn request_mcp_approval(&mut self, server: String, definition: String) {
         self.diff_scroll = 0;
-        self.pending = Some(PendingApproval {
+        self.install_pending(PendingApproval {
             request: ApprovalRequest {
                 id: gritt_core::event::ApprovalId(format!("mcp-launch:{server}")),
                 tool: "mcp_server_launch".into(),

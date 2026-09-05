@@ -681,14 +681,18 @@ struct Scheduler {
     /// session therefore draws nothing at all.
     dirty: bool,
     last_draw: tokio::time::Instant,
-    /// Whether the approval currently on `app.pending` has been drawn.
+    /// The approval whose frame has been drawn, by install identity.
     ///
     /// The frame cap must never let a decision key answer a prompt the
     /// user has not seen. `y` approves a tool call or an MCP launch the
     /// moment it reaches the reducer, so a capped frame plus a keystroke
     /// already on its way is an approval nobody read.
-    approval_drawn: bool,
-    had_pending: bool,
+    ///
+    /// Identity rather than presence, because one iteration can answer A
+    /// and install B during its drain: `pending` is `Some` before and
+    /// after, so a flag would carry A's visibility onto B and let the next
+    /// keystroke answer a prompt that was never drawn.
+    drawn_approval: Option<u64>,
 }
 
 impl Scheduler {
@@ -699,7 +703,6 @@ impl Scheduler {
         ui_rx: mpsc::UnboundedReceiver<UiMsg>,
         keys: mpsc::UnboundedReceiver<TerminalEvent>,
     ) -> Self {
-        let had_pending = app.pending.is_some();
         Self {
             app,
             runtime,
@@ -711,8 +714,17 @@ impl Scheduler {
             tick: tokio::time::interval(Duration::from_millis(50)),
             dirty: true,
             last_draw: tokio::time::Instant::now() - FRAME_INTERVAL,
-            approval_drawn: false,
-            had_pending,
+            drawn_approval: None,
+        }
+    }
+
+    /// True when a request is on `pending` whose own frame has not been
+    /// drawn. Compares identity, so a request installed in place of an
+    /// answered one is undrawn even though `pending` never became `None`.
+    fn undrawn_approval(&self) -> bool {
+        match self.app.pending_install() {
+            Some(install) => self.drawn_approval != Some(install),
+            None => false,
         }
     }
 
@@ -731,17 +743,11 @@ impl Scheduler {
     ) -> Result<Step> {
         let mut outcome = Step::default();
 
-        // A modal approval that has just appeared has not been seen yet.
-        let pending_now = self.app.pending.is_some();
-        if pending_now && !self.had_pending {
-            self.approval_drawn = false;
-        }
-        self.had_pending = pending_now;
-
-        // The frame cap yields to an undrawn approval. Every other frame
-        // waits its turn; this one is what the next keystroke answers.
+        // The frame cap yields to an approval that has not been drawn.
+        // Every other frame waits its turn; this one is what the next
+        // keystroke answers.
         let due = self.last_draw + FRAME_INTERVAL;
-        let owed = pending_now && !self.approval_drawn;
+        let owed = self.undrawn_approval();
         if self.dirty && (owed || tokio::time::Instant::now() >= due) {
             terminal
                 .draw(|frame| draw(frame, &self.app))
@@ -749,9 +755,7 @@ impl Scheduler {
             self.dirty = false;
             self.last_draw = tokio::time::Instant::now();
             outcome.drew = true;
-            if self.app.pending.is_some() {
-                self.approval_drawn = true;
-            }
+            self.drawn_approval = self.app.pending_install();
         }
 
         let action = tokio::select! {
@@ -764,7 +768,7 @@ impl Scheduler {
             Some(event) = self.keys.recv() => {
                 self.dirty = true;
                 outcome.input = true;
-                if self.app.pending.is_some() && !self.approval_drawn {
+                if self.undrawn_approval() {
                     // Unreachable while the draw above precedes this
                     // select, and kept so that it stays unreachable: a
                     // key cannot answer a prompt that has never been on
@@ -1973,18 +1977,17 @@ mod tests {
 
         let mut shown = false;
         let mut answered_unseen = false;
+        let mut delivered = false;
         for _ in 0..8 {
             scheduler.step(&mut terminal).await.unwrap();
             if screen(&terminal).contains("approve?") {
                 shown = true;
             }
             if decision.try_recv().is_ok() {
+                delivered = true;
                 if !shown {
                     answered_unseen = true;
                 }
-                break;
-            }
-            if shown {
                 break;
             }
         }
@@ -1993,6 +1996,182 @@ mod tests {
             "a decision was sent for an approval that had not been drawn"
         );
         assert!(shown, "the approval was never drawn");
+        // The guard delays the key, it does not eat it: once the prompt has
+        // been drawn the keystroke must still answer it.
+        assert!(delivered, "the decision never reached its responder");
+    }
+
+    /// A second approval installed in place of an answered one must be
+    /// drawn on its own account.
+    ///
+    /// Answering A and installing B can happen in the same iteration: the
+    /// turn that receives A's decision enqueues B from another worker, and
+    /// the drain handles it before the next frame. `pending` is `Some`
+    /// throughout, so tracking presence rather than identity would carry
+    /// A's visibility onto B and let the next keystroke answer a prompt
+    /// that had never been drawn.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_approval_does_not_inherit_the_first_one_s_visibility() {
+        let (mut scheduler, ui_tx, keys_tx, _dir) = scheduler().await;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+
+        // A is installed and drawn, then answered.
+        let (responder_a, mut decision_a) = oneshot::channel();
+        ui_tx
+            .send(approval_message(
+                scheduler.app.sidebar.generation,
+                "a1",
+                "rm -rf /tmp/a",
+                responder_a,
+            ))
+            .unwrap();
+        for _ in 0..4 {
+            scheduler.step(&mut terminal).await.unwrap();
+            if screen(&terminal).contains("/tmp/a") {
+                break;
+            }
+        }
+        assert!(screen(&terminal).contains("/tmp/a"), "A was never drawn");
+        let drawn_for_a = scheduler.drawn_approval;
+
+        // One step now answers A and installs B: the key is taken first,
+        // and B's message is handled by the same step's drain. `pending`
+        // is `Some` before and after, which is the transition that made
+        // presence-tracking wrong.
+        let (responder_b, mut decision_b) = oneshot::channel();
+        keys_tx
+            .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('y'),
+                crossterm::event::KeyModifiers::NONE,
+            )))
+            .unwrap();
+        ui_tx
+            .send(approval_message(
+                scheduler.app.sidebar.generation,
+                "b1",
+                "rm -rf /tmp/b",
+                responder_b,
+            ))
+            .unwrap();
+        let step = scheduler.step(&mut terminal).await.unwrap();
+        assert!(step.input, "the step did not answer A");
+        assert!(step.messages > 0, "the step did not install B");
+        assert!(
+            decision_a.try_recv().is_ok(),
+            "A's own decision never reached its responder"
+        );
+        assert!(
+            scheduler.app.pending.is_some(),
+            "B is not on screen; the transition under test did not happen"
+        );
+
+        // The next decision key is already on its way, as it would be from
+        // a user still answering A.
+        keys_tx
+            .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('y'),
+                crossterm::event::KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        let mut shown_b = false;
+        let mut answered_unseen = false;
+        let mut delivered_b = false;
+        for _ in 0..8 {
+            scheduler.step(&mut terminal).await.unwrap();
+            if screen(&terminal).contains("/tmp/b") {
+                shown_b = true;
+            }
+            if decision_b.try_recv().is_ok() {
+                delivered_b = true;
+                if !shown_b {
+                    answered_unseen = true;
+                }
+                break;
+            }
+        }
+        assert_ne!(
+            scheduler.drawn_approval, drawn_for_a,
+            "B inherited A's visibility"
+        );
+        assert!(
+            !answered_unseen,
+            "a decision was sent for a second approval that had not been drawn"
+        );
+        assert!(shown_b, "the second approval was never drawn");
+        assert!(
+            delivered_b,
+            "the second decision never reached its responder"
+        );
+    }
+
+    /// One `step` draws before it takes input, so a frame cannot show a
+    /// keystroke handled in the same step.
+    ///
+    /// The load benchmark relies on exactly this to attribute
+    /// input-to-frame latency: a frame drawn at the top of a step completes
+    /// only the input handled in earlier steps. If the order here ever
+    /// changes, that attribution becomes wrong and this fails first.
+    #[tokio::test(start_paused = true)]
+    async fn a_step_draws_before_it_handles_input() {
+        let (mut scheduler, ui_tx, keys_tx, _dir) = scheduler().await;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        // Something to draw, and a key waiting behind it.
+        ui_tx.send(UiMsg::Agents(Vec::new())).unwrap();
+        scheduler.step(&mut terminal).await.unwrap();
+        scheduler.app.composer.clear();
+
+        keys_tx
+            .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('Z'),
+                crossterm::event::KeyModifiers::NONE,
+            )))
+            .unwrap();
+        // Make a frame owed so this step both draws and takes the key.
+        scheduler.dirty = true;
+        scheduler.last_draw = tokio::time::Instant::now() - FRAME_INTERVAL;
+        let step = scheduler.step(&mut terminal).await.unwrap();
+
+        assert!(step.drew, "the step did not draw");
+        assert!(step.input, "the step did not take the key");
+        assert!(
+            !screen(&terminal).contains('Z'),
+            "the frame drawn by this step already showed the key it handled afterwards"
+        );
+        assert!(
+            scheduler.app.composer.text().contains('Z'),
+            "the key was not applied at all"
+        );
+    }
+
+    fn approval_message(
+        generation: u64,
+        id: &str,
+        resource: &str,
+        responder: oneshot::Sender<ApprovalDecision>,
+    ) -> UiMsg {
+        UiMsg::Approval {
+            generation,
+            pending: PendingApproval {
+                request: ApprovalRequest {
+                    id: gritt_core::event::ApprovalId(id.into()),
+                    tool: "shell".into(),
+                    resource: resource.into(),
+                    reason: "destructive".into(),
+                    call_id: None,
+                },
+                decision: Decision {
+                    outcome: gritt_core::policy::PolicyOutcome::Ask,
+                    reason: "destructive".into(),
+                    destructive: true,
+                    rule: None,
+                },
+                preview: None,
+            },
+            responder,
+        }
     }
 
     fn session(name: &str) -> Session {
