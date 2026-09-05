@@ -23,7 +23,9 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,12 +38,29 @@ const ALT_SCREEN_OFF: &str = "\x1b[?1049l";
 /// the input is drawn and the loop is reading keys.
 const COMPOSER: &str = "Ask Gritt to do something";
 
+/// The composer placeholder with nothing configured, which is what the idle
+/// tests run against.
+const COMPOSER_UNCONFIGURED: &str = "Type here";
+
 fn recording() -> bool {
     std::env::var("GRITT_BENCH").is_ok_and(|value| value == "1")
 }
 
 fn record(line: &str) {
     println!("BENCH {line}");
+}
+
+/// A workspace with no provider profiles at all.
+///
+/// Idle measurement needs every asynchronous startup dependency under
+/// control, and profile discovery is the one that is not: resolving a
+/// profile's credential reaches the operating system keychain before it
+/// looks at the environment, and that call can take as long as the platform
+/// wants. With no profile there is nothing to resolve and no keychain call,
+/// so startup finishes on a schedule the test controls. The home screen is
+/// the same one a new user sees, and it is what the idle budget is about.
+fn write_bare_config(dir: &Path) {
+    std::fs::write(dir.join("config.toml"), "\n").unwrap();
 }
 
 /// A configured workspace: one profile with a key variable that resolves, so
@@ -107,8 +126,19 @@ struct Session {
 }
 
 impl Session {
+    /// Starts against the default single-profile config.
     fn start(dir: &Path, rows: u16, cols: u16, extra: &[&str]) -> Self {
         write_config(dir);
+        Self::start_with_existing_config(dir, rows, cols, extra)
+    }
+
+    /// Starts against whatever configuration the caller already wrote.
+    ///
+    /// `start` rewrites `config.toml`, which silently replaced the fixture
+    /// endpoint in the pending-catalog case and pointed it at a closed port
+    /// instead, so the test measured a connection refusal rather than a
+    /// request left hanging.
+    fn start_with_existing_config(dir: &Path, rows: u16, cols: u16, extra: &[&str]) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows,
@@ -343,18 +373,28 @@ fn launch_to_usable_composer_with_existing_config() {
 ///
 /// This is what "independent of provider readiness" has to survive: the
 /// model list is requested and does not come back.
-fn stalling_provider() -> u16 {
+fn stalling_provider() -> (u16, Arc<AtomicUsize>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&requests);
     thread::spawn(move || {
         let mut held = Vec::new();
         for stream in listener.incoming() {
             let Ok(stream) = stream else { break };
-            // Held open, never answered, never closed.
-            held.push(stream);
+            // Read the request line so the count means "a request arrived",
+            // not merely "a socket was opened". Then hold it: never
+            // answered, never closed.
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+            if !line.is_empty() {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }
+            held.push((stream, reader));
         }
     });
-    port
+    (port, requests)
 }
 
 /// Launch with a model list that is requested and never arrives.
@@ -364,22 +404,36 @@ fn stalling_provider() -> u16 {
 /// makes the request and lets it hang.
 #[test]
 fn launch_to_usable_composer_with_a_pending_catalog_request() {
-    let port = stalling_provider();
+    let (port, requests) = stalling_provider();
     let dir = tempfile::tempdir().unwrap();
+    // A profile name unique to this run. The model cache lives under the
+    // user cache directory and is keyed by profile, so a shared name would
+    // be served from whatever an earlier run left there and no request
+    // would be made at all.
+    let profile = format!(
+        "pend{}{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    );
     std::fs::write(
         dir.path().join("config.toml"),
         format!(
-            "default_profile = \"local\"\ndefault_model = \"openai/gpt-5-nano\"\n\
-             [profiles.local]\nname = \"local\"\nprotocol = \"chat_completions\"\n\
+            "default_profile = \"{profile}\"\ndefault_model = \"openai/gpt-5-nano\"\n\
+             [profiles.{profile}]\nname = \"{profile}\"\nprotocol = \"chat_completions\"\n\
              base_url = \"http://127.0.0.1:{port}/v1\"\n\
-             [profiles.local.key]\nkeychain_service_entry = \"gritt-bench-no-such-entry/local\"\n\
+             [profiles.{profile}.key]\nkeychain_service_entry = \"gritt-bench-no-such-entry/x\"\n\
              env_var_name = \"GRITT_BENCH_KEY\"\n"
         ),
     )
     .unwrap();
     let start = Instant::now();
-    // No `--no-models`: the catalog is requested and will not answer.
-    let mut session = Session::start(dir.path(), 40, 120, &[]);
+    // No `--no-models`: the catalog is requested and will not answer. The
+    // configuration written above is preserved, so the request really does
+    // reach the stalling fixture.
+    let mut session = Session::start_with_existing_config(dir.path(), 40, 120, &[]);
     session.wait_for(ALT_SCREEN_ON, Duration::from_secs(30));
     session.wait_for(COMPOSER, Duration::from_secs(30));
     let usable = start.elapsed();
@@ -401,6 +455,20 @@ fn launch_to_usable_composer_with_a_pending_catalog_request() {
         usable < Duration::from_secs(10),
         "the composer waited {usable:?} for a model list that never arrived"
     );
+    // The measurement only means anything if the request was actually made
+    // and left hanging.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while requests.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the model list was never requested, so nothing was pending"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    record(&format!(
+        "launch with a pending catalog: {} request(s) reached the fixture and stayed open",
+        requests.load(Ordering::SeqCst)
+    ));
     assert!(session.quit().success());
 }
 
@@ -418,9 +486,10 @@ fn idle_cpu_and_redraw_over_thirty_seconds() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let mut session = Session::start(dir.path(), 40, 120, &["--no-models"]);
+    write_bare_config(dir.path());
+    let mut session = Session::start_with_existing_config(dir.path(), 40, 120, &["--no-models"]);
     session.wait_for(ALT_SCREEN_ON, Duration::from_secs(30));
-    session.wait_for(COMPOSER, Duration::from_secs(30));
+    session.wait_for(COMPOSER_UNCONFIGURED, Duration::from_secs(30));
     // Measure only once the terminal has actually gone silent.
     assert!(
         session.wait_until_quiet(Duration::from_secs(2), Duration::from_secs(60)),
@@ -479,10 +548,12 @@ fn idle_cpu_and_redraw_over_thirty_seconds() {
 #[test]
 fn an_idle_session_writes_nothing_to_the_terminal() {
     let dir = tempfile::tempdir().unwrap();
-    let mut session = Session::start(dir.path(), 40, 120, &["--no-models"]);
+    write_bare_config(dir.path());
+    let mut session = Session::start_with_existing_config(dir.path(), 40, 120, &["--no-models"]);
     session.wait_for(ALT_SCREEN_ON, Duration::from_secs(30));
-    session.wait_for(COMPOSER, Duration::from_secs(30));
-    // Startup's background work (profiles, agent probes, the change scan)
+    session.wait_for(COMPOSER_UNCONFIGURED, Duration::from_secs(30));
+    // Startup's background work (agent probes and the change scan; there
+    // are no profiles to resolve, so nothing reaches the keychain)
     // each land as a message and legitimately redraw. Wait for real
     // silence rather than assuming a settling time: a probe finishing a
     // second late is a correct redraw, not the defect this guards.
