@@ -392,12 +392,18 @@ async fn the_combined_workload_on_the_real_event_loop() {
         // in `run.rs` is the deterministic guard on that ordering.
         if step.drew {
             frames += 1;
-            let now = Instant::now();
+            // The instant the frame was written, taken inside `step`. The
+            // step then waits in `select!` and drains, which is scheduler
+            // time with the frame already on screen and must not be
+            // counted against the keystroke.
+            // `a_step_records_when_its_frame_was_drawn_not_when_it_returned`
+            // is the guard on that distinction.
+            let shown = step.drew_at.expect("a drawn step records when");
             for queued in awaiting_frame.drain(..) {
-                input_latency.push(now.duration_since(queued));
+                input_latency.push(shown.duration_since(queued));
             }
             if let Some(queued) = cancel_awaiting.take() {
-                cancel_latency = Some(now.duration_since(queued));
+                cancel_latency = Some(shown.duration_since(queued));
             }
         }
 

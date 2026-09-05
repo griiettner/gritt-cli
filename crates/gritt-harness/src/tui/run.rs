@@ -653,6 +653,14 @@ async fn event_loop(
 pub struct Step {
     /// A frame was put on the terminal.
     pub drew: bool,
+    /// When that frame finished being written.
+    ///
+    /// This is when the user could see it. The step goes on to wait in
+    /// `select!`, handle an action, and drain the queue, all of which can
+    /// take longer than the frame did, so a caller measuring
+    /// input-to-frame latency must use this instant and not the one after
+    /// `step` returns (TKT-0020).
+    pub drew_at: Option<std::time::Instant>,
     /// Messages taken off the queue and handled, including the drain.
     pub messages: usize,
     /// A terminal event was taken and handled.
@@ -755,6 +763,10 @@ impl Scheduler {
             self.dirty = false;
             self.last_draw = tokio::time::Instant::now();
             outcome.drew = true;
+            // Wall-clock, taken here rather than by the caller: everything
+            // after this point in the step happens once the frame is
+            // already on screen.
+            outcome.drew_at = Some(std::time::Instant::now());
             self.drawn_approval = self.app.pending_install();
         }
 
@@ -2143,6 +2155,42 @@ mod tests {
         assert!(
             scheduler.app.composer.text().contains('Z'),
             "the key was not applied at all"
+        );
+    }
+
+    /// `Step::drew_at` is taken when the frame is written, not when the
+    /// step returns.
+    ///
+    /// After drawing, a step waits in `select!` and then drains. That time
+    /// is scheduler time with the frame already on screen, and the load
+    /// benchmark's input-to-frame numbers are wrong by exactly that much if
+    /// they use the later instant. Real time here, not a paused clock: the
+    /// point is to observe the gap.
+    #[tokio::test]
+    async fn a_step_records_when_its_frame_was_drawn_not_when_it_returned() {
+        let (mut scheduler, ui_tx, _keys_tx, _dir) = scheduler().await;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        // The first frame, then a step with nothing queued to spend the
+        // interval's immediate first tick. After that a tick really waits.
+        ui_tx.send(UiMsg::Agents(Vec::new())).unwrap();
+        scheduler.step(&mut terminal).await.unwrap();
+        scheduler.step(&mut terminal).await.unwrap();
+
+        // Owe a frame, and leave both queues empty so the step draws and
+        // then waits out the 50 ms tick with nothing to do.
+        scheduler.dirty = true;
+        scheduler.last_draw = tokio::time::Instant::now() - FRAME_INTERVAL;
+        let step = scheduler.step(&mut terminal).await.unwrap();
+        let returned_at = std::time::Instant::now();
+
+        assert!(step.drew, "the step did not draw");
+        let drew_at = step.drew_at.expect("a drawn step records when");
+        let after_the_frame = returned_at.duration_since(drew_at);
+        assert!(
+            after_the_frame >= Duration::from_millis(20),
+            "the step returned {after_the_frame:?} after its frame; this test needs it to \
+             wait, so it is not proving anything"
         );
     }
 
