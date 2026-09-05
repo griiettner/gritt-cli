@@ -1,0 +1,57 @@
+# help 60x20
+
+## text
+
+api-cleanup  coding  fixture
+you   Tidy the public API of the store module.
+ ╭ Help ──────────────────────────────────────────────────╮
+t│Commands                                                │
+ │ /connect    Choose an AI provider or an installed agent│
+g│ /models     Search the selected provider's models and  │
+ │choose one                                              │
+ │ /effort     Choose the reasoning effort for native     │
+ │turns                                                   │
+ │ /plan       Switch to the planning phase               │
+t│ /code       Switch to the coding phase                 │
+ │ /sessions   Search and resume sessions for this        │
+t│workspace  [Ctrl-S]                                     │
+ │ /new        Start a fresh draft without deleting the   │
+ │current session                                         │
+ │ /details    Expand or collapse tool output             │
+╭│ /sidebar    Toggle the session information sidebar     │╮
+│╰ j/k scrolls · Esc closes ──────────────────────────────╯│
+╰──────────────────────────────────────────────────────────╯
+openai · openai/gpt-5-nano  effort medium
+
+## styles dark
+
+fg=Some(Rgb(122, 162, 247)) bg=Some(Rgb(20, 22, 26)) mod=BOLD
+fg=Some(Rgb(122, 162, 247)) bg=Some(Rgb(30, 33, 39)) mod=BOLD
+fg=Some(Rgb(122, 162, 247)) bg=Some(Rgb(30, 33, 39)) mod=NONE
+fg=Some(Rgb(135, 143, 156)) bg=Some(Rgb(20, 22, 26)) mod=DIM
+fg=Some(Rgb(135, 143, 156)) bg=Some(Rgb(20, 22, 26)) mod=ITALIC
+fg=Some(Rgb(135, 143, 156)) bg=Some(Rgb(20, 22, 26)) mod=NONE
+fg=Some(Rgb(135, 143, 156)) bg=Some(Rgb(30, 33, 39)) mod=NONE
+fg=Some(Rgb(221, 225, 230)) bg=Some(Rgb(20, 22, 26)) mod=NONE
+fg=Some(Rgb(221, 225, 230)) bg=Some(Rgb(30, 33, 39)) mod=NONE
+fg=Some(Rgb(240, 113, 120)) bg=Some(Rgb(20, 22, 26)) mod=BOLD
+
+## styles light
+
+fg=Some(Rgb(163, 29, 44)) bg=Some(Rgb(250, 250, 248)) mod=BOLD
+fg=Some(Rgb(34, 37, 43)) bg=Some(Rgb(238, 239, 242)) mod=NONE
+fg=Some(Rgb(34, 37, 43)) bg=Some(Rgb(250, 250, 248)) mod=NONE
+fg=Some(Rgb(43, 84, 168)) bg=Some(Rgb(238, 239, 242)) mod=BOLD
+fg=Some(Rgb(43, 84, 168)) bg=Some(Rgb(238, 239, 242)) mod=NONE
+fg=Some(Rgb(43, 84, 168)) bg=Some(Rgb(250, 250, 248)) mod=BOLD
+fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(238, 239, 242)) mod=NONE
+fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(250, 250, 248)) mod=DIM
+fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(250, 250, 248)) mod=ITALIC
+fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(250, 250, 248)) mod=NONE
+
+## styles no-color
+
+fg=Some(Reset) bg=Some(Reset) mod=BOLD
+fg=Some(Reset) bg=Some(Reset) mod=DIM
+fg=Some(Reset) bg=Some(Reset) mod=ITALIC
+fg=Some(Reset) bg=Some(Reset) mod=NONE

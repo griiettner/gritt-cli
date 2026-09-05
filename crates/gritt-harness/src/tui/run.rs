@@ -6,14 +6,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{self, Event as TerminalEvent, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event as TerminalEvent, KeyEventKind,
+};
+use crossterm::execute;
 use gritt_core::event::{ApprovalDecision, ApprovalRequest, Event};
 use gritt_core::session::{BoxFuture, SessionStore};
 use gritt_core::{Error, Result};
 use tokio::sync::{mpsc, oneshot};
 
 use super::app::{Action, App, PendingApproval, StatusBar};
+use super::fixture::{self, FixtureScreen};
 use super::render::draw;
+use super::theme::Theme;
 use crate::agent::{CancelHandle, SessionSelector, TurnOutcome, Ui};
 use crate::control::ControlPlane;
 use crate::driver::Driver;
@@ -81,30 +86,105 @@ fn spawn_key_reader(stop: Arc<AtomicBool>) -> mpsc::UnboundedReceiver<TerminalEv
 
 fn status_for(agent: &dyn Driver) -> StatusBar {
     let mut status = StatusBar::default();
-    let mut app = App::new(StatusBar::default(), true);
+    let mut app = App::new(StatusBar::default(), Theme::default());
     app.set_session(agent.session());
     let info = agent.info();
     status.profile = info.backend;
     status.model = info.detail;
     status.session = app.status.session;
     status.phase = app.status.phase;
+    status.workspace = app.status.workspace;
+    status.effort = app.status.effort;
     status
+}
+
+/// Enters the alternate screen and installs the panic hook that leaves it.
+/// Bracketed paste is enabled here so a paste arrives as one event and
+/// never as a stream of keys that could look like a command.
+fn enter() -> Result<ratatui::DefaultTerminal> {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        ratatui::restore();
+        previous_hook(info);
+    }));
+    let terminal = ratatui::try_init()
+        .map_err(|error| Error::config(format!("cannot start the full-screen mode: {error}")))?;
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    Ok(terminal)
+}
+
+fn leave() {
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    ratatui::restore();
+    let _ = std::panic::take_hook();
+}
+
+/// The theme for this process, from `NO_COLOR` and `GRITT_THEME`.
+fn theme_from_env() -> Theme {
+    Theme::from_env(std::env::vars())
+}
+
+/// Runs the reviewable prototype: fixture state, no control plane, no
+/// session, and no MCP server. The interface labels the run `fixture`.
+pub async fn run_fixture(screen: FixtureScreen) -> Result<()> {
+    let mut terminal = enter()?;
+    let result = fixture_loop(screen, &mut terminal).await;
+    leave();
+    result
+}
+
+async fn fixture_loop(
+    screen: FixtureScreen,
+    terminal: &mut ratatui::DefaultTerminal,
+) -> Result<()> {
+    let mut app = fixture::screen(screen, theme_from_env());
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut keys = spawn_key_reader(Arc::clone(&stop));
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
+    loop {
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .map_err(|error| Error::config(format!("draw failed: {error}")))?;
+        let action = tokio::select! {
+            Some(event) = keys.recv() => match event {
+                TerminalEvent::Key(key) if key.kind != KeyEventKind::Release => app.on_key(key),
+                TerminalEvent::Paste(text) => {
+                    app.on_paste(&text);
+                    Action::None
+                }
+                _ => Action::None,
+            },
+            _ = tick.tick() => Action::None,
+        };
+        match action {
+            // A fixture run has no session, so a prompt is answered
+            // locally and says so rather than pretending to stream.
+            Action::Submit(prompt) => {
+                app.push(
+                    super::app::EntryKind::System,
+                    format!("fixture: `{prompt}` was not sent. No session is open in this mode."),
+                );
+                app.running = false;
+            }
+            Action::Quit => break,
+            _ => {}
+        }
+        if app.quit {
+            break;
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    Ok(())
 }
 
 /// Runs the full-screen mode until the user quits. Native and connector
 /// sessions share the loop, the approval view, and the transcript.
 pub async fn run_tui(plane: &ControlPlane, agent: Box<dyn Driver>) -> Result<()> {
-    let color = std::env::var_os("NO_COLOR").is_none();
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        ratatui::restore();
-        previous_hook(info);
-    }));
-    let mut terminal = ratatui::try_init()
-        .map_err(|error| Error::config(format!("cannot start the full-screen mode: {error}")))?;
-    let result = event_loop(plane, agent, &mut terminal, color).await;
-    ratatui::restore();
-    let _ = std::panic::take_hook();
+    let theme = theme_from_env();
+    let mut terminal = enter()?;
+    let result = event_loop(plane, agent, &mut terminal, theme).await;
+    leave();
     result
 }
 
@@ -112,9 +192,9 @@ async fn event_loop(
     plane: &ControlPlane,
     agent: Box<dyn Driver>,
     terminal: &mut ratatui::DefaultTerminal,
-    color: bool,
+    theme: Theme,
 ) -> Result<()> {
-    let mut app = App::new(status_for(agent.as_ref()), color);
+    let mut app = App::new(status_for(agent.as_ref()), theme);
     let history = plane.builder.store.read_events(&agent.session().id).await?;
     app.load_history(&history);
     let mut idle_agent: Option<Box<dyn Driver>> = Some(agent);
@@ -154,6 +234,10 @@ async fn event_loop(
             Some(event) = keys.recv() => {
                 match event {
                     TerminalEvent::Key(key) if key.kind != KeyEventKind::Release => app.on_key(key),
+                    TerminalEvent::Paste(text) => {
+                        app.on_paste(&text);
+                        Action::None
+                    }
                     TerminalEvent::Resize(_, _) => Action::None,
                     _ => Action::None,
                 }
@@ -179,6 +263,7 @@ async fn event_loop(
             }
             Action::Submit(prompt) => {
                 if let Some(mut agent) = idle_agent.take() {
+                    app.sidebar.session.activity = Some("running".into());
                     handle = Some(agent.handle());
                     let tx = ui_tx.clone();
                     tokio::spawn(async move {
@@ -188,7 +273,9 @@ async fn event_loop(
                     });
                 } else {
                     app.running = false;
-                    app.notice = Some("no idle agent".into());
+                    // The draft survives a submission that could not be sent.
+                    app.restore_draft(&prompt);
+                    app.notice = Some("no idle agent; your draft was kept".into());
                 }
             }
             Action::SetPhase(phase) => {
@@ -212,6 +299,8 @@ async fn event_loop(
                 {
                     Ok(agent) => {
                         app.entries.clear();
+                        // No value may survive from the previous driver.
+                        app.sidebar.reset();
                         let history = plane.builder.store.read_events(&agent.session().id).await?;
                         app.load_history(&history);
                         app.set_session(agent.session());

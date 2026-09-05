@@ -1,35 +1,53 @@
-//! Draws the [`App`]. Colors are dropped when `NO_COLOR` is set; layout
-//! follows the terminal size on every frame so resize needs no handling
-//! beyond a redraw.
+//! Draws the [`App`]. Every colour comes from a [`Theme`] token, so
+//! `NO_COLOR` and the light palette are one decision, not a decision per
+//! widget. Layout follows the terminal size on every frame, so a resize
+//! needs no handling beyond a redraw.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout as RtLayout, Margin, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::app::{App, EntryKind, View, PALETTE};
+use super::app::{
+    App, Entry, EntryKind, Focus, Layout, Notice, Overlay, PickerKind, SetupField, SetupForm, View,
+};
+use super::command;
+use super::composer::display_width;
+use super::picker::{ListStatus, Picker};
+use super::sidebar::{SidebarPlacement, SIDEBAR_GUTTER, SIDEBAR_WIDTH};
+use super::theme::Theme;
 use crate::modes::print::approval_text;
 
-fn style(app: &App, color: Color, modifier: Modifier) -> Style {
-    let mut style = Style::default().add_modifier(modifier);
-    if app.color {
-        style = style.fg(color);
-    }
-    style
-}
+/// The composer and the home column never grow past this, so a wide
+/// terminal reads as a centred document rather than a stretched line.
+const CONTENT_WIDTH: u16 = 90;
+/// Below this height the wordmark is dropped for transcript and input.
+const WORDMARK_MIN_HEIGHT: u16 = 20;
+/// Below this width secondary status collapses.
+const COMPACT_WIDTH: u16 = 80;
 
-fn entry_style(app: &App, kind: EntryKind) -> Style {
+const WORDMARK: [&str; 5] = [
+    "  ▟█████▙  ▗█▙  ▗█▙  █▄▄▄▄  █▄▄▄▄  ▗█▙  ▗█▙ ",
+    " ▟█▛▘      ▐█▌  ▐█▌  █▌  █  █▌  █    ██▛▛   ",
+    " ██▌  ▟██  ▐█████▛▌  █▛▀▀   █▛▀▀      ██    ",
+    " ▜█▙   █▌  ▐█▌  ▐█▌  █▌     █▌        ██    ",
+    "  ▜█████▛  ▐█▌  ▐█▌  █▌     █▌        ██    ",
+];
+
+fn entry_style(theme: &Theme, kind: EntryKind) -> Style {
     match kind {
-        EntryKind::User => style(app, Color::Cyan, Modifier::BOLD),
-        EntryKind::Assistant => Style::default(),
-        EntryKind::Reasoning => style(app, Color::DarkGray, Modifier::ITALIC),
-        EntryKind::Tool => style(app, Color::Yellow, Modifier::empty()),
-        EntryKind::System => style(app, Color::DarkGray, Modifier::empty()),
-        EntryKind::Error => style(app, Color::Red, Modifier::BOLD),
+        EntryKind::User => theme.accent().add_modifier(Modifier::BOLD),
+        EntryKind::Assistant => theme.text(),
+        EntryKind::Reasoning => theme.reasoning(),
+        EntryKind::Tool => theme.muted(),
+        EntryKind::System => theme.dim(),
+        EntryKind::Error => theme.error(),
     }
 }
 
+/// The role label. Whitespace and this label carry the structure; there
+/// is no border around a message.
 fn prefix(kind: EntryKind) -> &'static str {
     match kind {
         EntryKind::User => "you  ",
@@ -41,171 +59,831 @@ fn prefix(kind: EntryKind) -> &'static str {
     }
 }
 
-/// Transcript lines wrapped to `width`, bottom-aligned with scroll.
-pub fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let body_width = width.saturating_sub(7).max(10);
-    for entry in &app.entries {
-        let style = entry_style(app, entry.kind);
-        let mut first = true;
-        for raw in entry.text.lines().chain(if entry.text.is_empty() {
-            Some("")
-        } else {
-            None
-        }) {
-            for chunk in wrap(raw, body_width) {
-                let label = if first { prefix(entry.kind) } else { "     " };
-                first = false;
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{label} "), style),
-                    Span::styled(
-                        chunk,
-                        if entry.kind == EntryKind::Assistant {
-                            Style::default()
-                        } else {
-                            style
-                        },
-                    ),
-                ]));
+/// Wraps `text` to `width` display cells, breaking between words where
+/// one fits and inside a word only when it is longer than the line.
+/// Widths are display cells, so a CJK glyph counts as two.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let width = width.max(1);
+    let mut out = Vec::new();
+    let mut line = String::new();
+    let mut used = 0;
+    for word in text.split_inclusive(' ') {
+        let trimmed = word.trim_end_matches(' ');
+        let word_width = display_width(trimmed);
+        if used > 0 && used + word_width > width {
+            out.push(std::mem::take(&mut line).trim_end().to_owned());
+            used = 0;
+        }
+        if word_width > width {
+            // A word longer than the line is split by character.
+            for c in word.chars() {
+                let cell = display_width(c.encode_utf8(&mut [0u8; 4])).max(1);
+                if used + cell > width {
+                    out.push(std::mem::take(&mut line));
+                    used = 0;
+                }
+                line.push(c);
+                used += cell;
             }
+            continue;
+        }
+        line.push_str(word);
+        used += display_width(word);
+    }
+    if !line.is_empty() {
+        out.push(line.trim_end().to_owned());
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn entry_lines(
+    theme: &Theme,
+    entry: &Entry,
+    body_width: usize,
+    details: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let style = entry_style(theme, entry.kind);
+    let mut first = true;
+    let mut blocks: Vec<String> = entry.text.lines().map(str::to_owned).collect();
+    if blocks.is_empty() {
+        blocks.push(String::new());
+    }
+    if details {
+        if let Some(detail) = &entry.detail {
+            blocks.extend(detail.lines().map(|line| format!("  {line}")));
+        }
+    }
+    for raw in blocks {
+        for chunk in wrap(&raw, body_width) {
+            let label = if first { prefix(entry.kind) } else { "     " };
+            first = false;
+            lines.push(Line::from(vec![
+                Span::styled(format!("{label} "), style),
+                Span::styled(chunk, style),
+            ]));
         }
     }
     lines
 }
 
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    if text.is_empty() {
-        return vec![String::new()];
+/// Transcript lines wrapped to `width`. Called through the app's layout
+/// cache, so a frame that changed nothing reuses the previous wrap.
+pub fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let body_width = width.saturating_sub(7).max(8);
+    let mut lines = Vec::new();
+    for entry in &app.entries {
+        lines.extend(entry_lines(&app.theme, entry, body_width, app.tool_details));
+        // Whitespace, not a border, separates messages.
+        lines.push(Line::default());
     }
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut count = 0;
-    for c in text.chars() {
-        if count == width {
-            out.push(std::mem::take(&mut current));
-            count = 0;
-        }
-        current.push(c);
-        count += 1;
-    }
-    if !current.is_empty() {
-        out.push(current);
-    }
-    out
+    lines.pop();
+    lines
 }
 
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
-    let input_height = (app.input.lines().count().max(1) as u16 + 2).min(8);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),
-            Constraint::Length(input_height),
-            Constraint::Length(1),
-        ])
-        .split(area);
-    draw_transcript(frame, app, chunks[0]);
-    draw_input(frame, app, chunks[1]);
-    draw_status(frame, app, chunks[2]);
+    frame.render_widget(Block::default().style(app.theme.screen()), area);
+    match app.layout() {
+        Layout::Home => draw_home(frame, app, area),
+        Layout::Conversation => draw_conversation(frame, app, area),
+    }
+    // Overlay priority, bottom to top: the drawer and pickers, then the
+    // approval, which is always modal above everything.
+    for overlay in &app.overlays {
+        draw_overlay(frame, app, overlay, area);
+    }
     if app.pending.is_some() {
         draw_approval(frame, app, area);
     }
-    match app.view {
-        View::Palette => draw_palette(frame, app, area),
-        View::Sessions => draw_sessions(frame, app, area),
-        _ => {}
+}
+
+/// Height the composer needs, bounded so a long draft cannot squeeze the
+/// transcript out.
+fn composer_height(app: &App, area: Rect) -> u16 {
+    let lines = app.composer.line_count().max(1) as u16;
+    lines.saturating_add(2).clamp(3, (area.height / 2).max(3))
+}
+
+fn centered_column(area: Rect, width: u16) -> Rect {
+    let width = width.min(area.width);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y,
+        width,
+        height: area.height,
     }
 }
 
-fn draw_transcript(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let inner_height = area.height.saturating_sub(2) as usize;
-    let lines = transcript_lines(app, area.width.saturating_sub(2) as usize);
-    let total = lines.len();
-    let end = total.saturating_sub(app.scroll);
-    let start = end.saturating_sub(inner_height);
-    let visible: Vec<Line<'static>> = lines[start..end].to_vec();
-    let title = if app.running {
-        " transcript (running, Esc cancels) "
+fn draw_home(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let margin = if area.width >= COMPACT_WIDTH { 1 } else { 0 };
+    let area = area.inner(Margin::new(margin, 0));
+    let show_wordmark = area.height >= WORDMARK_MIN_HEIGHT;
+    let wordmark_height = if show_wordmark {
+        WORDMARK.len() as u16 + 1
     } else {
-        " transcript "
+        0
     };
-    let paragraph = Paragraph::new(Text::from(visible))
-        .block(Block::default().borders(Borders::ALL).title(title));
-    frame.render_widget(paragraph, area);
-}
-
-fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let title = match &app.notice {
-        Some(notice) => format!(" {notice} "),
-        None => " prompt (Enter sends, Ctrl-J newline, Ctrl-P palette, Ctrl-S sessions) ".into(),
+    let composer = composer_height(app, area);
+    // Suggestions sit directly under the composer on the home screen too.
+    let suggestions = app.suggestions();
+    let suggest_height = if suggestions.is_empty() {
+        0
+    } else {
+        (suggestions.len() as u16 + 2).min(area.height / 3)
     };
-    let paragraph = Paragraph::new(app.input.as_str())
-        .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title(title));
-    frame.render_widget(paragraph, area);
-    let before = &app.input[..app.cursor];
-    let row = before
-        .lines()
-        .count()
-        .saturating_sub(if before.ends_with('\n') { 0 } else { 1 }) as u16;
-    let column = before
-        .rsplit('\n')
-        .next()
-        .unwrap_or_default()
-        .chars()
-        .count() as u16;
-    let x = area.x + 1 + column.min(area.width.saturating_sub(3));
-    let y = area.y + 1 + row.min(area.height.saturating_sub(3));
-    frame.set_cursor_position((x, y));
-}
-
-fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let usage = &app.status.usage;
-    let text = format!(
-        " {} | {} | {} [{}] | in {} out {} | {}",
-        app.status.profile,
-        app.status.model,
-        app.status.session,
-        app.status.phase,
-        usage.input_tokens.unwrap_or(0),
-        usage.output_tokens.unwrap_or(0),
-        if app.status.connection.is_empty() {
-            "idle"
-        } else {
-            &app.status.connection
-        }
-    );
-    let paragraph = Paragraph::new(text).style(style(app, Color::Black, Modifier::REVERSED));
-    frame.render_widget(paragraph, area);
-}
-
-fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let vertical = Layout::default()
+    let block_height = wordmark_height + 2 + composer + suggest_height + 2;
+    let top = area.height.saturating_sub(block_height) / 2;
+    let rows = RtLayout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Length(top),
+            Constraint::Length(wordmark_height),
+            Constraint::Length(2),
+            Constraint::Length(composer),
+            Constraint::Length(suggest_height),
+            Constraint::Length(2),
+            Constraint::Min(0),
         ])
-        .split(area)[1];
-    Layout::default()
-        .direction(Direction::Horizontal)
+        .split(area);
+    let column = centered_column(rows[1], CONTENT_WIDTH);
+    if show_wordmark {
+        let lines: Vec<Line<'static>> = WORDMARK
+            .iter()
+            .map(|row| Line::from(Span::styled((*row).to_owned(), app.theme.accent())))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).alignment(Alignment::Center),
+            column,
+        );
+    }
+    let subtitle = centered_column(rows[2], CONTENT_WIDTH);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            home_subtitle(app),
+            if app.is_connected() {
+                app.theme.muted()
+            } else {
+                app.theme.accent()
+            },
+        )]))
+        .alignment(Alignment::Center),
+        subtitle,
+    );
+    let composer_area = centered_column(rows[3], CONTENT_WIDTH);
+    draw_composer(frame, app, composer_area);
+    if suggest_height > 0 {
+        draw_suggestions(frame, app, centered_column(rows[4], CONTENT_WIDTH));
+    }
+    let status = centered_column(rows[5], CONTENT_WIDTH);
+    frame.render_widget(
+        Paragraph::new(Text::from(home_status(app))).alignment(Alignment::Center),
+        status,
+    );
+}
+
+fn home_subtitle(app: &App) -> String {
+    match (&app.notice, app.is_connected()) {
+        (Some(notice), _) => notice.clone(),
+        (None, false) => "Use /connect to get started.".to_owned(),
+        (None, true) => "Type a prompt, or / for commands.".to_owned(),
+    }
+}
+
+fn home_status(app: &App) -> Vec<Line<'static>> {
+    let theme = &app.theme;
+    let mut parts = Vec::new();
+    // A named session is shown even before its first turn, so `gritt tui
+    // --session NAME` says which session the composer will write to.
+    if !app.status.session.is_empty() {
+        parts.push(Span::styled(app.status.session.clone(), theme.heading()));
+        parts.push(Span::styled("  ·  ", theme.dim()));
+    }
+    parts.extend([
+        Span::styled(app.status.workspace.clone(), theme.muted()),
+        Span::styled("  ·  ", theme.dim()),
+        Span::styled(
+            if app.is_connected() {
+                format!("{} · {}", app.status.profile, app.status.model)
+            } else {
+                "not connected".to_owned()
+            },
+            if app.is_connected() {
+                theme.text()
+            } else {
+                theme.dim()
+            },
+        ),
+        Span::styled("  ·  ", theme.dim()),
+        Span::styled(format!("effort {}", app.status.effort), theme.muted()),
+        Span::styled("  ·  ", theme.dim()),
+        Span::styled(
+            if app.status.phase.is_empty() {
+                "plan".to_owned()
+            } else {
+                app.status.phase.clone()
+            },
+            theme.muted(),
+        ),
+    ]);
+    if let Some(label) = &app.fixture {
+        parts.push(Span::styled("  ·  ", theme.dim()));
+        parts.push(Span::styled(label.clone(), theme.error()));
+    }
+    vec![Line::from(parts)]
+}
+
+fn draw_conversation(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let margin = if area.width >= COMPACT_WIDTH { 1 } else { 0 };
+    let area = area.inner(Margin::new(margin, 0));
+    let composer = composer_height(app, area);
+    let suggestions = app.suggestions();
+    let suggest_height = if suggestions.is_empty() {
+        0
+    } else {
+        (suggestions.len() as u16 + 2).min(area.height / 3)
+    };
+    let rows = RtLayout::default()
+        .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(suggest_height),
+            Constraint::Length(composer),
+            Constraint::Length(1),
         ])
-        .split(vertical)[1]
+        .split(area);
+    draw_header(frame, app, rows[0]);
+    let body = rows[1];
+    // The sidebar is a column only on a wide terminal; below 110 columns
+    // it collapses and `/sidebar` opens the drawer instead.
+    let transcript = if app.sidebar_placement(frame.area().width) == SidebarPlacement::Column
+        && body.width > SIDEBAR_WIDTH + SIDEBAR_GUTTER + 20
+    {
+        let columns = RtLayout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(20),
+                Constraint::Length(SIDEBAR_GUTTER),
+                Constraint::Length(SIDEBAR_WIDTH),
+            ])
+            .split(body);
+        draw_sidebar(frame, app, columns[2], false);
+        columns[0]
+    } else {
+        body
+    };
+    draw_transcript(frame, app, transcript);
+    if suggest_height > 0 {
+        draw_suggestions(frame, app, rows[2]);
+    }
+    draw_composer(frame, app, rows[3]);
+    draw_footer(frame, app, rows[4]);
+}
+
+fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let theme = &app.theme;
+    let mut spans = vec![
+        Span::styled(
+            if app.status.session.is_empty() {
+                "new session".to_owned()
+            } else {
+                app.status.session.clone()
+            },
+            theme.heading(),
+        ),
+        Span::styled("  ", theme.dim()),
+        Span::styled(app.status.phase.clone(), theme.muted()),
+    ];
+    if area.width >= COMPACT_WIDTH {
+        spans.push(Span::styled("  ", theme.dim()));
+        spans.push(Span::styled(app.status.workspace.clone(), theme.dim()));
+    }
+    if let Some(label) = &app.fixture {
+        spans.push(Span::styled("  ", theme.dim()));
+        spans.push(Span::styled(label.clone(), theme.error()));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_transcript(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let lines = app.transcript_lines(area.width as usize, transcript_lines);
+    let height = area.height as usize;
+    let total = lines.len();
+    let end = total.saturating_sub(app.scroll);
+    let start = end.saturating_sub(height);
+    let mut visible: Vec<Line<'static>> = lines[start.min(total)..end.min(total)].to_vec();
+    // A held viewport says so, and offers the way back.
+    if app.new_output && !visible.is_empty() {
+        visible.pop();
+        visible.push(Line::from(Span::styled(
+            "new output below — Ctrl-G returns to latest".to_owned(),
+            app.theme.accent().add_modifier(Modifier::REVERSED),
+        )));
+    }
+    let mut paragraph = Paragraph::new(Text::from(visible));
+    if app.focus == Focus::Transcript {
+        paragraph = paragraph.block(
+            Block::default()
+                .borders(Borders::LEFT)
+                .border_style(app.theme.accent()),
+        );
+    }
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let theme = &app.theme;
+    let focused = app.focus == Focus::Composer && app.overlays.is_empty() && app.pending.is_none();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(if focused {
+            theme.accent()
+        } else {
+            theme.muted()
+        })
+        .style(theme.raised());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let text = if app.composer.is_empty() {
+        Text::from(Line::from(Span::styled(
+            if app.is_connected() {
+                "Ask Gritt to do something…"
+            } else {
+                "Type here; /connect chooses a provider or an installed agent"
+            }
+            .to_owned(),
+            theme.dim(),
+        )))
+    } else {
+        Text::from(
+            app.composer
+                .text()
+                .split('\n')
+                .map(|line| Line::from(Span::styled(line.to_owned(), theme.text())))
+                .collect::<Vec<_>>(),
+        )
+    };
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
+    if focused {
+        let x = inner.x + (app.composer.column() as u16).min(inner.width.saturating_sub(1));
+        let y = inner.y + (app.composer.row() as u16).min(inner.height.saturating_sub(1));
+        frame.set_cursor_position((x, y));
+    }
+}
+
+fn draw_suggestions(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let theme = &app.theme;
+    let suggestions = app.suggestions();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.muted())
+        .title(Span::styled(" commands ".to_owned(), theme.muted()));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let lines: Vec<Line<'static>> = suggestions
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            let style = if index == app.suggestion_index {
+                theme.selection()
+            } else {
+                theme.text()
+            };
+            Line::from(vec![
+                Span::styled(format!(" /{:<10}", spec.name), style),
+                Span::styled(format!(" {}", spec.summary), theme.muted()),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let theme = &app.theme;
+    let mut spans = Vec::new();
+    if let Some(notice) = &app.notice {
+        spans.push(Span::styled(notice.clone(), theme.error()));
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+    spans.push(Span::styled(
+        if app.is_connected() {
+            format!("{} · {}", app.status.profile, app.status.model)
+        } else {
+            "not connected".to_owned()
+        },
+        theme.muted(),
+    ));
+    spans.push(Span::styled(
+        format!("  effort {}", app.status.effort),
+        theme.muted(),
+    ));
+    // Secondary status collapses before the input or transcript does.
+    if area.width >= COMPACT_WIDTH {
+        let usage = &app.status.usage;
+        spans.push(Span::styled(
+            format!(
+                "  in {} out {}",
+                usage
+                    .input_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "—".into()),
+                usage
+                    .output_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "—".into())
+            ),
+            theme.dim(),
+        ));
+        spans.push(Span::styled(
+            format!(
+                "  {}",
+                if app.running {
+                    "running · Esc cancels"
+                } else {
+                    "Enter sends · Ctrl-J newline · / commands"
+                }
+            ),
+            theme.dim(),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, drawer: bool) {
+    let theme = &app.theme;
+    let scroll = if drawer { app.sidebar_scroll } else { 0 };
+    let block = Block::default()
+        .borders(if drawer { Borders::ALL } else { Borders::LEFT })
+        .border_type(BorderType::Rounded)
+        .border_style(if app.focus == Focus::Sidebar {
+            theme.accent()
+        } else {
+            theme.muted()
+        })
+        .style(if drawer {
+            theme.raised()
+        } else {
+            theme.screen()
+        });
+    let inner = block.inner(area);
+    if drawer {
+        frame.render_widget(Clear, area);
+    }
+    frame.render_widget(block, area);
+    let lines = app
+        .sidebar
+        .lines(theme, inner.width.saturating_sub(1) as usize);
+    let start = scroll.min(lines.len());
+    frame.render_widget(
+        Paragraph::new(Text::from(lines[start..].to_vec())),
+        inner.inner(Margin::new(1, 0)),
+    );
+}
+
+fn overlay_area(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(2)).max(1);
+    let height = height.min(area.height.saturating_sub(2)).max(1);
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+}
+
+fn draw_overlay(frame: &mut Frame<'_>, app: &App, overlay: &Overlay, area: Rect) {
+    match overlay {
+        Overlay::Picker { kind, picker } => draw_picker(frame, app, *kind, picker, area),
+        Overlay::Setup(form) => draw_setup(frame, app, form, area),
+        Overlay::Notice(notice) => draw_notice(frame, app, notice, area),
+        Overlay::Help { scroll } => draw_help(frame, app, *scroll, area),
+        Overlay::Drawer { .. } => {
+            let width = (area.width * 3 / 4).min(SIDEBAR_WIDTH + 8);
+            let drawer = Rect {
+                x: area.x + area.width.saturating_sub(width),
+                y: area.y,
+                width,
+                height: area.height,
+            };
+            draw_sidebar(frame, app, drawer, true);
+        }
+    }
+}
+
+fn panel<'a>(theme: &Theme, title: String, hint: &str) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent())
+        .style(theme.raised())
+        .title(Span::styled(format!(" {title} "), theme.heading()))
+        .title_bottom(Span::styled(format!(" {hint} "), theme.muted()))
+}
+
+fn draw_picker(frame: &mut Frame<'_>, app: &App, kind: PickerKind, picker: &Picker, area: Rect) {
+    let theme = &app.theme;
+    let width = match kind {
+        PickerKind::Effort => 60,
+        _ => 76,
+    };
+    let target = overlay_area(area, width, (area.height * 4 / 5).max(8));
+    frame.render_widget(Clear, target);
+    let block = panel(
+        theme,
+        picker.title.clone(),
+        "type to filter · Enter selects · Esc closes",
+    );
+    let inner = block.inner(target);
+    frame.render_widget(block, target);
+    let rows = RtLayout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("› ".to_owned(), theme.accent()),
+            Span::styled(picker.query.text().to_owned(), theme.text()),
+            Span::styled("▏".to_owned(), theme.accent()),
+        ])),
+        rows[0],
+    );
+    // Loading and failure are list state, never a blank list.
+    let status = match &picker.status {
+        ListStatus::Ready => Span::styled(picker.hint.clone(), theme.muted()),
+        ListStatus::Loading { what } => Span::styled(
+            format!("loading {what}'s models… Esc cancels"),
+            theme.accent(),
+        ),
+        ListStatus::Failed { reason, cached } => Span::styled(
+            if *cached {
+                format!("refresh failed: {reason}")
+            } else {
+                format!("unavailable: {reason}")
+            },
+            theme.error(),
+        ),
+    };
+    frame.render_widget(Paragraph::new(Line::from(status)), rows[1]);
+
+    let visible = picker.visible();
+    if visible.is_empty() {
+        let message = match &picker.status {
+            ListStatus::Loading { .. } => "nothing cached yet",
+            ListStatus::Failed { .. } => "no list is available; the state above says why",
+            ListStatus::Ready if picker.query.is_empty() => "nothing configured yet",
+            ListStatus::Ready => "no match for this search",
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(message.to_owned(), theme.dim()))),
+            rows[2],
+        );
+        return;
+    }
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut group: Option<String> = None;
+    let body_width = rows[2].width as usize;
+    for (position, index) in visible.iter().enumerate() {
+        let row = &picker.rows()[*index];
+        if row.group != group {
+            group.clone_from(&row.group);
+            if let Some(name) = &group {
+                if !lines.is_empty() {
+                    lines.push(Line::default());
+                }
+                lines.push(Line::from(Span::styled(name.clone(), theme.heading())));
+            }
+        }
+        let selected = position == picker.highlight();
+        let base = if !row.availability.is_available() {
+            theme.dim()
+        } else if selected {
+            theme.selection()
+        } else {
+            theme.text()
+        };
+        let marker = if row.current { "●" } else { " " };
+        let label = format!("{marker} {}", row.label);
+        let badge = if row.badge.is_empty() {
+            String::new()
+        } else {
+            format!("[{}]", row.badge)
+        };
+        let pad = body_width
+            .saturating_sub(display_width(&label) + display_width(&badge) + 1)
+            .max(1);
+        lines.push(Line::from(vec![
+            Span::styled(label, base),
+            Span::styled(" ".repeat(pad), base),
+            Span::styled(badge, theme.muted()),
+        ]));
+        let mut second = Vec::new();
+        if !row.detail.is_empty() {
+            second.push(Span::styled(format!("    {}", row.detail), theme.muted()));
+        }
+        if !row.availability.is_available() {
+            second.push(Span::styled(
+                format!("  — {}", row.availability.reason()),
+                theme.error(),
+            ));
+        }
+        if !second.is_empty() {
+            lines.push(Line::from(second));
+        }
+        if !row.note.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", row.note),
+                theme.dim(),
+            )));
+        }
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), rows[2]);
+}
+
+fn draw_setup(frame: &mut Frame<'_>, app: &App, form: &SetupForm, area: Rect) {
+    let theme = &app.theme;
+    let target = overlay_area(area, 70, 16);
+    frame.render_widget(Clear, target);
+    let block = panel(
+        theme,
+        "Provider setup".to_owned(),
+        "Tab moves · Enter confirms · Esc returns",
+    );
+    let inner = block.inner(target);
+    frame.render_widget(block, target);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "The key is typed masked, is never echoed, and goes to the keychain only.".to_owned(),
+            theme.muted(),
+        )),
+        Line::default(),
+    ];
+    for field in SetupField::ORDER {
+        let value = match field {
+            SetupField::Name => form.name.text().to_owned(),
+            SetupField::BaseUrl => form.base_url.text().to_owned(),
+            SetupField::EnvVar => form.env_var.text().to_owned(),
+            // Only the length leaves the form.
+            SetupField::Secret => "•".repeat(form.secret_len()),
+        };
+        let focused = form.field() == field;
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:>14}  ", field.label()),
+                if focused {
+                    theme.accent()
+                } else {
+                    theme.muted()
+                },
+            ),
+            Span::styled(
+                if value.is_empty() {
+                    "—".to_owned()
+                } else {
+                    value
+                },
+                if focused {
+                    theme.selection()
+                } else {
+                    theme.text()
+                },
+            ),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        format!("{:>14}  {:?}", "saves to", form.destination),
+        theme.muted(),
+    )));
+    if let Some(outcome) = &form.outcome {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(outcome.clone(), theme.error())));
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+fn draw_notice(frame: &mut Frame<'_>, app: &App, notice: &Notice, area: Rect) {
+    let theme = &app.theme;
+    let target = overlay_area(area, 70, 12);
+    frame.render_widget(Clear, target);
+    let block = panel(theme, notice.title.clone(), "Enter closes");
+    let inner = block.inner(target);
+    frame.render_widget(block, target);
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![Line::from(Span::styled(
+            notice.body.clone(),
+            if notice.is_error {
+                theme.error()
+            } else {
+                theme.text()
+            },
+        ))]))
+        .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+fn draw_help(frame: &mut Frame<'_>, app: &App, scroll: usize, area: Rect) {
+    let theme = &app.theme;
+    let target = overlay_area(area, 78, (area.height * 4 / 5).max(8));
+    frame.render_widget(Clear, target);
+    let block = panel(theme, "Help".to_owned(), "j/k scrolls · Esc closes");
+    let inner = block.inner(target);
+    frame.render_widget(block, target);
+    let mut lines = vec![Line::from(Span::styled(
+        "Commands".to_owned(),
+        theme.heading(),
+    ))];
+    for spec in command::COMMANDS {
+        lines.push(Line::from(vec![
+            Span::styled(format!(" /{:<10}", spec.name), theme.accent()),
+            Span::styled(format!(" {}", spec.summary), theme.text()),
+            Span::styled(
+                spec.shortcut
+                    .map(|key| format!("  [{key}]"))
+                    .unwrap_or_default(),
+                theme.muted(),
+            ),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("Keys".to_owned(), theme.heading())));
+    for (key, what) in [
+        ("Enter", "send the prompt"),
+        ("Ctrl-J / Shift-Enter", "insert a newline"),
+        ("Tab", "move focus, or complete a suggestion"),
+        ("Esc", "close the top overlay, then cancel a running turn"),
+        ("Ctrl-P", "the command palette"),
+        ("Ctrl-G", "return to the latest output"),
+        ("Ctrl-Y", "copy the draft or transcript to the Gritt buffer"),
+        (
+            "Ctrl-A / Ctrl-W / Ctrl-U",
+            "select all, delete word, delete to line start",
+        ),
+        ("Ctrl-Q", "quit"),
+    ] {
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {key:<26}"), theme.accent()),
+            Span::styled(what.to_owned(), theme.text()),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "Limitations".to_owned(),
+        theme.heading(),
+    )));
+    for limitation in [
+        "A session is pinned to its provider and model; /new changes them.",
+        "An installed agent manages its own model, effort, and permissions.",
+        "Cost is an estimate from listed prices, never a billed amount.",
+        "Ctrl-Y copies inside Gritt; it does not write the system clipboard.",
+    ] {
+        lines.push(Line::from(Span::styled(
+            format!(" · {limitation}"),
+            theme.muted(),
+        )));
+    }
+    let start = scroll.min(lines.len());
+    frame.render_widget(
+        Paragraph::new(Text::from(lines[start..].to_vec())).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 fn draw_approval(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(pending) = &app.pending else {
         return;
     };
-    let popup = centered(area, 80, if app.view == View::Diff { 90 } else { 50 });
-    frame.render_widget(Clear, popup);
-    let mut text = if app.view == View::Diff {
+    let theme = &app.theme;
+    let diff = app.view == View::Diff;
+    let target = overlay_area(
+        area,
+        (area.width * 4 / 5).max(30),
+        if diff {
+            (area.height * 9 / 10).max(8)
+        } else {
+            (area.height / 2).max(8)
+        },
+    );
+    frame.render_widget(Clear, target);
+    let mut text = if diff {
         pending
             .preview
             .clone()
@@ -219,87 +897,41 @@ fn draw_approval(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         " approve? "
     };
-    let block = Block::default().borders(Borders::ALL).title(title).style(
-        if pending.decision.destructive {
-            style(app, Color::Red, Modifier::BOLD)
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(
+            title.to_owned(),
+            if pending.decision.destructive {
+                theme.error()
+            } else {
+                theme.heading()
+            },
+        ))
+        .border_style(if pending.decision.destructive {
+            theme.error()
         } else {
-            style(app, Color::Yellow, Modifier::empty())
-        },
-    );
-    let paragraph = Paragraph::new(text)
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((app.diff_scroll as u16, 0));
-    frame.render_widget(paragraph, popup);
-}
-
-fn draw_palette(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let popup = centered(area, 50, 40);
-    frame.render_widget(Clear, popup);
-    let items: Vec<ListItem<'_>> = PALETTE
-        .iter()
-        .enumerate()
-        .map(|(index, (name, description))| {
-            let marker = if index == app.palette_index { ">" } else { " " };
-            ListItem::new(format!("{marker} {name:<9} {description}"))
+            theme.accent()
+        })
+        .style(theme.raised());
+    let lines: Vec<Line<'static>> = crate::tui::app::sanitize(&text)
+        .lines()
+        .map(|line| {
+            let style = if line.starts_with('+') {
+                theme.success()
+            } else if line.starts_with('-') {
+                theme.error()
+            } else {
+                theme.text()
+            };
+            Line::from(Span::styled(line.to_owned(), style))
         })
         .collect();
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" command palette (Enter runs, Esc closes) "),
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((app.diff_scroll as u16, 0)),
+        target,
     );
-    frame.render_widget(list, popup);
-}
-
-fn draw_sessions(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let popup = centered(area, 70, 60);
-    frame.render_widget(Clear, popup);
-    let items: Vec<ListItem<'_>> = if app.sessions.is_empty() {
-        vec![ListItem::new("no sessions yet")]
-    } else {
-        app.sessions
-            .iter()
-            .enumerate()
-            .map(|(index, session)| {
-                let marker = if index == app.session_index { ">" } else { " " };
-                ListItem::new(format!(
-                    "{marker} {:<24} {:?} {}",
-                    session.name,
-                    session.phase,
-                    session.updated_at.format("%Y-%m-%d %H:%M")
-                ))
-            })
-            .collect()
-    };
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" sessions (Enter resumes, Esc closes) "),
-    );
-    frame.render_widget(list, popup);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tui::app::StatusBar;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
-
-    #[test]
-    fn wrapping_and_rendering_without_a_terminal() {
-        let mut app = App::new(StatusBar::default(), false);
-        app.push(EntryKind::User, "a".repeat(30));
-        app.push(EntryKind::Assistant, "line one\nline two");
-        let lines = transcript_lines(&app, 20);
-        assert!(lines.len() >= 5);
-        let backend = TestBackend::new(40, 12);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
-        let rendered = terminal.backend().buffer().clone();
-        let text: String = rendered.content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("transcript"));
-        assert!(text.contains("prompt"));
-    }
 }

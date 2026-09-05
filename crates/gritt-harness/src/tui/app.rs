@@ -1,14 +1,32 @@
 //! Full-screen state and its reducers. Everything here is plain data so
-//! the key handling and transcript logic run under `cargo test`.
+//! the key handling, command dispatch, and transcript logic run under
+//! `cargo test` without a terminal.
+//!
+//! The state is a client of the control plane and nothing more: it holds
+//! the choices a user has made and the values the harness handed it. It
+//! never resolves a model, reads a config file, or opens a session.
+
+use std::cell::RefCell;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use gritt_core::connector::ConnectorId;
 use gritt_core::event::{
     ApprovalDecision, ApprovalRequest, Event, EventKind, SessionStatus, Usage,
 };
+use gritt_core::mcp::McpServerSnapshot;
+use gritt_core::provider::{ModelInfo, Protocol, ReasoningEffort};
 use gritt_core::session::{Phase, Session, SessionId};
+use ratatui::text::Line;
 
+use super::command::{self, Command, Parsed};
+use super::composer::Composer;
+use super::picker::{ListStatus, Picker, PickerRow};
+use super::sidebar::{self, SidebarModel, SidebarPlacement};
+use super::theme::Theme;
+use crate::draft::{CatalogState, SessionDraft};
 use crate::modes::print::describe_call;
 use crate::policy::Decision;
+use crate::setup::{ConfigDestination, CredentialState, ProfileSummary};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -23,9 +41,57 @@ pub enum EntryKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub kind: EntryKind,
+    /// The compact one-line form for a tool row, the whole message for
+    /// everything else.
     pub text: String,
+    /// Tool output, shown when `/details` is on.
+    pub detail: Option<String>,
 }
 
+impl Entry {
+    pub fn new(kind: EntryKind, text: impl Into<String>) -> Self {
+        Self {
+            kind,
+            text: sanitize(&text.into()),
+            detail: None,
+        }
+    }
+}
+
+/// Replaces control characters that a terminal would act on with a
+/// visible placeholder, so an escape sequence in tool or model output is
+/// rendered rather than executed. Tabs and newlines are kept.
+pub fn sanitize(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\n' | '\t' => c,
+            '\u{1b}' => '␛',
+            c if c.is_control() => '·',
+            c => c,
+        })
+        .collect()
+}
+
+/// Which of the two main compositions is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// Centered wordmark and composer, before the first submission.
+    Home,
+    /// Header, transcript, sidebar column, composer, footer.
+    Conversation,
+}
+
+/// What has the keyboard when no overlay is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Focus {
+    #[default]
+    Composer,
+    Transcript,
+    Sidebar,
+}
+
+/// Kept for the existing runtime and PTY tests, which name the palette,
+/// session list, and diff views.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Transcript,
@@ -50,6 +116,8 @@ pub struct StatusBar {
     pub phase: String,
     pub usage: Usage,
     pub connection: String,
+    pub workspace: String,
+    pub effort: ReasoningEffort,
 }
 
 /// What the runtime should do after a key.
@@ -65,64 +133,331 @@ pub enum Action {
     RefreshSessions,
 }
 
-pub const PALETTE: [(&str, &str); 6] = [
-    ("plan", "Switch to the planning phase"),
-    ("code", "Switch to the coding phase"),
-    ("sessions", "List and resume sessions"),
-    ("cancel", "Cancel the running turn"),
-    ("clear", "Clear the transcript view"),
-    ("quit", "Quit Gritt"),
-];
+/// An installed external agent as the connection dialog sees it. The
+/// connector owns its own model and permissions (ADR-010); this is only
+/// what Gritt can honestly report about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSummary {
+    pub id: ConnectorId,
+    pub name: String,
+    pub installed: bool,
+    pub version: Option<String>,
+    /// `None` when the agent does not report an auth state.
+    pub authenticated: Option<bool>,
+}
+
+/// The catalog for the selected profile, as a picker shows it.
+#[derive(Debug, Clone, Default)]
+pub struct ModelCatalogView {
+    pub profile: String,
+    pub models: Vec<ModelInfo>,
+    pub state: Option<CatalogState>,
+    /// A refresh is in flight.
+    pub loading: bool,
+}
+
+/// Which searchable list an overlay is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerKind {
+    Commands,
+    Connect,
+    Models,
+    Effort,
+    Sessions,
+    Mcp,
+}
+
+/// Which field of the provider setup form has the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupField {
+    Name,
+    BaseUrl,
+    EnvVar,
+    Secret,
+}
+
+impl SetupField {
+    pub const ORDER: [SetupField; 4] = [
+        SetupField::Name,
+        SetupField::BaseUrl,
+        SetupField::EnvVar,
+        SetupField::Secret,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SetupField::Name => "profile name",
+            SetupField::BaseUrl => "endpoint",
+            SetupField::EnvVar => "key variable",
+            SetupField::Secret => "API key",
+        }
+    }
+
+    /// The key field is echoed as dots and never reaches the transcript.
+    pub fn is_secret(self) -> bool {
+        self == SetupField::Secret
+    }
+}
+
+/// The provider setup screens. In this step it is an overlay over fixture
+/// state: nothing here writes a config file or a keychain entry.
+#[derive(Debug, Clone)]
+pub struct SetupForm {
+    pub name: Composer,
+    pub base_url: Composer,
+    pub env_var: Composer,
+    secret: Composer,
+    pub field_index: usize,
+    pub destination: ConfigDestination,
+    /// The outcome line shown after an attempted save.
+    pub outcome: Option<String>,
+}
+
+impl Default for SetupForm {
+    fn default() -> Self {
+        SetupForm::for_profile("")
+    }
+}
+
+impl SetupForm {
+    pub fn for_profile(name: &str) -> Self {
+        Self {
+            name: Composer::from_text(name),
+            base_url: Composer::new(),
+            env_var: Composer::from_text(format!(
+                "{}_API_KEY",
+                name.to_ascii_uppercase().replace('-', "_")
+            )),
+            secret: Composer::new(),
+            field_index: 1,
+            destination: ConfigDestination::User,
+            outcome: None,
+        }
+    }
+
+    pub fn field(&self) -> SetupField {
+        SetupField::ORDER[self.field_index % SetupField::ORDER.len()]
+    }
+
+    /// The number of characters typed into the key field. The value
+    /// itself has no accessor, so it cannot reach a transcript or a log.
+    pub fn secret_len(&self) -> usize {
+        self.secret.text().chars().count()
+    }
+
+    fn current(&mut self) -> &mut Composer {
+        match self.field() {
+            SetupField::Name => &mut self.name,
+            SetupField::BaseUrl => &mut self.base_url,
+            SetupField::EnvVar => &mut self.env_var,
+            SetupField::Secret => &mut self.secret,
+        }
+    }
+
+    fn next_field(&mut self) {
+        self.field_index = (self.field_index + 1) % SetupField::ORDER.len();
+    }
+
+    fn previous_field(&mut self) {
+        self.field_index =
+            (self.field_index + SetupField::ORDER.len() - 1) % SetupField::ORDER.len();
+    }
+}
+
+/// A modal explanation with no choice to make beyond acknowledging it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub title: String,
+    pub body: String,
+    /// Set when the notice is the "this needs a new session" explanation.
+    pub is_error: bool,
+}
+
+/// Everything that can sit above the main layout, most recent last.
+#[derive(Debug, Clone)]
+pub enum Overlay {
+    Picker {
+        kind: PickerKind,
+        picker: Picker,
+    },
+    Setup(SetupForm),
+    Notice(Notice),
+    Help {
+        scroll: usize,
+    },
+    /// The narrow-terminal form of the sidebar. Closing it restores the
+    /// focus and the scroll position it covered.
+    Drawer {
+        scroll: usize,
+        restore_focus: Focus,
+        restore_scroll: usize,
+    },
+}
+
+impl Overlay {
+    pub fn picker_kind(&self) -> Option<PickerKind> {
+        match self {
+            Overlay::Picker { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct LayoutCache {
+    width: usize,
+    revision: u64,
+    lines: Vec<Line<'static>>,
+}
 
 #[derive(Debug)]
 pub struct App {
     pub entries: Vec<Entry>,
-    pub input: String,
-    pub cursor: usize,
+    pub composer: Composer,
     pub status: StatusBar,
     pub pending: Option<PendingApproval>,
     pub view: View,
-    pub palette_index: usize,
+    pub overlays: Vec<Overlay>,
+    pub focus: Focus,
     pub sessions: Vec<Session>,
-    pub session_index: usize,
     /// Lines scrolled up from the bottom of the transcript.
     pub scroll: usize,
     pub diff_scroll: usize,
+    /// True while the viewport sits at the bottom and follows streaming.
+    pub follow: bool,
+    /// Set when output arrived while the reader was scrolled up.
+    pub new_output: bool,
     pub running: bool,
     pub quit: bool,
-    pub color: bool,
+    pub theme: Theme,
     pub notice: Option<String>,
+    /// `/details`: tool rows show their output.
+    pub tool_details: bool,
+    /// The user's `/sidebar` choice on a wide terminal.
+    pub sidebar_enabled: bool,
+    pub sidebar: SidebarModel,
+    pub sidebar_scroll: usize,
+    /// Fixture mode label, shown in the interface so a screenshot can
+    /// never be mistaken for live data.
+    pub fixture: Option<String>,
+    /// Highlighted `/` suggestion.
+    pub suggestion_index: usize,
+    suggestions_dismissed: bool,
+    /// The keyboard copy target, filled by Ctrl-Y.
+    pub clipboard: Option<String>,
+    // Session-draft state the pickers read and write.
+    pub draft: SessionDraft,
+    pub profiles: Vec<ProfileSummary>,
+    pub agents: Vec<AgentSummary>,
+    pub catalog: ModelCatalogView,
+    /// True once the current session has history, which pins its provider
+    /// and model until a new session is started.
+    pub session_pinned: bool,
+    pub mcp: Vec<McpServerSnapshot>,
     assistant_open: bool,
+    revision: u64,
+    cache: RefCell<LayoutCache>,
 }
 
 impl App {
-    pub fn new(status: StatusBar, color: bool) -> Self {
+    pub fn new(status: StatusBar, theme: Theme) -> Self {
         Self {
             entries: Vec::new(),
-            input: String::new(),
-            cursor: 0,
+            composer: Composer::new(),
             status,
             pending: None,
             view: View::Transcript,
-            palette_index: 0,
+            overlays: Vec::new(),
+            focus: Focus::Composer,
             sessions: Vec::new(),
-            session_index: 0,
             scroll: 0,
             diff_scroll: 0,
+            follow: true,
+            new_output: false,
             running: false,
             quit: false,
-            color,
+            theme,
             notice: None,
+            tool_details: false,
+            sidebar_enabled: true,
+            sidebar: SidebarModel::default(),
+            sidebar_scroll: 0,
+            fixture: None,
+            suggestion_index: 0,
+            suggestions_dismissed: false,
+            clipboard: None,
+            draft: SessionDraft::default(),
+            profiles: Vec::new(),
+            agents: Vec::new(),
+            catalog: ModelCatalogView::default(),
+            session_pinned: false,
+            mcp: Vec::new(),
             assistant_open: false,
+            revision: 0,
+            cache: RefCell::new(LayoutCache::default()),
         }
     }
 
+    /// The composition for this frame. The home screen is what an empty
+    /// transcript shows, so `/new` returns to it.
+    pub fn layout(&self) -> Layout {
+        if self.entries.is_empty() {
+            Layout::Home
+        } else {
+            Layout::Conversation
+        }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        !self.status.profile.is_empty()
+    }
+
+    /// Where the sidebar goes at this terminal width.
+    pub fn sidebar_placement(&self, width: u16) -> SidebarPlacement {
+        let drawer = matches!(self.overlays.last(), Some(Overlay::Drawer { .. }));
+        sidebar::placement(width, self.sidebar_enabled, drawer)
+    }
+
+    pub fn top_overlay(&self) -> Option<&Overlay> {
+        self.overlays.last()
+    }
+
+    /// `/` suggestions, open only when nothing above them is.
+    pub fn suggestions(&self) -> Vec<&'static command::CommandSpec> {
+        if self.suggestions_dismissed || self.pending.is_some() || !self.overlays.is_empty() {
+            return Vec::new();
+        }
+        if self.focus != Focus::Composer {
+            return Vec::new();
+        }
+        match command::suggestion_query(self.composer.text()) {
+            Some(query) => command::search(query),
+            None => Vec::new(),
+        }
+    }
+
+    // -- transcript -----------------------------------------------------
+
     pub fn push(&mut self, kind: EntryKind, text: impl Into<String>) {
-        self.entries.push(Entry {
-            kind,
-            text: text.into(),
-        });
+        self.entries.push(Entry::new(kind, text));
         self.assistant_open = kind == EntryKind::Assistant;
+        self.touch();
+    }
+
+    fn push_entry(&mut self, entry: Entry) {
+        self.assistant_open = entry.kind == EntryKind::Assistant;
+        self.entries.push(entry);
+        self.touch();
+    }
+
+    fn touch(&mut self) {
+        self.revision += 1;
+        if self.follow {
+            self.scroll = 0;
+            self.new_output = false;
+        } else {
+            self.new_output = true;
+        }
     }
 
     /// Replays stored events into the transcript on resume.
@@ -132,6 +467,9 @@ impl App {
         }
         self.assistant_open = false;
         self.running = false;
+        self.follow = true;
+        self.scroll = 0;
+        self.new_output = false;
     }
 
     pub fn on_event(&mut self, event: &Event) {
@@ -139,12 +477,12 @@ impl App {
             EventKind::TextDelta { text } => {
                 if self.assistant_open {
                     if let Some(last) = self.entries.last_mut() {
-                        last.text.push_str(text);
+                        last.text.push_str(&sanitize(text));
                     }
+                    self.touch();
                 } else {
                     self.push(EntryKind::Assistant, text.clone());
                 }
-                self.scroll = 0;
             }
             EventKind::ReasoningSummary { text } => self.push(EntryKind::Reasoning, text.clone()),
             EventKind::ToolCall { call } => {
@@ -155,7 +493,7 @@ impl App {
             }
             EventKind::ToolResult { result } => {
                 let first = result.output.lines().next().unwrap_or_default();
-                self.push(
+                let mut entry = Entry::new(
                     EntryKind::Tool,
                     format!(
                         "<- {} {} {}",
@@ -166,6 +504,10 @@ impl App {
                     .trim_end()
                     .to_owned(),
                 );
+                if !result.output.is_empty() {
+                    entry.detail = Some(sanitize(&result.output));
+                }
+                self.push_entry(entry);
             }
             EventKind::ApprovalRequested { request } => {
                 self.push(
@@ -185,9 +527,12 @@ impl App {
                     Some(total.input_tokens.unwrap_or(0) + usage.input_tokens.unwrap_or(0));
                 total.output_tokens =
                     Some(total.output_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0));
+                self.sidebar.usage.input_tokens = total.input_tokens;
+                self.sidebar.usage.output_tokens = total.output_tokens;
             }
             EventKind::StatusChanged { status } => {
                 self.status.connection = format!("{status:?}");
+                self.sidebar.session.activity = Some(format!("{status:?}").to_lowercase());
                 if let Some(phase) = event
                     .diagnostic
                     .as_ref()
@@ -195,6 +540,7 @@ impl App {
                     .and_then(|p| p.as_str())
                 {
                     self.status.phase = phase.to_owned();
+                    self.sidebar.session.phase = Some(phase.to_owned());
                 }
                 if matches!(
                     status,
@@ -225,152 +571,427 @@ impl App {
         }
     }
 
+    /// Wrapped transcript lines for `width`, rebuilt only when the width
+    /// or the transcript changed. Long sessions do not re-wrap on every
+    /// frame.
+    pub fn transcript_lines(
+        &self,
+        width: usize,
+        render: impl Fn(&App, usize) -> Vec<Line<'static>>,
+    ) -> Vec<Line<'static>> {
+        {
+            let cache = self.cache.borrow();
+            if cache.width == width && cache.revision == self.revision && !cache.lines.is_empty() {
+                return cache.lines.clone();
+            }
+        }
+        let lines = render(self, width);
+        let mut cache = self.cache.borrow_mut();
+        cache.width = width;
+        cache.revision = self.revision;
+        cache.lines = lines.clone();
+        lines
+    }
+
+    /// True when the cached wrap is reusable, for the cache test.
+    pub fn layout_cache_hit(&self, width: usize) -> bool {
+        let cache = self.cache.borrow();
+        cache.width == width && cache.revision == self.revision && !cache.lines.is_empty()
+    }
+
     pub fn request_approval(&mut self, pending: PendingApproval) {
         self.diff_scroll = 0;
         self.pending = Some(pending);
     }
 
-    fn insert_char(&mut self, c: char) {
-        self.input.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
-    }
+    // -- picker construction -------------------------------------------
 
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let previous = self.input[..self.cursor]
-            .chars()
-            .next_back()
-            .map(char::len_utf8)
-            .unwrap_or(1);
-        self.cursor -= previous;
-        self.input.remove(self.cursor);
-    }
-
-    fn move_left(&mut self) {
-        if let Some(c) = self.input[..self.cursor].chars().next_back() {
-            self.cursor -= c.len_utf8();
-        }
-    }
-
-    fn move_right(&mut self) {
-        if let Some(c) = self.input[self.cursor..].chars().next() {
-            self.cursor += c.len_utf8();
-        }
-    }
-
-    /// The reducer. Overlays take keys first; the transcript view edits
-    /// the prompt.
-    pub fn on_key(&mut self, key: KeyEvent) -> Action {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if self.pending.is_some() {
-            return self.approval_key(key);
-        }
-        match self.view {
-            View::Palette => return self.palette_key(key),
-            View::Sessions => return self.sessions_key(key),
-            View::Diff => {
-                self.view = View::Transcript;
-                return Action::None;
-            }
-            View::Transcript => {}
-        }
-        match (key.code, ctrl) {
-            (KeyCode::Char('c'), true) => {
-                if self.running {
-                    Action::Cancel
-                } else {
-                    self.quit = true;
-                    Action::Quit
+    /// The grouped connection dialog: configured provider profiles and
+    /// installed agents, each row saying which it is.
+    pub fn connection_picker(&self) -> Picker {
+        let mut rows = Vec::new();
+        for profile in &self.profiles {
+            let credential = match &profile.credential {
+                CredentialState::Available => "key available".to_owned(),
+                CredentialState::Missing { env_var_name } => {
+                    format!("no key; set {env_var_name} or run setup")
                 }
+            };
+            let catalog = match &self.catalog.state {
+                Some(state) if self.catalog.profile == profile.name => catalog_word(state),
+                _ => "catalog not loaded",
+            };
+            rows.push(
+                PickerRow::new(format!("profile:{}", profile.name), profile.name.clone())
+                    .group("AI providers")
+                    .detail(profile.base_url.clone())
+                    .badge(protocol_word(profile.protocol).to_owned())
+                    .note(format!("{credential} · {catalog}"))
+                    .current(self.draft.profile.as_deref() == Some(profile.name.as_str())),
+            );
+        }
+        for agent in &self.agents {
+            let auth = match agent.authenticated {
+                Some(true) => "signed in",
+                Some(false) => "not signed in",
+                None => "auth state not reported",
+            };
+            let mut row = PickerRow::new(format!("agent:{}", agent.name), agent.name.clone())
+                .group("Installed agents")
+                .detail(
+                    agent
+                        .version
+                        .clone()
+                        .unwrap_or_else(|| "version unknown".into()),
+                )
+                .badge(if agent.installed {
+                    "installed"
+                } else {
+                    "not installed"
+                })
+                // ADR-010: the agent keeps its own model, effort, and
+                // permissions. Gritt does not offer to change them.
+                .note(format!("{auth} · Managed by agent"));
+            if !agent.installed {
+                row = row.unavailable("install this agent to select it");
             }
-            (KeyCode::Char('q'), true) => {
+            rows.push(row);
+        }
+        Picker::new("Connect", rows)
+            .with_hint("Selecting does not install software or start a sign-in")
+    }
+
+    /// The model picker for the drafted profile. A profile with no key
+    /// gets a setup row, which is the `/models` to provider-setup round
+    /// trip.
+    pub fn model_picker(&self) -> Picker {
+        let mut rows = Vec::new();
+        let profile = self.draft.profile.clone().unwrap_or_default();
+        if let Some(summary) = self.profiles.iter().find(|p| p.name == profile) {
+            if let CredentialState::Missing { env_var_name } = &summary.credential {
+                rows.push(
+                    PickerRow::new("__setup__", format!("Set up {profile}…"))
+                        .detail(format!("no key found; {env_var_name} is unset"))
+                        .badge("setup"),
+                );
+            }
+        }
+        for model in &self.catalog.models {
+            let label = model
+                .display_name
+                .clone()
+                .unwrap_or_else(|| model.id.clone());
+            let mut row = PickerRow::new(model.id.clone(), label)
+                .detail(model.id.clone())
+                .badge(profile.clone())
+                .current(self.draft.model.as_deref() == Some(model.id.as_str()));
+            if model.deprecated {
+                row = row.note(match &model.replaced_by {
+                    Some(replacement) => format!("deprecated; replaced by {replacement}"),
+                    None => "deprecated".into(),
+                });
+            }
+            rows.push(row);
+        }
+        let status = if self.catalog.loading {
+            ListStatus::Loading {
+                what: profile.clone(),
+            }
+        } else {
+            match &self.catalog.state {
+                Some(CatalogState::Stale { .. }) => ListStatus::Failed {
+                    reason: "the refresh failed; showing the last cached list".into(),
+                    cached: true,
+                },
+                Some(CatalogState::Missing { reason }) => ListStatus::Failed {
+                    reason: reason.clone(),
+                    cached: false,
+                },
+                Some(CatalogState::RefreshFailed { reason }) => ListStatus::Failed {
+                    reason: reason.clone(),
+                    cached: false,
+                },
+                _ => ListStatus::Ready,
+            }
+        };
+        Picker::new(format!("Models · {profile}"), rows)
+            .with_hint(match &self.catalog.state {
+                Some(state) => catalog_word(state).to_owned(),
+                None => "catalog not loaded".to_owned(),
+            })
+            .with_status(status)
+    }
+
+    /// The effort picker: `Model default` plus only the levels the
+    /// adapter has a verified mapping for on this model.
+    pub fn effort_picker(&self) -> Picker {
+        let protocol = self
+            .draft
+            .profile
+            .as_deref()
+            .and_then(|name| self.profiles.iter().find(|p| p.name == name))
+            .map(|profile| profile.protocol);
+        let capabilities = self
+            .draft
+            .model
+            .as_deref()
+            .and_then(|id| self.catalog.models.iter().find(|model| model.id == id))
+            .map(|model| &model.capabilities);
+        let selected = self.draft.effort.unwrap_or_default();
+        let mut rows = vec![PickerRow::new("auto", "Model default")
+            .detail("no explicit effort is sent")
+            .badge("auto")
+            .current(selected == ReasoningEffort::Auto)];
+        for level in ReasoningEffort::EXPLICIT {
+            let mut row = PickerRow::new(level.as_str(), level.as_str())
+                .badge(level.as_str().to_owned())
+                .current(selected == level);
+            match protocol {
+                Some(protocol) => {
+                    // One rule for the adapter and the picker: the
+                    // provider crate decides, the TUI only displays.
+                    if let gritt_provider::effort::EffortSupport::Unsupported(reason) =
+                        gritt_provider::effort::effort_support(protocol, capabilities, level)
+                    {
+                        row = row.unavailable(format!(
+                            "this model does not support {}",
+                            reason.describe()
+                        ));
+                    }
+                }
+                None => row = row.unavailable("choose a provider first"),
+            }
+            rows.push(row);
+        }
+        Picker::new("Effort", rows)
+            .with_hint("Effort applies to native turns and can change between them")
+    }
+
+    pub fn session_picker(&self) -> Picker {
+        let rows: Vec<PickerRow> = self
+            .sessions
+            .iter()
+            .map(|session| {
+                PickerRow::new(session.id.0.clone(), session.name.clone())
+                    .detail(session.updated_at.format("%Y-%m-%d %H:%M").to_string())
+                    .badge(match session.phase {
+                        Phase::Planning => "planning".into(),
+                        Phase::Coding => "coding".to_owned(),
+                    })
+                    .current(session.name == self.status.session)
+            })
+            .collect();
+        Picker::new("Sessions", rows).with_hint("Enter resumes; the draft is kept")
+    }
+
+    pub fn mcp_picker(&self) -> Picker {
+        let rows: Vec<PickerRow> = self
+            .mcp
+            .iter()
+            .map(|server| {
+                let word = sidebar::mcp_state_word(&server.state);
+                let mut row = PickerRow::new(server.name.clone(), server.name.clone())
+                    .badge(word.to_owned())
+                    .detail(if server.state.is_ready() {
+                        format!("{} tools", server.tool_count)
+                    } else {
+                        String::new()
+                    })
+                    .note(server.state.explain());
+                if !server.state.is_ready() {
+                    row = row.unavailable(word.to_owned());
+                }
+                row
+            })
+            .collect();
+        Picker::new("MCP servers", rows)
+            .with_hint("Every configured entry is listed, whatever its state")
+    }
+
+    fn command_picker(&self) -> Picker {
+        let rows: Vec<PickerRow> = command::COMMANDS
+            .iter()
+            .map(|spec| {
+                PickerRow::new(spec.name, format!("/{}", spec.name))
+                    .detail(spec.summary.to_owned())
+                    .badge(spec.shortcut.unwrap_or_default().to_owned())
+            })
+            .collect();
+        Picker::new("Commands", rows).with_hint("The same registry as / and the shortcuts")
+    }
+
+    // -- command dispatch ----------------------------------------------
+
+    fn open_picker(&mut self, kind: PickerKind) {
+        let picker = match kind {
+            PickerKind::Commands => self.command_picker(),
+            PickerKind::Connect => self.connection_picker(),
+            PickerKind::Models => self.model_picker(),
+            PickerKind::Effort => self.effort_picker(),
+            PickerKind::Sessions => self.session_picker(),
+            PickerKind::Mcp => self.mcp_picker(),
+        };
+        self.overlays.push(Overlay::Picker { kind, picker });
+    }
+
+    /// Runs a registry command. Every entry point — `/` submission, the
+    /// palette, and a shortcut — comes through here.
+    pub fn dispatch(&mut self, cmd: Command, argument: Option<String>) -> Action {
+        self.notice = None;
+        self.suggestions_dismissed = false;
+        match cmd {
+            Command::Connect => {
+                self.open_picker(PickerKind::Connect);
+                Action::None
+            }
+            Command::Models => {
+                if self.draft.profile.is_none() {
+                    self.notice = Some("choose a provider with /connect first".into());
+                    self.open_picker(PickerKind::Connect);
+                    return Action::None;
+                }
+                self.open_picker(PickerKind::Models);
+                Action::None
+            }
+            Command::Effort => {
+                self.open_picker(PickerKind::Effort);
+                Action::None
+            }
+            Command::Plan => {
+                self.status.phase = "planning".into();
+                Action::SetPhase(Phase::Planning)
+            }
+            Command::Code => {
+                self.status.phase = "coding".into();
+                Action::SetPhase(Phase::Coding)
+            }
+            Command::Sessions => {
+                self.view = View::Sessions;
+                self.open_picker(PickerKind::Sessions);
+                if let Some(name) = argument {
+                    if let Some(Overlay::Picker { picker, .. }) = self.overlays.last_mut() {
+                        for c in name.chars() {
+                            picker.type_char(c);
+                        }
+                    }
+                }
+                Action::RefreshSessions
+            }
+            Command::New => {
+                // A fresh draft, not a deleted session: the transcript
+                // view is cleared and the composer draft is kept.
+                self.entries.clear();
+                self.revision += 1;
+                self.scroll = 0;
+                self.follow = true;
+                self.new_output = false;
+                self.session_pinned = false;
+                self.sidebar.reset();
+                self.notice = Some("new draft; the previous session is still listed".into());
+                Action::None
+            }
+            Command::Details => {
+                self.tool_details = !self.tool_details;
+                self.revision += 1;
+                Action::None
+            }
+            Command::Sidebar => {
+                self.toggle_sidebar();
+                Action::None
+            }
+            Command::Mcp => {
+                self.open_picker(PickerKind::Mcp);
+                Action::None
+            }
+            Command::Help => {
+                self.overlays.push(Overlay::Help { scroll: 0 });
+                Action::None
+            }
+            Command::Quit => {
                 self.quit = true;
                 Action::Quit
             }
-            (KeyCode::Char('p'), true) => {
-                self.view = View::Palette;
-                self.palette_index = 0;
-                Action::None
+        }
+    }
+
+    /// `/sidebar`. On a wide terminal it toggles the column; on a narrow
+    /// one it opens the drawer, which restores focus and scroll on close.
+    fn toggle_sidebar(&mut self) {
+        if let Some(position) = self
+            .overlays
+            .iter()
+            .position(|overlay| matches!(overlay, Overlay::Drawer { .. }))
+        {
+            self.close_drawer(position);
+            return;
+        }
+        if self.sidebar_enabled {
+            self.sidebar_enabled = false;
+            // The column is off; a narrow terminal gets the drawer.
+            self.overlays.push(Overlay::Drawer {
+                scroll: self.sidebar_scroll,
+                restore_focus: self.focus,
+                restore_scroll: self.scroll,
+            });
+        } else {
+            self.sidebar_enabled = true;
+            self.overlays.push(Overlay::Drawer {
+                scroll: self.sidebar_scroll,
+                restore_focus: self.focus,
+                restore_scroll: self.scroll,
+            });
+        }
+    }
+
+    fn close_drawer(&mut self, position: usize) {
+        if let Overlay::Drawer {
+            restore_focus,
+            restore_scroll,
+            ..
+        } = self.overlays.remove(position)
+        {
+            self.focus = restore_focus;
+            self.scroll = restore_scroll;
+        }
+    }
+
+    // -- the reducer ----------------------------------------------------
+
+    /// Overlay priority, top first: an approval, then the overlay stack,
+    /// then `/` suggestions, then the focused pane.
+    pub fn on_key(&mut self, key: KeyEvent) -> Action {
+        if self.pending.is_some() {
+            return self.approval_key(key);
+        }
+        if !self.overlays.is_empty() {
+            return self.overlay_key(key);
+        }
+        if !self.suggestions().is_empty() {
+            if let Some(action) = self.suggestion_key(key) {
+                return action;
             }
-            (KeyCode::Char('s'), true) => {
-                self.view = View::Sessions;
-                self.session_index = 0;
-                Action::RefreshSessions
+        }
+        self.main_key(key)
+    }
+
+    /// Bracketed paste from the runtime. Pasted text is always text.
+    pub fn on_paste(&mut self, pasted: &str) {
+        if self.pending.is_some() {
+            return;
+        }
+        match self.overlays.last_mut() {
+            Some(Overlay::Picker { picker, .. }) => picker.paste(pasted),
+            Some(Overlay::Setup(form)) => {
+                let first = pasted.lines().next().unwrap_or_default().to_owned();
+                form.current().insert_paste(&first);
             }
-            (KeyCode::Char('j'), true) => {
-                self.insert_char('\n');
-                Action::None
+            Some(_) => {}
+            None => {
+                self.composer.insert_paste(pasted);
+                // A pasted line beginning with `/` must not open the
+                // suggestion list and must not run on submit.
+                self.suggestions_dismissed = self.composer.is_multiline();
             }
-            (KeyCode::Esc, _) => {
-                if self.running {
-                    Action::Cancel
-                } else {
-                    self.notice = None;
-                    Action::None
-                }
-            }
-            (KeyCode::Enter, _) => {
-                if key.modifiers.contains(KeyModifiers::SHIFT)
-                    || key.modifiers.contains(KeyModifiers::ALT)
-                {
-                    self.insert_char('\n');
-                    return Action::None;
-                }
-                if self.running {
-                    self.notice = Some("a turn is running; Esc cancels it".into());
-                    return Action::None;
-                }
-                let prompt = self.input.trim().to_owned();
-                if prompt.is_empty() {
-                    return Action::None;
-                }
-                self.input.clear();
-                self.cursor = 0;
-                self.push(EntryKind::User, prompt.clone());
-                self.running = true;
-                self.assistant_open = false;
-                self.scroll = 0;
-                Action::Submit(prompt)
-            }
-            (KeyCode::Backspace, _) => {
-                self.backspace();
-                Action::None
-            }
-            (KeyCode::Left, _) => {
-                self.move_left();
-                Action::None
-            }
-            (KeyCode::Right, _) => {
-                self.move_right();
-                Action::None
-            }
-            (KeyCode::Home, _) => {
-                self.cursor = 0;
-                Action::None
-            }
-            (KeyCode::End, _) => {
-                self.cursor = self.input.len();
-                Action::None
-            }
-            (KeyCode::PageUp, _) => {
-                self.scroll = self.scroll.saturating_add(10);
-                Action::None
-            }
-            (KeyCode::PageDown, _) => {
-                self.scroll = self.scroll.saturating_sub(10);
-                Action::None
-            }
-            (KeyCode::Char(c), false) => {
-                self.insert_char(c);
-                Action::None
-            }
-            (KeyCode::Tab, _) => {
-                self.insert_char('\t');
-                Action::None
-            }
-            _ => Action::None,
         }
     }
 
@@ -414,241 +1035,552 @@ impl App {
         }
     }
 
-    fn palette_key(&mut self, key: KeyEvent) -> Action {
+    fn suggestion_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let count = self.suggestions().len();
         match key.code {
+            KeyCode::Down => {
+                self.suggestion_index = (self.suggestion_index + 1) % count;
+                Some(Action::None)
+            }
+            KeyCode::Up => {
+                self.suggestion_index = (self.suggestion_index + count - 1) % count;
+                Some(Action::None)
+            }
             KeyCode::Esc => {
-                self.view = View::Transcript;
-                Action::None
+                self.suggestions_dismissed = true;
+                Some(Action::None)
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.palette_index = (self.palette_index + 1) % PALETTE.len();
-                Action::None
+            KeyCode::Tab => {
+                // Tab completes the highlighted suggestion instead of
+                // moving focus while the list is open.
+                let name = self.suggestions()[self.suggestion_index].name;
+                self.composer.set_text(format!("/{name}"));
+                Some(Action::None)
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.palette_index = (self.palette_index + PALETTE.len() - 1) % PALETTE.len();
-                Action::None
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                let command = self.suggestions()[self.suggestion_index].command;
+                self.composer.clear();
+                self.suggestion_index = 0;
+                Some(self.dispatch(command, None))
             }
-            KeyCode::Enter => {
-                self.view = View::Transcript;
-                match PALETTE[self.palette_index].0 {
-                    "plan" => Action::SetPhase(Phase::Planning),
-                    "code" => Action::SetPhase(Phase::Coding),
-                    "sessions" => {
-                        self.view = View::Sessions;
-                        self.session_index = 0;
-                        Action::RefreshSessions
+            _ => None,
+        }
+    }
+
+    fn overlay_key(&mut self, key: KeyEvent) -> Action {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if key.code == KeyCode::Esc {
+            let position = self.overlays.len() - 1;
+            if matches!(self.overlays[position], Overlay::Drawer { .. }) {
+                self.close_drawer(position);
+            } else {
+                self.overlays.pop();
+            }
+            return Action::None;
+        }
+        match self.overlays.last_mut() {
+            Some(Overlay::Help { scroll }) => {
+                match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => *scroll += 1,
+                    KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                    KeyCode::Enter => {
+                        self.overlays.pop();
                     }
-                    "cancel" => Action::Cancel,
-                    "clear" => {
-                        self.entries.clear();
-                        Action::None
-                    }
-                    _ => {
-                        self.quit = true;
-                        Action::Quit
-                    }
+                    _ => {}
                 }
+                Action::None
+            }
+            Some(Overlay::Drawer { scroll, .. }) => {
+                match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => *scroll += 1,
+                    KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                    _ => {}
+                }
+                self.sidebar_scroll = match self.overlays.last() {
+                    Some(Overlay::Drawer { scroll, .. }) => *scroll,
+                    _ => 0,
+                };
+                Action::None
+            }
+            Some(Overlay::Notice(_)) => {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                    self.overlays.pop();
+                }
+                Action::None
+            }
+            Some(Overlay::Setup(_)) => self.setup_key(key),
+            Some(Overlay::Picker { .. }) => self.picker_key(key, ctrl),
+            None => Action::None,
+        }
+    }
+
+    fn setup_key(&mut self, key: KeyEvent) -> Action {
+        let Some(Overlay::Setup(form)) = self.overlays.last_mut() else {
+            return Action::None;
+        };
+        match key.code {
+            KeyCode::Tab | KeyCode::Down => form.next_field(),
+            KeyCode::BackTab | KeyCode::Up => form.previous_field(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                form.current().insert_char(c)
+            }
+            KeyCode::Backspace => form.current().backspace(),
+            KeyCode::Left => form.current().move_left(false),
+            KeyCode::Right => form.current().move_right(false),
+            KeyCode::Enter => {
+                if form.field() == SetupField::Secret {
+                    // Fixture mode: nothing is written. The real writes
+                    // are the injected `ProviderSetup` service.
+                    let name = form.name.text().to_owned();
+                    form.outcome = Some(format!(
+                        "fixture: nothing was written. A real run would save `{name}` \
+                         to the user config and the key to the keychain."
+                    ));
+                } else {
+                    form.next_field();
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    fn picker_key(&mut self, key: KeyEvent, ctrl: bool) -> Action {
+        let Some(Overlay::Picker { kind, picker }) = self.overlays.last_mut() else {
+            return Action::None;
+        };
+        let kind = *kind;
+        match key.code {
+            KeyCode::Down => picker.move_down(),
+            KeyCode::Up => picker.move_up(),
+            KeyCode::PageDown => picker.page_down(10),
+            KeyCode::PageUp => picker.page_up(10),
+            KeyCode::Char('n') if ctrl => picker.move_down(),
+            KeyCode::Char('p') if ctrl => picker.move_up(),
+            KeyCode::Backspace => picker.backspace(),
+            // Typing filters, including j and k.
+            KeyCode::Char(c) if !ctrl => picker.type_char(c),
+            KeyCode::Tab => picker.move_down(),
+            KeyCode::Enter => return self.choose(kind),
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Applies the highlighted row of the top picker.
+    fn choose(&mut self, kind: PickerKind) -> Action {
+        let Some(Overlay::Picker { picker, .. }) = self.overlays.last() else {
+            return Action::None;
+        };
+        let Some(row) = picker.choose() else {
+            // An unavailable row explains itself instead of doing nothing.
+            if let Some(row) = picker.selected() {
+                self.notice = Some(row.availability.reason().to_owned());
+            }
+            return Action::None;
+        };
+        let id = row.id.clone();
+        match kind {
+            PickerKind::Commands => {
+                self.overlays.pop();
+                match command::lookup(&id) {
+                    Some(command) => self.dispatch(command, None),
+                    None => Action::None,
+                }
+            }
+            PickerKind::Connect => {
+                self.overlays.pop();
+                if let Some(profile) = id.strip_prefix("profile:") {
+                    self.select_profile(profile);
+                    self.open_picker(PickerKind::Models);
+                } else if let Some(agent) = id.strip_prefix("agent:") {
+                    self.overlays.push(Overlay::Notice(Notice {
+                        title: agent.to_string(),
+                        body: format!(
+                            "{agent} runs its own harness. Gritt supervises it and relays its \
+                             approvals; its model and effort are managed by the agent and are \
+                             not set here."
+                        ),
+                        is_error: false,
+                    }));
+                }
+                Action::None
+            }
+            PickerKind::Models => {
+                if id == "__setup__" {
+                    // The round trip: setup opens above the model picker,
+                    // so closing it returns with the search preserved.
+                    let profile = self.draft.profile.clone().unwrap_or_default();
+                    self.overlays
+                        .push(Overlay::Setup(SetupForm::for_profile(&profile)));
+                    return Action::None;
+                }
+                self.overlays.pop();
+                self.select_model(&id);
+                Action::None
+            }
+            PickerKind::Effort => {
+                self.overlays.pop();
+                if let Ok(effort) = id.parse::<ReasoningEffort>() {
+                    self.draft.effort = Some(effort);
+                    self.status.effort = effort;
+                    self.sidebar.model.effort = Some(effort.as_str().to_owned());
+                }
+                Action::None
+            }
+            PickerKind::Sessions => {
+                self.overlays.pop();
+                self.view = View::Transcript;
+                if self.running {
+                    self.notice = Some("finish or cancel the running turn first".into());
+                    return Action::None;
+                }
+                Action::Resume(SessionId(id))
+            }
+            PickerKind::Mcp => Action::None,
+        }
+    }
+
+    /// Selecting a provider clears the model, because a model belongs to
+    /// the profile it was chosen under.
+    pub fn select_profile(&mut self, profile: &str) {
+        let had_model = self.draft.model.clone();
+        self.draft = self.draft.clone().with_profile(profile);
+        if had_model.is_some() && self.draft.model.is_none() {
+            self.notice = Some(format!(
+                "the model was cleared: it belonged to another provider, not {profile}"
+            ));
+        }
+        if self.catalog.profile != profile {
+            // The previous profile's list is not this profile's list.
+            self.catalog = ModelCatalogView {
+                profile: profile.to_owned(),
+                ..ModelCatalogView::default()
+            };
+        }
+        self.sidebar.model.backend = Some(profile.to_owned());
+        self.sidebar.model.model = None;
+        self.revalidate_effort();
+    }
+
+    /// Selecting a model revalidates the effort against it and, on a
+    /// session that already has history, explains that the change needs a
+    /// new session instead of silently discarding context.
+    pub fn select_model(&mut self, model: &str) {
+        if self.session_pinned && self.status.model != model && !self.status.model.is_empty() {
+            self.overlays.push(Overlay::Notice(Notice {
+                title: "Changing the model needs a new session".into(),
+                body: format!(
+                    "This session is pinned to {} on {}. Gritt cannot move its stored \
+                     transcript and continuation state to {model}. Run /new to start a \
+                     session on the new model; this one stays in /sessions and your \
+                     composer draft is kept.",
+                    self.status.model, self.status.profile
+                ),
+                is_error: false,
+            }));
+            return;
+        }
+        self.draft = self.draft.clone().with_model(model);
+        self.sidebar.model.model = Some(model.to_owned());
+        self.revalidate_effort();
+    }
+
+    /// Drops an explicit effort the newly selected model cannot take.
+    fn revalidate_effort(&mut self) {
+        let Some(effort) = self.draft.effort else {
+            return;
+        };
+        if !effort.is_explicit() {
+            return;
+        }
+        let picker = self.effort_picker();
+        let still_valid = picker
+            .rows()
+            .iter()
+            .any(|row| row.id == effort.as_str() && row.availability.is_available());
+        if !still_valid {
+            self.draft.effort = Some(ReasoningEffort::Auto);
+            self.status.effort = ReasoningEffort::Auto;
+            self.sidebar.model.effort = Some("auto".into());
+            let explanation = format!(
+                "effort returned to the model default: {effort} is not available on this model"
+            );
+            // A profile change can clear the model and the effort at once;
+            // both reasons are shown rather than one overwriting the other.
+            self.notice = Some(match self.notice.take() {
+                Some(existing) => format!("{existing}; {explanation}"),
+                None => explanation,
+            });
+        }
+    }
+
+    fn main_key(&mut self, key: KeyEvent) -> Action {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match (key.code, ctrl) {
+            (KeyCode::Char('c'), true) => {
+                if self.running {
+                    Action::Cancel
+                } else {
+                    self.quit = true;
+                    Action::Quit
+                }
+            }
+            (KeyCode::Char('q'), true) => {
+                self.quit = true;
+                Action::Quit
+            }
+            (KeyCode::Char('p'), true) => {
+                self.view = View::Palette;
+                self.open_picker(PickerKind::Commands);
+                Action::None
+            }
+            (KeyCode::Char('s'), true) => self.dispatch(Command::Sessions, None),
+            (KeyCode::Char('j'), true) => {
+                self.composer.insert_newline();
+                Action::None
+            }
+            (KeyCode::Char('y'), true) => {
+                // The keyboard copy path: no mouse, no OS clipboard crate.
+                self.clipboard = Some(match self.focus {
+                    Focus::Transcript => self
+                        .entries
+                        .iter()
+                        .map(|entry| entry.text.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => self.composer.copy_target().to_owned(),
+                });
+                let count = self.clipboard.as_ref().map(String::len).unwrap_or(0);
+                self.notice = Some(format!("copied {count} bytes to the Gritt buffer"));
+                Action::None
+            }
+            (KeyCode::Char('a'), true) => {
+                self.composer.select_all();
+                Action::None
+            }
+            (KeyCode::Char('w'), true) => {
+                self.composer.delete_word_back();
+                Action::None
+            }
+            (KeyCode::Char('u'), true) => {
+                self.composer.delete_to_line_start();
+                Action::None
+            }
+            (KeyCode::Char('g'), true) => {
+                // Return to latest.
+                self.scroll = 0;
+                self.follow = true;
+                self.new_output = false;
+                Action::None
+            }
+            (KeyCode::Esc, _) => {
+                // Nothing is open here: Escape cancels a running turn.
+                if self.running {
+                    Action::Cancel
+                } else {
+                    self.notice = None;
+                    Action::None
+                }
+            }
+            (KeyCode::Tab, _) => {
+                self.focus = match self.focus {
+                    Focus::Composer => Focus::Transcript,
+                    Focus::Transcript => Focus::Sidebar,
+                    Focus::Sidebar => Focus::Composer,
+                };
+                Action::None
+            }
+            (KeyCode::BackTab, _) => {
+                self.focus = match self.focus {
+                    Focus::Composer => Focus::Sidebar,
+                    Focus::Transcript => Focus::Composer,
+                    Focus::Sidebar => Focus::Transcript,
+                };
+                Action::None
+            }
+            (KeyCode::Enter, _) => {
+                // Shift-Enter and Alt-Enter insert a newline where the
+                // terminal reports them; Ctrl-J always does. Ctrl-M is
+                // never bound on its own: terminals encode it as Enter.
+                if shift || alt {
+                    self.composer.insert_newline();
+                    return Action::None;
+                }
+                self.submit()
+            }
+            (KeyCode::Backspace, _) => {
+                self.composer.backspace();
+                Action::None
+            }
+            (KeyCode::Delete, _) => {
+                self.composer.delete_forward();
+                Action::None
+            }
+            (KeyCode::Left, true) => {
+                self.composer.move_word_left(shift);
+                Action::None
+            }
+            (KeyCode::Right, true) => {
+                self.composer.move_word_right(shift);
+                Action::None
+            }
+            (KeyCode::Left, false) => {
+                self.composer.move_left(shift);
+                Action::None
+            }
+            (KeyCode::Right, false) => {
+                self.composer.move_right(shift);
+                Action::None
+            }
+            (KeyCode::Up, _) => {
+                // The transcript pane scrolls outright; from the
+                // composer, a move with nowhere to go scrolls instead.
+                if self.focus == Focus::Transcript || !self.composer.move_up(shift) {
+                    self.scroll_up(1);
+                }
+                Action::None
+            }
+            (KeyCode::Down, _) => {
+                if self.focus == Focus::Transcript || !self.composer.move_down(shift) {
+                    self.scroll_down(1);
+                }
+                Action::None
+            }
+            (KeyCode::Home, _) => {
+                self.composer.move_line_start(shift);
+                Action::None
+            }
+            (KeyCode::End, _) => {
+                self.composer.move_line_end(shift);
+                Action::None
+            }
+            (KeyCode::PageUp, _) => {
+                self.scroll_up(10);
+                Action::None
+            }
+            (KeyCode::PageDown, _) => {
+                self.scroll_down(10);
+                Action::None
+            }
+            (KeyCode::Char(c), false) => {
+                self.composer.insert_char(c);
+                self.suggestions_dismissed = false;
+                self.suggestion_index = 0;
+                Action::None
             }
             _ => Action::None,
         }
     }
 
-    fn sessions_key(&mut self, key: KeyEvent) -> Action {
-        match key.code {
-            KeyCode::Esc => {
-                self.view = View::Transcript;
+    /// Enter. A command runs locally; anything else becomes a prompt.
+    fn submit(&mut self) -> Action {
+        let text = self.composer.text().to_owned();
+        match command::parse(&text) {
+            Parsed::Command { command, argument } => {
+                self.composer.clear();
+                self.dispatch(command, argument)
+            }
+            Parsed::Unknown(name) => {
+                // The input is kept so the typo can be corrected.
+                self.notice = Some(format!("unknown command /{name}; /help lists them"));
                 Action::None
             }
-            KeyCode::Down | KeyCode::Char('j') if !self.sessions.is_empty() => {
-                self.session_index = (self.session_index + 1) % self.sessions.len();
-                Action::None
-            }
-            KeyCode::Up | KeyCode::Char('k') if !self.sessions.is_empty() => {
-                self.session_index =
-                    (self.session_index + self.sessions.len() - 1) % self.sessions.len();
-                Action::None
-            }
-            KeyCode::Enter => {
-                self.view = View::Transcript;
-                match self.sessions.get(self.session_index) {
-                    Some(session) if !self.running => Action::Resume(session.id.clone()),
-                    Some(_) => {
-                        self.notice = Some("finish or cancel the running turn first".into());
-                        Action::None
-                    }
-                    None => Action::None,
+            Parsed::Prompt(prompt) => {
+                if self.running {
+                    self.notice = Some("a turn is running; Esc cancels it".into());
+                    return Action::None;
                 }
+                if prompt.trim().is_empty() {
+                    return Action::None;
+                }
+                self.composer.clear();
+                self.push(EntryKind::User, prompt.clone());
+                self.running = true;
+                self.assistant_open = false;
+                self.follow = true;
+                self.scroll = 0;
+                Action::Submit(prompt)
             }
-            _ => Action::None,
+        }
+    }
+
+    /// Puts a draft back after a submission that could not be sent.
+    pub fn restore_draft(&mut self, draft: &str) {
+        self.composer.set_text(draft);
+    }
+
+    /// Scrolling up holds the viewport: streaming stops following.
+    pub fn scroll_up(&mut self, lines: usize) {
+        self.scroll = self.scroll.saturating_add(lines);
+        self.follow = false;
+    }
+
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.scroll = self.scroll.saturating_sub(lines);
+        if self.scroll == 0 {
+            self.follow = true;
+            self.new_output = false;
         }
     }
 
     pub fn set_session(&mut self, session: &Session) {
         self.status.session = session.name.clone();
+        self.status.workspace = session.workspace.display().to_string();
         self.status.phase = match session.phase {
             Phase::Planning => "planning".into(),
             Phase::Coding => "coding".into(),
         };
+        self.sidebar.session.name = Some(session.name.clone());
+        self.sidebar.session.workspace = Some(self.status.workspace.clone());
+        self.sidebar.session.phase = Some(self.status.phase.clone());
         match &session.kind {
             gritt_core::session::SessionKind::Native {
                 provider_profile,
                 model,
-                ..
+                effort,
             } => {
                 self.status.profile = provider_profile.clone();
                 self.status.model = model.clone();
+                self.status.effort = *effort;
+                self.sidebar.model.backend = Some(provider_profile.clone());
+                self.sidebar.model.model = Some(model.clone());
+                self.sidebar.model.effort = Some(effort.as_str().to_owned());
+                self.sidebar.model.managed_by_agent = false;
             }
             gritt_core::session::SessionKind::Connector { id } => {
                 self.status.profile = id.as_str().to_owned();
                 self.status.model.clear();
+                self.sidebar.model.backend = Some(id.as_str().to_owned());
+                self.sidebar.model.model = None;
+                // ADR-010: the connector owns these, so the sidebar says
+                // so rather than showing Gritt's native values.
+                self.sidebar.model.managed_by_agent = true;
             }
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::Utc;
-    use gritt_core::event::EventSource;
-    use gritt_core::policy::PolicyOutcome;
-    use gritt_core::tool::{ToolCall, ToolCallId};
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    fn ctrl(c: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
-    }
-
-    fn event(kind: EventKind) -> Event {
-        Event {
-            session_id: SessionId("s".into()),
-            sequence: 0,
-            source: EventSource::Native,
-            timestamp: Utc::now(),
-            kind,
-            diagnostic: None,
-        }
-    }
-
-    #[test]
-    fn typing_and_submitting_a_prompt() {
-        let mut app = App::new(StatusBar::default(), true);
-        for c in "hi there".chars() {
-            assert_eq!(app.on_key(key(KeyCode::Char(c))), Action::None);
-        }
-        app.on_key(ctrl('j'));
-        app.on_key(key(KeyCode::Char('!')));
-        assert_eq!(app.input, "hi there\n!");
-        app.on_key(key(KeyCode::Left));
-        app.on_key(key(KeyCode::Backspace));
-        assert_eq!(app.input, "hi there!");
-        let action = app.on_key(key(KeyCode::Enter));
-        assert_eq!(action, Action::Submit("hi there!".into()));
-        assert!(app.running);
-        assert_eq!(app.entries[0].kind, EntryKind::User);
-        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None);
-        assert!(app.notice.is_some());
-    }
-
-    #[test]
-    fn streamed_text_accumulates_into_one_entry() {
-        let mut app = App::new(StatusBar::default(), false);
-        app.on_event(&event(EventKind::TextDelta { text: "Hel".into() }));
-        app.on_event(&event(EventKind::TextDelta { text: "lo".into() }));
-        assert_eq!(app.entries.len(), 1);
-        assert_eq!(app.entries[0].text, "Hello");
-        app.on_event(&event(EventKind::ToolCall {
-            call: ToolCall {
-                id: ToolCallId("c".into()),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "ls"}),
-            },
-        }));
-        app.on_event(&event(EventKind::TextDelta {
-            text: "done".into(),
-        }));
-        assert_eq!(app.entries.len(), 3);
-        assert_eq!(app.entries[1].text, "-> shell ls");
-        assert_eq!(app.entries[2].text, "done");
-    }
-
-    #[test]
-    fn approval_keys_answer_and_diff_toggles() {
-        let mut app = App::new(StatusBar::default(), true);
-        app.request_approval(PendingApproval {
-            request: ApprovalRequest {
-                id: gritt_core::event::ApprovalId("a".into()),
-                tool: "file_write".into(),
-                resource: "/ws/a".into(),
-                reason: "write".into(),
-                call_id: None,
-            },
-            decision: Decision {
-                outcome: PolicyOutcome::Ask,
-                reason: "write".into(),
-                destructive: false,
-                rule: Some(1),
-            },
-            preview: Some("--- a\n+++ b\n+x\n".into()),
-        });
-        assert_eq!(app.on_key(key(KeyCode::Char('d'))), Action::None);
-        assert_eq!(app.view, View::Diff);
-        app.on_key(key(KeyCode::Down));
-        assert_eq!(app.diff_scroll, 1);
-        assert_eq!(
-            app.on_key(key(KeyCode::Char('y'))),
-            Action::Approve(ApprovalDecision::Approved)
-        );
-        assert!(app.pending.is_none());
-        assert_eq!(app.view, View::Transcript);
-    }
-
-    #[test]
-    fn palette_and_quit_and_cancel() {
-        let mut app = App::new(StatusBar::default(), true);
-        assert_eq!(app.on_key(ctrl('p')), Action::None);
-        assert_eq!(app.view, View::Palette);
-        app.on_key(key(KeyCode::Down));
-        assert_eq!(
-            app.on_key(key(KeyCode::Enter)),
-            Action::SetPhase(Phase::Coding)
-        );
-        app.running = true;
-        assert_eq!(app.on_key(key(KeyCode::Esc)), Action::Cancel);
-        assert_eq!(app.on_key(ctrl('c')), Action::Cancel);
-        app.running = false;
-        assert_eq!(app.on_key(ctrl('c')), Action::Quit);
-        assert!(app.quit);
-    }
-
-    #[test]
-    fn sessions_view_resumes_when_idle() {
-        let mut app = App::new(StatusBar::default(), true);
-        assert_eq!(app.on_key(ctrl('s')), Action::RefreshSessions);
-        let now = Utc::now();
-        app.sessions = vec![Session {
-            id: SessionId("abc".into()),
-            name: "work".into(),
-            kind: gritt_core::session::SessionKind::Native {
-                provider_profile: "p".into(),
-                model: "m".into(),
-                effort: Default::default(),
-            },
-            phase: Phase::Coding,
-            workspace: "/ws".into(),
-            created_at: now,
-            updated_at: now,
-            parent_id: None,
-        }];
-        assert_eq!(
-            app.on_key(key(KeyCode::Enter)),
-            Action::Resume(SessionId("abc".into()))
-        );
-        app.set_session(&app.sessions[0].clone());
-        assert_eq!(app.status.phase, "coding");
-        assert_eq!(app.status.model, "m");
+fn protocol_word(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::ChatCompletions => "chat completions",
+        Protocol::Responses => "responses",
+        Protocol::Messages => "messages",
     }
 }
+
+/// The one-line catalog state shown in a picker.
+pub fn catalog_word(state: &CatalogState) -> &'static str {
+    match state {
+        CatalogState::Fresh { .. } => "catalog fresh",
+        CatalogState::Stale { .. } => "catalog stale; using the last cached list",
+        CatalogState::Missing { .. } => "no catalog; capabilities unreported",
+        CatalogState::RefreshFailed { .. } => "refresh failed; no list in use",
+        CatalogState::Skipped => "catalog loading is off for this run",
+    }
+}
+
+#[cfg(test)]
+mod tests;
