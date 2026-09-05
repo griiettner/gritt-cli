@@ -661,9 +661,9 @@ impl NativeAgent {
             return self.tools.resource_for(call);
         }
         match self.mcp_tools.lookup(&call.name) {
-            Some(reference) => Ok(crate::policy::Resource::Other(format!(
+            Some(frozen) => Ok(crate::policy::Resource::Other(format!(
                 "mcp:{}/{}",
-                reference.server, reference.tool
+                frozen.reference.server, frozen.reference.tool
             ))),
             None => Err(Error::config(format!(
                 "unknown tool `{}`; it is not offered by any connected MCP server",
@@ -686,7 +686,17 @@ impl NativeAgent {
                 output: "no MCP runtime is available for this session".into(),
             };
         };
-        match mcp.call(&call.name, &call.arguments, &self.cancel).await {
+        // The turn's frozen entry, not the live registry: the call that runs
+        // is the one the permission engine approved, or none at all.
+        let Some(frozen) = self.mcp_tools.lookup(&call.name).cloned() else {
+            return ToolResult {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                is_error: true,
+                output: format!("`{}` is not offered by any connected MCP server", call.name),
+            };
+        };
+        match mcp.call(&frozen, &call.arguments, &self.cancel).await {
             Ok(rendered) => ToolResult {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
