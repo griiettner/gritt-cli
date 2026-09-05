@@ -1620,3 +1620,134 @@ fn debugging_the_setup_form_cannot_print_the_key() {
     app.overlays.push(Overlay::Setup(form));
     assert!(!format!("{:?}", app.overlays).contains("sk-never-printed"));
 }
+
+/// Round 2, finding 5: setting up a provider from a pinned session writes
+/// the profile but does not move the selection the driver is using.
+#[test]
+fn setup_from_a_pinned_session_saves_without_changing_the_selection() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    assert!(app.session_pinned);
+    assert_eq!(app.status.profile, "openai");
+    type_text(&mut app, "a draft worth keeping");
+    app.overlays
+        .push(Overlay::Setup(SetupForm::for_preset(&PRESETS[0])));
+    // The write succeeded; only the selection is in question.
+    let action = app.setup_outcome("saved to /somewhere/config.toml".into(), true);
+    assert_eq!(
+        action,
+        Action::None,
+        "a pinned session loaded a new catalog"
+    );
+    assert_eq!(
+        app.draft.profile.as_deref(),
+        Some("openai"),
+        "the pinned session's provider was replaced by the one just saved"
+    );
+    assert_eq!(app.status.profile, "openai");
+    assert_eq!(app.sidebar.model.backend.as_deref(), Some("openai"));
+    assert_eq!(app.composer.text(), "a draft worth keeping");
+    // The explanation says what to do with the profile that was saved.
+    let Some(Overlay::Notice(notice)) = app.top_overlay() else {
+        panic!("no explanation was shown")
+    };
+    assert!(notice.body.contains("/new"), "{:?}", notice.body);
+}
+
+/// The same write on an unpinned draft does adopt the new profile and
+/// asks for its catalog, which is the round trip `/models` relies on.
+#[test]
+fn setup_on_an_unpinned_draft_selects_the_profile_and_reloads_its_catalog() {
+    let mut app = fixture::home(Theme::new(ThemeMode::NoColor));
+    app.session_pinned = false;
+    app.draft = SessionDraft::default().with_profile("openai");
+    app.catalog = ModelCatalogView {
+        profile: "openrouter".into(),
+        models: vec![model("stale")],
+        state: Some(CatalogState::Missing {
+            reason: "no key".into(),
+        }),
+        loading: false,
+    };
+    app.overlays
+        .push(Overlay::Setup(SetupForm::for_preset(&PRESETS[0])));
+    let action = app.setup_outcome("saved".into(), true);
+    assert_eq!(app.draft.profile.as_deref(), Some("openrouter"));
+    // The failure cached before the credential existed is not an answer
+    // about the profile that now has one.
+    assert!(app.catalog.models.is_empty());
+    let Action::LoadCatalog { profile, selection } = action else {
+        panic!("the catalog was not reloaded after setup: {action:?}")
+    };
+    assert_eq!(profile, "openrouter");
+    assert_eq!(selection, app.selection);
+}
+
+/// An installed agent is selected explicitly, from its detail view, and
+/// never by highlighting its row.
+#[test]
+fn an_installed_agent_is_selected_only_by_confirming_its_detail_view() {
+    let mut app = fixture::home(Theme::new(ThemeMode::NoColor));
+    app.dispatch(Command::Connect, None);
+    type_text(&mut app, "codex");
+    // Choosing the row opens the detail view and starts nothing.
+    let action = app.on_key(key(KeyCode::Enter));
+    assert_eq!(
+        action,
+        Action::None,
+        "highlighting an agent started a session"
+    );
+    let Some(Overlay::Notice(notice)) = app.top_overlay() else {
+        panic!("no detail view was shown")
+    };
+    assert!(
+        notice.body.contains("Managed by agent") || notice.body.contains("managed by the agent")
+    );
+    assert_eq!(
+        notice.confirm,
+        Some(gritt_core::connector::ConnectorId::Codex)
+    );
+    // Enter on the detail view is the explicit selection.
+    assert_eq!(
+        app.on_key(key(KeyCode::Enter)),
+        Action::SelectConnector(gritt_core::connector::ConnectorId::Codex)
+    );
+    // Escape instead of Enter starts nothing.
+    let mut app = fixture::home(Theme::new(ThemeMode::NoColor));
+    app.dispatch(Command::Connect, None);
+    type_text(&mut app, "codex");
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(app.on_key(key(KeyCode::Esc)), Action::None);
+    assert!(app.overlays.is_empty());
+}
+
+/// The MCP inventory is Gritt's on a connector session, and the agent's
+/// own MCP state is named as unreported rather than being stood in for.
+#[test]
+fn a_connector_session_does_not_relabel_gritts_mcp_inventory() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.connector = Some(gritt_core::connector::ConnectorId::Codex);
+    app.apply_mcp(vec![snapshot("gritt-server", McpServerState::Ready, 3)]);
+    assert_eq!(
+        app.sidebar.integrations.mcp_owner.as_deref(),
+        Some("Gritt"),
+        "Gritt's own servers were attributed to the agent"
+    );
+    assert_eq!(
+        app.sidebar.integrations.connector_mcp.as_deref(),
+        Some("codex")
+    );
+    let text = app
+        .sidebar
+        .lines(&app.theme, 30)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("MCP owned by Gritt"), "{text}");
+    assert!(text.contains("codex's own MCP: not reported"), "{text}");
+}

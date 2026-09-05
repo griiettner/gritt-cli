@@ -75,7 +75,13 @@ enum UiMsg {
     Diff(FileDiff),
     /// Live MCP state, from the runtime's subscription rather than a poll.
     Mcp(Vec<McpServerSnapshot>),
-    McpOutcome(Result<()>),
+    McpOutcome {
+        /// The action this answers. A completion from an action that has
+        /// already been superseded must not clear the current one's token
+        /// or its loading line.
+        operation: u64,
+        result: Result<()>,
+    },
     /// A redacted definition for a first-use launch approval.
     McpApproval {
         server: String,
@@ -277,17 +283,33 @@ struct Runtime {
     /// it, and Escape aborts it, so the loading line always describes work
     /// that is really running.
     work: Option<JoinHandle<()>>,
+    /// The task behind a session change, kept apart from `work`.
+    ///
+    /// A session change owns a reservation: the driver being replaced is
+    /// held by it, and the interface refuses prompts until it resolves.
+    /// Sharing the ordinary request slot let any later request — a session
+    /// list, a catalog, a diff — abort the open while leaving the
+    /// reservation behind, which blocked the interface with nothing left
+    /// to unblock it.
+    open_work: Option<JoinHandle<()>>,
     /// Monotonic id for cancellable operations whose result must be
     /// matched to the request that is still wanted.
     operations: u64,
     /// The session change in flight, if any.
     pending_open: Option<PendingOpen>,
-    /// The token of the MCP operation in flight.
+    /// The MCP operation in flight, identified so a late completion from
+    /// a previous one cannot clear the current one's state.
     ///
     /// MCP work is never aborted. Its future owns child processes and
     /// launch slots, and dropping it would skip the shutdown that releases
     /// them; the token asks it to stop and its own cleanup runs.
-    mcp_cancel: Option<CancellationToken>,
+    mcp: Option<McpOperation>,
+}
+
+/// One MCP action in flight.
+struct McpOperation {
+    id: u64,
+    cancel: CancellationToken,
 }
 
 impl Runtime {
@@ -299,16 +321,32 @@ impl Runtime {
 
     /// Abandons the session change in flight, if any, and returns it. A
     /// result already queued for it can no longer match.
+    ///
+    /// The task is dropped with it, so nothing keeps working towards a
+    /// session the loop has stopped waiting for.
     fn take_pending_open(&mut self) -> Option<PendingOpen> {
+        if let Some(work) = self.open_work.take() {
+            work.abort();
+        }
         self.pending_open.take()
+    }
+
+    /// Replaces the session-change task. Only a caller that has already
+    /// installed the matching reservation uses this.
+    fn spawn_open(&mut self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        if let Some(previous) = self.open_work.take() {
+            previous.abort();
+        }
+        self.open_work = Some(tokio::spawn(future));
     }
 
     /// Replaces the background request, aborting whatever it superseded.
     fn spawn(&mut self, future: impl std::future::Future<Output = ()> + Send + 'static) {
         // Superseding uses the same rule as cancelling: an MCP operation
         // is signalled and left to clean up, everything else is dropped.
-        if let Some(token) = self.mcp_cancel.take() {
-            token.cancel();
+        // A session change is in neither slot and is never touched here.
+        if let Some(previous) = self.mcp.take() {
+            previous.cancel.cancel();
             self.work = None;
         }
         if let Some(previous) = self.work.take() {
@@ -331,14 +369,33 @@ impl Runtime {
     /// the shutdown that releases them, leaving the process alive until
     /// the application exits.
     fn cancel_work(&mut self) {
-        if let Some(token) = self.mcp_cancel.take() {
-            token.cancel();
+        if let Some(previous) = self.mcp.take() {
+            previous.cancel.cancel();
             self.work = None;
             return;
         }
         if let Some(work) = self.work.take() {
             work.abort();
         }
+    }
+
+    /// Starts an MCP action, signalling the one it replaces.
+    ///
+    /// Each action carries its own id and token, so a completion that
+    /// arrives after another action started cannot clear the newer one's
+    /// state, and the older one is always told to stop rather than being
+    /// forgotten with its child still running.
+    fn begin_mcp(&mut self) -> (u64, CancellationToken) {
+        if let Some(previous) = self.mcp.take() {
+            previous.cancel.cancel();
+        }
+        let id = self.next_operation();
+        let cancel = CancellationToken::new();
+        self.mcp = Some(McpOperation {
+            id,
+            cancel: cancel.clone(),
+        });
+        (id, cancel)
     }
 }
 
@@ -434,7 +491,13 @@ async fn event_loop(
     app.draft = draft;
     app.status.workspace = plane.builder.workspace_root().display().to_string();
     app.sidebar.session.workspace = Some(app.status.workspace.clone());
-    app.profiles = plane.profile_summaries();
+    // Profile summaries are deliberately absent here. Resolving one
+    // reaches `keys.key()` and therefore the keychain, which can block for
+    // as long as the operating system wants; doing it before the first
+    // draw would hold the entered terminal blank and deaf. `load_profiles`
+    // fills them in from a blocking worker and the dialog updates when
+    // they arrive.
+    //
     // The flags above the configured defaults are the selection the home
     // screen shows before a session exists. It is a choice, not an open
     // connection, which is why nothing here opens anything.
@@ -445,9 +508,10 @@ async fn event_loop(
         changes: Arc::new(WorkspaceChanges::new(app.status.workspace.clone())),
         tx: ui_tx.clone(),
         work: None,
+        open_work: None,
         operations: 0,
         pending_open: None,
-        mcp_cancel: None,
+        mcp: None,
     };
     let mut idle_agent: Option<Box<dyn Driver>> = None;
     if let Some(agent) = agent {
@@ -780,19 +844,39 @@ async fn on_message(
             app.show_file_diff(diff);
         }
         UiMsg::Mcp(snapshots) => app.apply_mcp(snapshots),
-        UiMsg::McpOutcome(result) => {
+        UiMsg::McpOutcome { operation, result } => {
+            let current = runtime
+                .mcp
+                .as_ref()
+                .is_some_and(|active| active.id == operation);
+            if !current {
+                // A superseded or cancelled action finished its cleanup.
+                // Its outcome is not this operation's, so it clears
+                // neither the loading line nor the live token.
+                return Ok(Action::None);
+            }
+            runtime.mcp = None;
             app.loading = None;
-            runtime.mcp_cancel = None;
             if let Err(error) = result {
                 app.notice = Some(error.message);
             }
         }
         UiMsg::McpApproval { server, definition } => {
             app.loading = None;
-            // Only ask if nothing else owns the modal layer now.
-            if app.pending.is_none() {
-                app.request_mcp_approval(server, definition);
+            // The definition was asked for when nothing was running. If a
+            // turn or another approval started while it was being read,
+            // showing it now would let the answer authorize a launch
+            // during that turn, which is exactly what the mutation guard
+            // exists to prevent. It is refused rather than deferred: the
+            // user can reopen `/mcp` when the turn ends, and a queued
+            // approval for a definition read minutes ago is worse.
+            if !app.settings_are_editable() {
+                app.notice = Some(format!(
+                    "{server} was not approved: a turn started while its definition was read"
+                ));
+                return Ok(Action::None);
             }
+            app.request_mcp_approval(server, definition);
         }
         UiMsg::Profiles(profiles) => {
             app.profiles = profiles;
@@ -942,7 +1026,7 @@ async fn on_action(
                 prompt: None,
                 previous: idle_agent.take(),
             });
-            runtime.spawn(async move {
+            runtime.spawn_open(async move {
                 let result = resume_by_id(&plane, &named).await;
                 let _ = tx.send(UiMsg::Opened {
                     operation,
@@ -967,7 +1051,7 @@ async fn on_action(
                 prompt: None,
                 previous: idle_agent.take(),
             });
-            runtime.spawn(async move {
+            runtime.spawn_open(async move {
                 // An external agent owns its own model and effort, so this
                 // is the general control-plane operation, not a draft.
                 let result = plane
@@ -1097,13 +1181,22 @@ async fn on_action(
                 });
                 return Ok(());
             }
+            // The mutation guard is enforced here as well as in the
+            // reducer: the decision may have been taken from an approval
+            // overlay that opened before a turn started.
+            if !app.settings_are_editable() {
+                app.notice =
+                    Some("a turn or an approval is active; the MCP change was not applied".into());
+                return Ok(());
+            }
             app.loading = Some("applying the MCP change".into());
-            // The token is kept by the loop. Cancelling signals it and
-            // lets the operation's own cleanup shut the child down and
-            // release its launch slot; aborting the future would drop both
-            // and leave the process alive until the application exits.
-            let cancel = crate::CancellationToken::new();
-            runtime.mcp_cancel = Some(cancel.clone());
+            // The token is kept by the loop, with an id. Cancelling signals
+            // it and lets the operation's own cleanup shut the child down
+            // and release its launch slot; aborting the future would drop
+            // both and leave the process alive until the application
+            // exits. The id is what stops a completion from a superseded
+            // action clearing this one's state.
+            let (operation, cancel) = runtime.begin_mcp();
             runtime.spawn_detached(async move {
                 let result = match request {
                     McpRequest::RequestApproval { .. } => Ok(()),
@@ -1129,7 +1222,7 @@ async fn on_action(
                         Err(error) => Err(error),
                     },
                 };
-                let _ = tx.send(UiMsg::McpOutcome(result));
+                let _ = tx.send(UiMsg::McpOutcome { operation, result });
             });
         }
         Action::ScanChanges => scan_changes(runtime, app.sidebar.generation),
@@ -1180,7 +1273,7 @@ fn open_draft(
         prompt,
         previous,
     });
-    runtime.spawn(async move {
+    runtime.spawn_open(async move {
         let result = plane.open_draft(draft).await;
         let _ = tx.send(UiMsg::Opened {
             operation,
@@ -1372,9 +1465,10 @@ mod tests {
             changes: Arc::new(WorkspaceChanges::new(dir.path())),
             tx,
             work: None,
+            open_work: None,
             operations: 0,
             pending_open: None,
-            mcp_cancel: None,
+            mcp: None,
         };
         Harness {
             _dir: dir,
@@ -1455,9 +1549,9 @@ mod tests {
         let mut h = harness().await;
         h.act(Action::Resume(SessionId("id-a".into()))).await;
         let stale_operation = h.runtime.pending_open.as_ref().unwrap().operation;
-        // The user asks for a different session before the first answers.
-        h.runtime.pending_open = None;
-        h.app.session_transition = false;
+        // The first one is cancelled the way the user cancels it, then a
+        // second is asked for. Nothing is cleared by hand.
+        h.act(Action::Cancel).await;
         h.act(Action::Resume(SessionId("id-b".into()))).await;
         let current = h.runtime.pending_open.as_ref().unwrap().operation;
         assert_ne!(stale_operation, current);
@@ -1602,15 +1696,137 @@ mod tests {
     #[tokio::test]
     async fn cancelling_mcp_work_signals_it_rather_than_aborting_it() {
         let mut h = harness().await;
-        let token = crate::CancellationToken::new();
-        h.runtime.mcp_cancel = Some(token.clone());
+        let (_id, token) = h.runtime.begin_mcp();
         h.app.loading = Some("applying the MCP change".into());
         h.act(Action::Cancel).await;
         assert!(
             token.is_cancelled(),
             "the MCP operation was dropped without being told to stop"
         );
-        assert!(h.runtime.mcp_cancel.is_none());
+        assert!(h.runtime.mcp.is_none());
         let _ = h.rx.try_recv();
+    }
+    /// Round 2, finding 1: another request during a pending resume must
+    /// not strand the reservation.
+    ///
+    /// `/sessions` is the realistic one, because the picker opens before
+    /// the store answers and its response clears the loading line the
+    /// resume had put up. The open must survive it, and Escape must still
+    /// reach the transition afterwards.
+    #[tokio::test]
+    async fn a_session_list_during_a_resume_leaves_the_transition_recoverable() {
+        let mut h = harness().await;
+        let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        h.idle = Some(Box::new(StubDriver {
+            session: session("old"),
+            turns: Arc::clone(&turns),
+        }));
+        h.act(Action::Resume(SessionId("id-new".into()))).await;
+        let operation = h.runtime.pending_open.as_ref().unwrap().operation;
+
+        // The real sequence `/sessions` produces.
+        h.act(Action::RefreshSessions).await;
+        h.message(UiMsg::Sessions(Vec::new())).await;
+
+        assert!(
+            h.runtime.pending_open.is_some(),
+            "the session list aborted the open and left its reservation behind"
+        );
+        assert_eq!(
+            h.runtime.pending_open.as_ref().unwrap().operation,
+            operation,
+            "the reservation was replaced by the session list"
+        );
+        assert!(h.app.session_transition);
+        // The session list cleared the loading line, so the transition is
+        // the only thing left that says work is outstanding. Escape has to
+        // see it, or the interface has no way back.
+        assert!(h.app.loading.is_none());
+        assert_eq!(
+            h.app.on_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE
+            )),
+            Action::Cancel,
+            "Escape ignored a session change that was still in flight"
+        );
+        h.act(Action::Cancel).await;
+        assert!(h.runtime.pending_open.is_none());
+        assert!(!h.app.session_transition);
+        assert!(
+            h.idle.is_some(),
+            "cancelling the transition did not give the session back"
+        );
+        assert!(h.app.settings_are_editable());
+    }
+
+    /// Round 2, finding 4: overlapping MCP actions each own their token,
+    /// and a completion from a superseded one changes nothing.
+    #[tokio::test]
+    async fn overlapping_mcp_actions_keep_their_own_tokens_and_completions() {
+        let mut h = harness().await;
+        let (first, first_token) = h.runtime.begin_mcp();
+        h.app.loading = Some("applying the MCP change".into());
+        let (second, second_token) = h.runtime.begin_mcp();
+        assert_ne!(first, second);
+        assert!(
+            first_token.is_cancelled(),
+            "the superseded operation was never told to stop"
+        );
+        assert!(!second_token.is_cancelled());
+
+        // The first one finishes its cleanup afterwards. It must not clear
+        // the second's token or its loading line.
+        h.message(UiMsg::McpOutcome {
+            operation: first,
+            result: Ok(()),
+        })
+        .await;
+        assert!(
+            h.runtime.mcp.is_some(),
+            "a late completion took the live operation's token"
+        );
+        assert!(h.app.loading.is_some(), "a late completion cleared loading");
+        // Escape can still reach the operation that is really running.
+        h.act(Action::Cancel).await;
+        assert!(second_token.is_cancelled());
+        assert!(h.runtime.mcp.is_none());
+    }
+
+    /// Round 2, finding 6: a definition read before a turn started cannot
+    /// put an approval in front of the user during that turn.
+    #[tokio::test]
+    async fn a_definition_arriving_after_a_turn_started_is_refused() {
+        let mut h = harness().await;
+        // The turn starts while the definition is being read.
+        h.app.running = true;
+        h.message(UiMsg::McpApproval {
+            server: "probe".into(),
+            definition: "run: /usr/bin/probe".into(),
+        })
+        .await;
+        assert!(
+            h.app.pending.is_none(),
+            "a launch approval opened during a running turn"
+        );
+        assert!(h.app.mcp_approval.is_none());
+        assert!(h
+            .app
+            .notice
+            .as_deref()
+            .unwrap_or_default()
+            .contains("a turn started"));
+
+        // And the decision itself is refused if it reaches the runtime
+        // during a turn anyway.
+        h.act(Action::Mcp(McpRequest::Decide {
+            server: "probe".into(),
+            decision: gritt_core::mcp::TrustDecision::Approved,
+        }))
+        .await;
+        assert!(
+            h.runtime.mcp.is_none(),
+            "an MCP mutation started during a running turn"
+        );
     }
 }

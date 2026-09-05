@@ -152,7 +152,12 @@ pub struct WorkspaceChanges {
     /// be run, which is what makes the list partial.
     is_repository: RwLock<bool>,
     /// Bounds how much blocking work this service can have in flight.
-    scans: tokio::sync::Semaphore,
+    ///
+    /// Behind an `Arc` so a permit can be *owned by the worker* rather
+    /// than by the future awaiting it. A caller that is cancelled drops
+    /// the future, and a permit held there would be released while the
+    /// blocking worker it was taken for is still running.
+    scans: Arc<tokio::sync::Semaphore>,
 }
 
 impl WorkspaceChanges {
@@ -167,7 +172,7 @@ impl WorkspaceChanges {
             baseline: RwLock::new(None),
             observed: RwLock::new(BTreeMap::new()),
             is_repository: RwLock::new(false),
-            scans: tokio::sync::Semaphore::new(MAX_CONCURRENT_SCANS),
+            scans: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SCANS)),
         }
     }
 
@@ -203,7 +208,14 @@ impl WorkspaceChanges {
     /// labelled partial.
     pub async fn record_write(&self, path: impl Into<String>) {
         let path = self.relative(&path.into());
-        let existed = Path::new(&self.root).join(&path).exists();
+        // `exists()` is a stat, and this is awaited by the event handler
+        // after every turn. It goes to a blocking worker like the rest of
+        // the filesystem work here.
+        let target = self.root.join(&path);
+        let existed = self
+            .blocking(move || target.exists())
+            .await
+            .unwrap_or(false);
         let mut observed = self.observed.write().await;
         observed.entry(path).or_insert(if existed {
             ChangeStatus::Modified
@@ -352,13 +364,24 @@ impl WorkspaceChanges {
     /// Runs one blocking closure under the concurrency bound. `None` means
     /// the worker did not finish, which a caller reports rather than
     /// treating as an answer.
+    ///
+    /// The permit is moved into the worker, so it is released when the
+    /// work actually ends. Holding it in this future instead would let a
+    /// cancelled caller hand the permit to the next request while its own
+    /// worker was still running, and repeated cancel-and-retry would then
+    /// exceed the bound the permit exists to enforce.
     async fn blocking<T, F>(&self, work: F) -> Option<T>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let _permit = self.scans.acquire().await.ok()?;
-        tokio::task::spawn_blocking(work).await.ok()
+        let permit = Arc::clone(&self.scans).acquire_owned().await.ok()?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await
+        .ok()
     }
 
     /// Paths are reported relative to the workspace root, whichever form
@@ -432,6 +455,20 @@ fn parse_status_z(bytes: &[u8]) -> Vec<StatusEntry> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Decrements the live counter when the invocation returns.
+    struct LiveGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+    impl Drop for LiveGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn scopeguard(counter: &std::sync::atomic::AtomicUsize) -> LiveGuard<'_> {
+        LiveGuard(counter)
+    }
 
     /// A `git` that answers from a script, so the parsing and the
     /// baseline rule are testable without a repository.
@@ -439,6 +476,11 @@ mod tests {
         status: Mutex<Vec<String>>,
         diff: Option<String>,
         available: bool,
+        /// How long each invocation blocks, for the concurrency bound.
+        delay: Duration,
+        /// Workers inside `run` right now, and the highest that has been.
+        live: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl FakeGit {
@@ -447,6 +489,9 @@ mod tests {
                 status: Mutex::new(statuses.iter().map(|s| (*s).to_owned()).collect()),
                 diff: None,
                 available: true,
+                delay: Duration::default(),
+                live: Default::default(),
+                peak: Default::default(),
             }
         }
     }
@@ -454,6 +499,11 @@ mod tests {
     impl GitRunner for FakeGit {
         fn run(&self, _root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
             use std::os::unix::process::ExitStatusExt;
+            use std::sync::atomic::Ordering;
+            let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(live, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            let _guard = scopeguard(&self.live);
             let ok = std::process::ExitStatus::from_raw(0);
             let fail = std::process::ExitStatus::from_raw(1 << 8);
             if !self.available {
@@ -517,6 +567,9 @@ mod tests {
             status: Mutex::new(Vec::new()),
             diff: None,
             available: false,
+            delay: Duration::default(),
+            live: Default::default(),
+            peak: Default::default(),
         });
         let changes = WorkspaceChanges::with_git("/tmp/ws", git);
         changes.capture_baseline().await;
@@ -566,6 +619,47 @@ mod tests {
             entries[2].path, "\"already quoted\".md",
             "quotes that are part of the name were stripped"
         );
+    }
+
+    /// Round 2, finding 3: a cancelled caller must not hand its permit to
+    /// the next request while its own blocking worker is still running.
+    ///
+    /// The permit belongs to the worker, so cancelling and retrying cannot
+    /// push more than `MAX_CONCURRENT_SCANS` invocations into `git` at
+    /// once. With the permit held by the awaiting future instead, each
+    /// cancellation released one early and this peaks well above the
+    /// bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn cancelling_a_scan_does_not_release_its_worker_s_permit() {
+        let peak: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let git = Arc::new(FakeGit {
+            status: Mutex::new(vec![String::new()]),
+            diff: None,
+            available: true,
+            delay: Duration::from_millis(120),
+            live: Default::default(),
+            peak: Arc::clone(&peak),
+        });
+        let changes = Arc::new(WorkspaceChanges::with_git("/tmp/ws", git));
+        // Six requests, each abandoned before its worker can finish.
+        for _ in 0..6 {
+            let changes = Arc::clone(&changes);
+            let _ = tokio::time::timeout(
+                Duration::from_millis(10),
+                async move { changes.scan().await },
+            )
+            .await;
+        }
+        // Let every started worker drain.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            peak <= MAX_CONCURRENT_SCANS,
+            "cancellation let {peak} workers run at once, above the bound of {MAX_CONCURRENT_SCANS}"
+        );
+        // The service still works afterwards: no permit was lost either.
+        let done = tokio::time::timeout(Duration::from_secs(5), changes.scan()).await;
+        assert!(done.is_ok(), "the concurrency bound was never released");
     }
 
     #[tokio::test]

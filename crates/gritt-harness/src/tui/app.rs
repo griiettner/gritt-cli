@@ -2176,9 +2176,13 @@ impl App {
                 Action::None
             }
             (KeyCode::Esc, _) => {
-                // Nothing is open here: Escape cancels a running turn, or
-                // the asynchronous work the loading line is showing.
-                if self.running || self.loading.is_some() {
+                // Nothing is open here: Escape cancels a running turn, the
+                // asynchronous work the loading line is showing, or a
+                // session change that is still in flight. The transition
+                // is checked on its own: its loading line can have been
+                // replaced by another request's, and without this the
+                // interface would have no way back.
+                if self.running || self.loading.is_some() || self.session_transition {
                     Action::Cancel
                 } else {
                     self.notice = None;
@@ -2580,13 +2584,22 @@ impl App {
                 ..ModelCatalogView::default()
             };
         }
-        // A model picker underneath is for the profile that was just set
-        // up when the round trip came from `/models`; either way it is
-        // rebuilt from current state before it is looked at again.
+        // Writing a profile is always allowed; selecting it is not. A
+        // pinned session's driver keeps its own provider and model, so
+        // adopting the new one here would show a selection the driver is
+        // not using. The save stands and the explanation says what to do
+        // with it.
         if self.draft.profile.as_deref() != Some(profile.as_str()) {
+            if self.refuses_pinned_change(&profile, None) {
+                self.refresh_open_picker();
+                return Action::None;
+            }
             self.draft = self.draft.clone().with_profile(&profile);
             self.sidebar.model.backend = Some(profile.clone());
         }
+        // A model picker underneath is for the profile that was just set
+        // up when the round trip came from `/models`; either way it is
+        // rebuilt from current state before it is looked at again.
         self.refresh_open_picker();
         self.request_catalog()
     }
