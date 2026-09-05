@@ -6,3 +6,8 @@ __pycache__/
 .agents/cli/target/
 /target/
 /dist/
+
+# `.cargo/config.toml` sets `artifact-dir = "."`, so every built target lands
+# at the repository root. Only the committed `gritt` binary belongs here.
+/gritt-mcp-fixture
+/libgritt_*.rlib
