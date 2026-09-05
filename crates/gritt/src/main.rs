@@ -312,27 +312,30 @@ async fn runs_on_native(
     selector: &SessionSelector,
     connector: Option<ConnectorId>,
 ) -> bool {
-    if connector.is_some() {
-        return native_backend(connector, None);
-    }
-    match builder.find_session(selector, None).await {
-        Ok(Some(session)) => native_backend(None, Some(&session.kind)),
-        // A new session, or a lookup that failed for a reason the caller will
-        // report anyway, runs natively.
-        Ok(None) | Err(_) => true,
-    }
+    // The session is resolved first, whatever the flag says, because that is
+    // the order `ControlPlane::open` uses and the prediction has to agree
+    // with it. A lookup that fails is treated as a new session; the real
+    // error surfaces when the session is opened for real.
+    let existing = builder.find_session(selector, None).await.ok().flatten();
+    native_backend(connector, existing.as_ref().map(|session| &session.kind))
 }
 
 /// The backend decision itself, given the flag and the session being resumed.
 ///
-/// `--connector native` and no flag at all are the same path and must load
-/// MCP alike. Resuming a session owned by an external agent is the opposite
-/// case: that agent runs its own MCP clients, so Gritt starts none.
+/// An existing session's own kind decides, because that is what
+/// `ControlPlane::open` does: it keeps a stored native session native even
+/// when a connector flag is present, and only refuses a flag that contradicts
+/// a stored *connector* session. Predicting otherwise would disable MCP for a
+/// session that then runs natively.
+///
+/// With no stored session the flag decides, and `--connector native` is the
+/// native path just as an absent flag is.
 fn native_backend(connector: Option<ConnectorId>, existing: Option<&SessionKind>) -> bool {
-    if let Some(id) = connector {
-        return id == ConnectorId::Native;
+    match existing {
+        Some(SessionKind::Native { .. }) => true,
+        Some(SessionKind::Connector { .. }) => false,
+        None => matches!(connector, None | Some(ConnectorId::Native)),
     }
-    !matches!(existing, Some(SessionKind::Connector { .. }))
 }
 
 /// Wraps the builder in the control plane with every external connector
@@ -669,6 +672,11 @@ async fn run_tui_mode(
         warm_catalog(&builder, args).await;
     }
     let mcp = builder.mcp().cloned();
+    // Installed before the first launch. Raw mode is not on yet, so an
+    // interrupt here arrives as a signal, and the children sit in their own
+    // process groups: without this they would survive it.
+    let slot: CancelSlot = Arc::new(Mutex::new(None));
+    install_ctrl_c(Arc::clone(&slot), mcp.clone());
     if runs_on_native(&builder, &selector(args), connector).await {
         start_mcp(&builder, false).await;
     }
@@ -707,6 +715,11 @@ async fn mcp_command(
         .with_http_transport(Arc::new(ReqwestTransport::new()?))
         .with_trust(StoreTrustStore::new(Arc::clone(&store)));
     let cancel = gritt_harness::CancellationToken::new();
+    // `trust` and `list` both launch approved servers, so they need the same
+    // cleanup on interruption as the session modes.
+    let runtime = Arc::new(runtime);
+    let slot: CancelSlot = Arc::new(Mutex::new(None));
+    install_ctrl_c(Arc::clone(&slot), Some(Arc::clone(&runtime)));
     match command {
         McpCommand::Forget => {
             store
@@ -1062,9 +1075,12 @@ mod tests {
         assert!(native_backend(Some(ConnectorId::Native), None));
         assert!(native_backend(None, None));
         assert!(native_backend(None, Some(&native_session)));
-        // A flag naming an external agent, whatever the stored session says.
+        // A flag naming an external agent, with nothing stored yet.
         assert!(!native_backend(Some(ConnectorId::Codex), None));
-        assert!(!native_backend(
+        // A stored native session stays native even under an external flag,
+        // because `ControlPlane::open` resolves it that way; predicting
+        // otherwise would leave MCP off for a session that runs natively.
+        assert!(native_backend(
             Some(ConnectorId::ClaudeCode),
             Some(&native_session)
         ));
