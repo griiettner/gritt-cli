@@ -76,10 +76,23 @@ pub struct ModelSection {
 pub struct UsageSection {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
-    /// Tokens currently in the model's context, when the driver reports
-    /// it. Not the cumulative total above.
+    /// Tokens currently in the model's context, when a source reports it.
+    ///
+    /// Nothing populates this today. The prompt tokens of the last request
+    /// are a *lower bound* on it, not the value: the driver may add tool
+    /// results and continuation state after it, and a provider that caches
+    /// prompt tokens reports them differently again. Until a source
+    /// establishes the current size, occupancy stays unavailable rather
+    /// than being derived from something adjacent.
     pub context_tokens: Option<u64>,
     pub context_limit: Option<u64>,
+    /// The prompt tokens the most recent request reported, under its own
+    /// label. A fact about one request, never occupancy.
+    pub last_request_input: Option<u64>,
+    /// Set when a usage event arrived without one of its counts, which
+    /// makes the totals a floor rather than a total and withholds the cost
+    /// estimate.
+    pub incomplete: bool,
 }
 
 impl UsageSection {
@@ -101,71 +114,9 @@ pub struct CostSection {
     pub scope: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChangeStatus {
-    Added,
-    Modified,
-    Deleted,
-    Renamed,
-    Untracked,
-}
-
-impl ChangeStatus {
-    pub fn label(self) -> &'static str {
-        match self {
-            ChangeStatus::Added => "added",
-            ChangeStatus::Modified => "modified",
-            ChangeStatus::Deleted => "deleted",
-            ChangeStatus::Renamed => "renamed",
-            ChangeStatus::Untracked => "new",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChangedFile {
-    pub path: String,
-    pub status: ChangeStatus,
-    /// Present in the workspace before Gritt opened it. The sidebar
-    /// reports workspace state; it does not claim authorship.
-    pub pre_existing: bool,
-}
-
-/// Where the changed-file list came from, which decides how complete it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChangeSource {
-    /// Read-only Git status against the baseline taken at open.
-    Git,
-    /// No Git repository: only files Gritt itself wrote are observable.
-    ObservedWrites,
-}
-
-impl ChangeSource {
-    pub fn caveat(self) -> Option<&'static str> {
-        match self {
-            ChangeSource::Git => None,
-            ChangeSource::ObservedWrites => Some("partial: observed writes only"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChangedFiles {
-    /// Not collected yet, or collection is not possible here.
-    Unavailable { reason: String },
-    Observed {
-        source: ChangeSource,
-        files: Vec<ChangedFile>,
-    },
-}
-
-impl Default for ChangedFiles {
-    fn default() -> Self {
-        ChangedFiles::Unavailable {
-            reason: "not collected yet".into(),
-        }
-    }
-}
+/// The changed-file types live with the harness service that produces
+/// them, so the renderer and the observer cannot drift apart.
+pub use crate::changes::{ChangeSource, ChangeStatus, ChangedFile, ChangedFiles};
 
 /// Integration sections. A section that is `None` is hidden entirely;
 /// `Some(empty)` means an inventory was checked and found empty, which is
@@ -173,10 +124,13 @@ impl Default for ChangedFiles {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IntegrationsSection {
     pub mcp: Option<Vec<McpServerSnapshot>>,
-    /// Set only when a connector session owns its own MCP clients, so the
-    /// sidebar labels the state by owner instead of implying Gritt's
-    /// `.mcp.json` controls it.
+    /// Who owns the servers in `mcp`. Always Gritt for this list: it comes
+    /// from Gritt's runtime and Gritt's `.mcp.json`.
     pub mcp_owner: Option<String>,
+    /// The connector whose *own* MCP clients Gritt cannot see. Set while a
+    /// connector session is active, so the unknown is stated instead of
+    /// Gritt's list standing in for it (ADR-010).
+    pub connector_mcp: Option<String>,
 }
 
 /// Everything the sidebar shows for one session.
@@ -319,6 +273,21 @@ impl SidebarModel {
             tokens(self.usage.output_tokens),
             width,
         ));
+        lines.push(field(
+            theme,
+            "last",
+            match self.usage.last_request_input {
+                Some(count) => format!("{count} in, last request"),
+                None => "unavailable".to_owned(),
+            },
+            width,
+        ));
+        if self.usage.incomplete {
+            lines.push(Line::from(Span::styled(
+                truncate("partial usage reported; totals are a floor", width),
+                theme.dim(),
+            )));
+        }
         match self.usage.occupancy() {
             Some(fraction) => lines.push(field(
                 theme,
@@ -389,6 +358,12 @@ impl SidebarModel {
                 lines.push(Line::from(Span::styled(
                     truncate(&format!("MCP owned by {owner}"), width),
                     theme.muted(),
+                )));
+            }
+            if let Some(connector) = &self.integrations.connector_mcp {
+                lines.push(Line::from(Span::styled(
+                    truncate(&format!("{connector}'s own MCP: not reported"), width),
+                    theme.dim(),
                 )));
             }
             if servers.is_empty() {
@@ -570,6 +545,7 @@ mod tests {
                     },
                 ]),
                 mcp_owner: None,
+                connector_mcp: None,
             },
             ..SidebarModel::default()
         };
@@ -586,6 +562,7 @@ mod tests {
             integrations: IntegrationsSection {
                 mcp: Some(Vec::new()),
                 mcp_owner: None,
+                connector_mcp: None,
             },
             ..SidebarModel::default()
         };

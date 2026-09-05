@@ -18,11 +18,13 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use gritt_core::event::{ApprovalId, ApprovalRequest};
 use gritt_core::policy::PolicyOutcome;
+use gritt_harness::changes::{ChangeSource, ChangeStatus, ChangedFile, ChangedFiles};
 use gritt_harness::draft::CatalogState;
 use gritt_harness::policy::Decision;
 use gritt_harness::tui::app::{App, Metrics, PendingApproval, View};
 use gritt_harness::tui::command::Command;
 use gritt_harness::tui::render::draw;
+use gritt_harness::tui::sidebar::IntegrationsSection;
 use gritt_harness::tui::theme::{Theme, ThemeMode};
 use gritt_harness::tui::{fixture, PickerKind};
 use ratatui::backend::TestBackend;
@@ -141,6 +143,52 @@ fn build(name: &str, theme: Theme) -> App {
             app.dispatch(Command::Sidebar, None);
             app
         }
+        // The sidebar states TKT-0019 fills from live sources: an
+        // inventory checked and found empty, one where nothing is known
+        // yet, and one longer than any terminal.
+        "sidebar_empty" => {
+            let mut app = fixture::conversation(theme);
+            app.sidebar.changed_files = ChangedFiles::Observed {
+                source: ChangeSource::Git,
+                files: Vec::new(),
+            };
+            app.sidebar.integrations = IntegrationsSection {
+                mcp: Some(Vec::new()),
+                mcp_owner: Some("Gritt".into()),
+                connector_mcp: None,
+            };
+            app.sidebar.usage = Default::default();
+            app.sidebar.cost = Default::default();
+            app
+        }
+        "sidebar_unavailable" => {
+            let mut app = fixture::conversation(theme);
+            // A session that has just been switched to: nothing from the
+            // previous driver may survive, so every field is unknown.
+            app.sidebar.reset();
+            app
+        }
+        "sidebar_long" => {
+            let mut app = fixture::conversation(theme);
+            app.sidebar.changed_files = ChangedFiles::Observed {
+                source: ChangeSource::Git,
+                files: (0..24)
+                    .map(|index| ChangedFile {
+                        path: format!(
+                            "crates/gritt-harness/src/tui/very/deeply/nested/module_{index}.rs"
+                        ),
+                        status: if index % 3 == 0 {
+                            ChangeStatus::Added
+                        } else {
+                            ChangeStatus::Modified
+                        },
+                        pre_existing: index % 4 == 0,
+                    })
+                    .collect(),
+            };
+            app.sidebar_scroll = 6;
+            app
+        }
         "home_long_draft" => {
             let mut app = fixture::home(theme);
             type_text(
@@ -253,7 +301,7 @@ fn check(name: &str, width: u16, height: u16) {
     );
 }
 
-const SCREENS: [&str; 13] = [
+const SCREENS: [&str; 16] = [
     "home",
     "conversation",
     "command_search",
@@ -267,6 +315,9 @@ const SCREENS: [&str; 13] = [
     "help",
     "sidebar_drawer",
     "home_long_draft",
+    "sidebar_empty",
+    "sidebar_unavailable",
+    "sidebar_long",
 ];
 
 #[test]
@@ -281,8 +332,15 @@ fn every_screen_matches_its_snapshot_at_every_review_size() {
 /// The sidebar column appears at 110 columns and not at 109.
 #[test]
 fn the_sidebar_boundary_is_snapshotted_on_both_sides_of_110_columns() {
-    check("conversation", 111, 30);
-    check("conversation", 109, 30);
+    for name in [
+        "conversation",
+        "sidebar_empty",
+        "sidebar_unavailable",
+        "sidebar_long",
+    ] {
+        check(name, 111, 30);
+        check(name, 109, 30);
+    }
     let wide = text_of(&render("conversation", ThemeMode::Dark, 111, 30));
     let narrow = text_of(&render("conversation", ThemeMode::Dark, 109, 30));
     assert!(wide.contains("Changed files"), "{wide}");
@@ -293,6 +351,41 @@ fn the_sidebar_boundary_is_snapshotted_on_both_sides_of_110_columns() {
     // Collapsing does not cost the transcript or the composer.
     assert!(narrow.contains("api-cleanup"), "{narrow}");
     assert!(narrow.contains("effort"), "{narrow}");
+}
+
+/// The three live sidebar states the plan distinguishes: unknown is never
+/// drawn as zero, an inventory that was checked may say none, and a list
+/// longer than the column scrolls rather than overflowing it.
+#[test]
+fn the_sidebar_tells_unknown_empty_and_long_apart() {
+    let unknown = text_of(&render("sidebar_unavailable", ThemeMode::Dark, 120, 40));
+    assert!(unknown.contains("unavailable"), "{unknown}");
+    for zero in ["in   0", "out  0", "est  ~$0"] {
+        assert!(
+            !unknown.contains(zero),
+            "an unknown value was drawn as zero: {unknown}"
+        );
+    }
+    // No runtime was checked, so no Integrations section is drawn at all.
+    assert!(!unknown.contains("Integrations"), "{unknown}");
+
+    let empty = text_of(&render("sidebar_empty", ThemeMode::Dark, 120, 40));
+    assert!(empty.contains("no MCP servers configured"), "{empty}");
+    assert!(empty.contains("none"), "{empty}");
+
+    let long = text_of(&render("sidebar_long", ThemeMode::Dark, 120, 40));
+    for line in long.lines() {
+        assert!(line.chars().count() <= 120, "a line overflowed: {line:?}");
+    }
+    // A path longer than the column is cut between whole characters and
+    // marked, never wrapped across the transcript.
+    assert!(long.contains('…'), "{long}");
+    assert!(long.contains("(pre-existing)"), "{long}");
+    // Scrolled: the heading has moved off the top of the column.
+    assert!(
+        !long.contains("Gritt 0.1.0"),
+        "the column did not scroll:\n{long}"
+    );
 }
 
 #[test]

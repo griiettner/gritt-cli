@@ -9,6 +9,7 @@
 #![recursion_limit = "256"]
 
 pub mod agent;
+pub mod changes;
 pub mod connector_session;
 pub mod control;
 pub mod draft;

@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
+use gritt_core::config::Config;
 use gritt_core::provider::ProviderProfile;
 use gritt_core::secret::Secret;
 use gritt_harness::setup::{
@@ -127,6 +128,14 @@ impl<K: Keychain + Send + Sync, E: EnvSource + Send + Sync> ProviderSetup for Fi
             path,
             shadowed_by,
         }
+    }
+
+    /// Merges the layers again, exactly as startup does, so a profile
+    /// written a moment ago becomes usable without restarting Gritt. A
+    /// configuration that no longer parses is reported as no reload rather
+    /// than replacing a working one with an error.
+    fn reload_config(&self) -> Option<Config> {
+        crate::config::load(&self.workspace, std::env::vars()).ok()
     }
 
     fn store_credential(&self, profile: &ProviderProfile, value: Secret) -> CredentialStoreOutcome {

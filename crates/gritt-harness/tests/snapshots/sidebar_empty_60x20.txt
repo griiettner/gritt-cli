@@ -1,54 +1,50 @@
-# mcp 60x20
+# sidebar_empty 60x20
 
 ## text
 
 api-cleanup  coding  fixture
 you   Tidy the public API of the store module.
- ╭ MCP servers ───────────────────────────────────────────╮
-t│› ▏                                                     │
- │Enter opens the actions for a server; every configured e│
-g│  gritt-local-memory                            [ready] │
- │    6 tools                                             │
- │    connected; its tools are available                  │
- │  turso-local-memory                         [starting] │
- │    connecting and negotiating the protocol             │
-t│  unapproved-server                 [awaiting approval] │
- │    waiting for approval to run this definition in this │
-t│  broken-server                                [failed] │
- │    failed: the command exited with status 127          │
- │  legacy-sse                              [unsupported] │
- │    gritt cannot connect to it: standalone SSE is not su│
-╭│                                                        │╮
-│╰ type to filter · Enter selects · Esc closes ───────────╯│
+
+think Reading the module, then the callers.
+
+gritt I read `store/mod.rs` and found three exported
+      helpers that no caller outside the crate uses. I will
+      make them private and keep the trait surface
+      unchanged. 世界 renders at its real width.
+
+tool  -> file_read store/mod.rs
+
+tool  <- file_read ok
+
+      tool output contained ␛[31m and was rendered as text
+
+╭──────────────────────────────────────────────────────────╮
+│Ask Gritt to do something…                                │
 ╰──────────────────────────────────────────────────────────╯
 openai · openai/gpt-5-nano  effort medium
 
 ## styles dark
 
+fg=Some(Reset) bg=Some(Reset) mod=NONE
 fg=Some(Rgb(122, 162, 247)) bg=Some(Rgb(20, 22, 26)) mod=BOLD
-fg=Some(Rgb(122, 162, 247)) bg=Some(Rgb(30, 33, 39)) mod=BOLD
 fg=Some(Rgb(122, 162, 247)) bg=Some(Rgb(30, 33, 39)) mod=NONE
 fg=Some(Rgb(135, 143, 156)) bg=Some(Rgb(20, 22, 26)) mod=DIM
 fg=Some(Rgb(135, 143, 156)) bg=Some(Rgb(20, 22, 26)) mod=ITALIC
 fg=Some(Rgb(135, 143, 156)) bg=Some(Rgb(20, 22, 26)) mod=NONE
 fg=Some(Rgb(135, 143, 156)) bg=Some(Rgb(30, 33, 39)) mod=DIM
-fg=Some(Rgb(135, 143, 156)) bg=Some(Rgb(30, 33, 39)) mod=NONE
 fg=Some(Rgb(221, 225, 230)) bg=Some(Rgb(20, 22, 26)) mod=NONE
 fg=Some(Rgb(221, 225, 230)) bg=Some(Rgb(30, 33, 39)) mod=NONE
-fg=Some(Rgb(221, 225, 230)) bg=Some(Rgb(45, 63, 100)) mod=BOLD
 fg=Some(Rgb(240, 113, 120)) bg=Some(Rgb(20, 22, 26)) mod=BOLD
 
 ## styles light
 
+fg=Some(Reset) bg=Some(Reset) mod=NONE
 fg=Some(Rgb(163, 29, 44)) bg=Some(Rgb(250, 250, 248)) mod=BOLD
-fg=Some(Rgb(34, 37, 43)) bg=Some(Rgb(205, 218, 245)) mod=BOLD
 fg=Some(Rgb(34, 37, 43)) bg=Some(Rgb(238, 239, 242)) mod=NONE
 fg=Some(Rgb(34, 37, 43)) bg=Some(Rgb(250, 250, 248)) mod=NONE
-fg=Some(Rgb(43, 84, 168)) bg=Some(Rgb(238, 239, 242)) mod=BOLD
 fg=Some(Rgb(43, 84, 168)) bg=Some(Rgb(238, 239, 242)) mod=NONE
 fg=Some(Rgb(43, 84, 168)) bg=Some(Rgb(250, 250, 248)) mod=BOLD
 fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(238, 239, 242)) mod=DIM
-fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(238, 239, 242)) mod=NONE
 fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(250, 250, 248)) mod=DIM
 fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(250, 250, 248)) mod=ITALIC
 fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(250, 250, 248)) mod=NONE
@@ -56,7 +52,6 @@ fg=Some(Rgb(95, 102, 114)) bg=Some(Rgb(250, 250, 248)) mod=NONE
 ## styles no-color
 
 fg=Some(Reset) bg=Some(Reset) mod=BOLD
-fg=Some(Reset) bg=Some(Reset) mod=BOLD | REVERSED
 fg=Some(Reset) bg=Some(Reset) mod=DIM
 fg=Some(Reset) bg=Some(Reset) mod=ITALIC
 fg=Some(Reset) bg=Some(Reset) mod=NONE

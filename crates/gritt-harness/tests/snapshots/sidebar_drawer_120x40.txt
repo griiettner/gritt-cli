@@ -19,6 +19,7 @@
                                                                                          │ Usage
                                                                                          │ in   12480
                                                                                          │ out  3210
+                                                                                         │ last 9100 in, last request
                                                                                          │ ctx  8% of context
                                                                                          │
                                                                                          │ Cost
@@ -32,12 +33,11 @@
                                                                                          │   modified (pre-existing)
                                                                                          │
                                                                                          │ Integrations
+                                                                                         │ MCP owned by Gritt
                                                                                          │ gritt-local-memory ready
                                                                                          │   6 tools
                                                                                          │ turso-local-memory starting
                                                                                          │   connecting and negotiatin
-                                                                                         │ unapprove… awaiting approva
-                                                                                         │   waiting for approval to r
  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │Ask Gritt to do something…                                                                                          │
  ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

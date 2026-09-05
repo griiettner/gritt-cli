@@ -16,6 +16,7 @@ use gritt_core::session::{Phase, SessionKind, SessionStore};
 use gritt_core::{Error, Result};
 use gritt_harness::agent::{AgentBuilder, ApprovalMode, SessionSelector, TurnStatus, Ui};
 use gritt_harness::control::ControlPlane;
+use gritt_harness::draft::SessionDraft;
 use gritt_harness::mcp::McpRuntime;
 use gritt_harness::modes::print::{PrintUi, PrintUiOptions};
 use gritt_harness::modes::repl::{line_prompter, run_repl, CancelSlot, LineInput};
@@ -712,22 +713,52 @@ async fn run_tui_mode(
     result
 }
 
+/// The full-screen session.
+///
+/// A named session, or one on an external agent, is opened eagerly as
+/// before: the user asked for that session and a failure to open it is
+/// their answer. Anything else is lazy (feature plan, step 5): the run
+/// starts on a draft seeded from `--profile` and `--model` above the
+/// configured defaults, and the session is created when the first prompt
+/// is submitted with valid choices.
 async fn tui_session(
     builder: AgentBuilder,
     args: &SessionArgs,
     connector: Option<ConnectorId>,
 ) -> Result<ExitCode> {
     let plane = plane(builder)?;
-    let agent = plane
-        .open(
-            selector(args),
-            connector,
-            args.profile.as_deref(),
-            args.model.as_deref(),
-            phase_flag(args),
+    let mut draft = SessionDraft::default();
+    if let Some(profile) = args.profile.as_deref() {
+        draft = draft.with_profile(profile);
+    }
+    if let Some(model) = args.model.as_deref() {
+        draft = draft.with_model(model);
+    }
+    if let Some(phase) = phase_flag(args) {
+        draft = draft.with_phase(phase);
+    }
+    // No configured profile is the strongest reason to take the lazy
+    // path: `/connect` has to work before anything is set up.
+    let lazy = args.session.is_none() && matches!(connector, None | Some(ConnectorId::Native));
+    let agent = if lazy {
+        None
+    } else {
+        if let Some(name) = &args.session {
+            draft = draft.with_name(name.clone());
+        }
+        Some(
+            plane
+                .open(
+                    selector(args),
+                    connector,
+                    args.profile.as_deref(),
+                    args.model.as_deref(),
+                    phase_flag(args),
+                )
+                .await?,
         )
-        .await?;
-    run_tui(&plane, agent).await?;
+    };
+    run_tui(plane, agent, draft).await?;
     Ok(ExitCode::SUCCESS)
 }
 

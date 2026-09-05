@@ -47,6 +47,10 @@ pub enum DraftOpen {
     },
 }
 
+/// Cloning shares every handle, which is what
+/// [`ControlPlane::reloaded`] and the asynchronous TUI work both need: a
+/// task holds its own handle without opening a second store or runtime.
+#[derive(Clone)]
 pub struct ControlPlane {
     pub builder: Arc<AgentBuilder>,
     native: Arc<NativeConnector>,
@@ -73,6 +77,40 @@ impl ControlPlane {
 
     pub fn setup(&self) -> &Arc<dyn ProviderSetup> {
         &self.setup
+    }
+
+    /// Re-reads configuration through the injected setup service and
+    /// rebuilds the plane around it.
+    ///
+    /// Saving a profile writes a file; it does not change the `Config` this
+    /// plane was built with. Without this, a profile created from the setup
+    /// flow would not appear in the connection picker until the next run.
+    /// The store, telemetry, catalog, cache, workspace, and MCP runtime are
+    /// shared handles and survive the rebuild, so nothing already open is
+    /// disturbed: only the configuration-derived parts change.
+    ///
+    /// Returns whether a reload happened. A service that cannot reload
+    /// answers `false` rather than pretending.
+    pub fn reload_config(&mut self) -> bool {
+        match self.reloaded() {
+            Some(plane) => {
+                *self = plane;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The same reload as a new value, for a caller that shares this plane
+    /// behind an `Arc` and replaces the handle rather than mutating it.
+    pub fn reloaded(&self) -> Option<ControlPlane> {
+        let config = self.setup.reload_config()?;
+        let mut plane = self.clone();
+        let mut builder = (*self.builder).clone();
+        builder.config = config;
+        plane.builder = Arc::new(builder);
+        plane.native = Arc::new(NativeConnector::new(Arc::clone(&plane.builder)));
+        Some(plane)
     }
 
     /// Every configured profile with credential availability, never a

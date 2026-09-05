@@ -1,0 +1,466 @@
+---
+id: TKT-0019
+namespace: griiettner
+title: Review fixes for the TUI integration
+artifact: update
+status: done
+owner: griiettner
+created: 2026-09-05
+updated: 2026-09-05
+chain_role: worker
+chain_parent: TKT-0015
+---
+
+# 2026-09-05 Review fixes
+
+## Trigger
+
+Semantic review of PR #11 returned `needs-fix` with two High and ten
+Medium findings, all confirmed against the branch at `76aeb54`. The
+reviewer's acceptance table marked "reject late asynchronous work" and
+"connect installed agents" not met, and six other criteria partial.
+
+## Changes per finding
+
+**1 (High) — a pending resume could replace a session while its old driver
+ran.** A session change is now *reserved*. `PendingOpen` in `run.rs` holds
+the operation id, the prompt that triggered a lazy open, and the driver
+being replaced; `idle_agent` is emptied when the request goes out, so a
+prompt submitted mid-switch cannot start a turn on the session being left.
+`UiMsg::Opened` carries the operation it answers and is applied only when
+it is still the one the loop is waiting for; anything else closes its
+driver. `ChannelUi` stamps every event, approval, and completion with the
+session generation its turn started under, and the handler drops those
+that no longer match — a stale approval is answered `Denied` rather than
+shown, and a stale driver is dropped rather than restored as the idle one.
+`App::session_transition` refuses submission and settings while a switch
+is in flight. A refused or failed open restores the previous driver.
+
+**2 (High) — cancelling the first lazy open stranded the interface.**
+`Action::Cancel` now takes the reservation, clears `running` and
+`session_transition`, returns the prompt to the composer through
+`undo_submission`, restores the previous driver, and says the draft was
+kept. A result queued before the cancellation can no longer match the
+operation, so it cannot open a session afterwards.
+
+**3 — MCP cancellation dropped initialization before cleanup.** The
+cancellation token is now held by the loop (`Runtime::mcp_cancel`) and MCP
+work runs detached. `cancel_work` and `spawn` both signal that token and
+leave the future to finish, because it owns the child process and the
+launch slot whose release happens in its own shutdown path.
+
+**4 — installed agents could not be selected; connectors could not
+resume.** `Notice` gained `confirm: Option<ConnectorId>`, so the agent
+detail view has an explicit acceptance and Enter returns
+`Action::SelectConnector`, which opens the session through
+`ControlPlane::open`. `resume_by_id` now looks at the stored session kind
+and routes a connector session through the same general operation; only a
+native session goes through `open_draft`, whose validation rejects
+connectors by design.
+
+**5 — configuration and keychain reads on the event path.** Initial
+profile enumeration moved out of `event_loop` into `load_profiles`, which
+resolves credentials in `spawn_blocking` and delivers `UiMsg::Profiles`;
+the connection dialog fills in when they arrive. The post-setup path does
+the write, the reload, and the new summaries in one blocking worker and
+returns a prepared `UiMsg::Reloaded`.
+
+**6 — Git blocked Tokio workers.** `WorkspaceChanges` runs every Git
+invocation and every filesystem read through `spawn_blocking`, behind a
+semaphore of two, so a slow repository cannot occupy executor capacity or
+let refreshes pile up.
+
+**7 — provider selection bypassed pinning.** One
+`refuses_pinned_change(profile, model)` check covers both halves and runs
+before anything is mutated, so a pinned session's draft, catalog, sidebar
+provider, and effort stay on what the driver is really using. A model of
+the same name under another provider is now recognised as a change.
+
+**8 — unknown usage became zero.** A count the provider did not report is
+left unknown. A turn missing either half sets `UsageSection::incomplete`,
+which withholds the cost estimate and says the totals are a floor. The
+last request's prompt tokens moved to `last_request_input` with their own
+label; `context_tokens` has no source yet, so occupancy stays unavailable.
+
+**9 — connector sessions misattributed Gritt's MCP inventory.**
+`apply_mcp` labels the list Gritt's whatever session is open and sets
+`IntegrationsSection::connector_mcp`, which renders
+`<agent>'s own MCP: not reported`.
+
+**10 — MCP trust bypassed the approval overlay.** Approving from `/mcp`
+now returns `McpRequest::RequestApproval`; the runtime fetches
+`McpRuntime::definition_summary` and the App shows it in the shared modal
+approval, with `mcp_approval` routing the answer to a trust decision
+instead of a tool approval. The summary carries the command and its
+arguments, or an endpoint with its query removed, plus environment and
+header **names** only, redacted against the entry's own credentials. Every
+mutating MCP action is refused while a turn or an approval is active.
+
+**11 — successful setup left the model picker stale.** `setup_outcome`
+returns an `Action`: on success it invalidates the catalog cached before
+the credential existed, bumps the selection token, rebuilds the picker
+underneath, and requests a fresh catalog, keeping the query, the highlight,
+and the composer draft.
+
+**12 — Git-quoted filenames.** `git status --porcelain=v1 -z` is parsed
+from NUL-separated records, with a rename's origin record consumed rather
+than reported. A Unicode path under `core.quotePath` and a filename
+containing ` -> ` both survive.
+
+**Optional, applied.** `SetupForm` has a hand-written `Debug` that prints
+the key's length and never its buffer.
+
+**Optional, recorded not applied.** The reviewer's note for TKT-0020: a
+reducer frame count does not cover the pre-terminal catalog and MCP waits
+inherited at startup, continuous draw attempts, UI queue bounds, or full
+history loading. That belongs in `report.md`'s follow-up 2 and is added
+there.
+
+## Validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, 0 errors |
+| `cargo test --workspace --no-fail-fast` | pass, 466 passed, 0 failed |
+| `cargo test -p gritt --test tui_pty` | pass, 10 passed |
+| `cargo test -p gritt-harness` | pass, 301 passed |
+| `GRITT_LIVE_MCP_TESTS=1 ... --test mcp_live_smoke` | pass, 1 passed |
+
+New coverage: five runtime-handler tests in `src/tui/run.rs` driving
+`on_action` and `on_message` against a stub driver, which is where
+findings 1, 2, and 3 live and where no reducer test could reach; a
+partial-usage test; a `Debug` redaction test; two `-z` parsing tests
+including a filename containing the rename separator; and the MCP
+approval overlay asserted in both the reducer tests and
+`tests/tui_integration.rs`, where the definition summary is checked to
+contain the executable and the environment *name* while not containing its
+value. The narrow PTY walkthrough now scrolls the drawer, which is how a
+24-row terminal reaches the sections below the fold, and asserts that an
+unreported token count is drawn `unavailable` rather than `0`.
+
+## Remaining follow-up
+
+The report's follow-up list stands. Two claims in it were corrected: the
+sidebar no longer shows context occupancy at all on the live path, and the
+walkthrough evidence section already stated that no human ran it in a real
+terminal, which the reviewer confirmed is still outstanding for the
+chain's verification requirement.
+
+---
+
+# Round 2
+
+## Trigger
+
+Re-review of PR #11 at `2c24cac` returned `needs-fix` with one High and
+five Medium findings, all confirmed. Round-1 fixes 2, 4, 8, 9, 12 and the
+refresh half of 11 were confirmed met; the rest were partial.
+
+## Changes per finding
+
+**1 (High) — superseding a resume stranded its reservation.** A session
+change shared `Runtime::work` with ordinary requests, so `/sessions`
+during a pending resume called `spawn`, aborted the open, and left
+`pending_open` and `session_transition` behind. The session-list response
+then cleared the loading line, and the reducer's Escape only looked at
+`running` and `loading`, so nothing could unwind it: prompts, settings,
+and further resumes stayed refused for the rest of the run. The session
+change now has its own slot, `Runtime::open_work`, which no other request
+touches, and `take_pending_open` aborts that task with the reservation so
+the two cannot separate. Escape checks `session_transition` as well.
+`a_session_list_during_a_resume_leaves_the_transition_recoverable` drives
+the real `Action::RefreshSessions` plus `UiMsg::Sessions` sequence and
+asserts both that the open survives it and that Escape recovers; the
+round-1 supersession test no longer clears the reservation by hand, it
+cancels the way a user does.
+
+**2 — keychain reads still blocked the first draw.** `event_loop` still
+called `profile_summaries()` synchronously. That line was meant to go in
+round 1 and did not: the script that removed it aborted on a later
+assertion before writing the file, and the follow-up script only reapplied
+the other half. It is gone; `load_profiles` is the only path, and the
+comment now says why nothing may enumerate profiles before the first draw.
+
+**3 — the concurrency permit outlived nothing.** `blocking` held the
+permit in the future that awaits the worker, so a cancelled caller
+released it while its `spawn_blocking` was still running. The permit is
+now owned and moved into the closure.
+`cancelling_a_scan_does_not_release_its_worker_s_permit` cancels six scans
+against a `git` that blocks for 120 ms and asserts the peak concurrent
+invocation count stays within the bound; against the previous code it
+records six. `record_write`'s `exists()` stat moved into the same blocking
+path, because the event handler awaits it after every turn.
+
+**4 — MCP operations lost their cancellation ownership.** `Runtime::mcp`
+now holds an id and a token. `begin_mcp` signals the operation it replaces
+rather than dropping the token, and `UiMsg::McpOutcome` carries the id, so
+a completion from a superseded action clears neither the live token nor
+the loading line. `overlapping_mcp_actions_keep_their_own_tokens_and_completions`
+covers both halves.
+
+**5 — setup bypassed session pinning.** `setup_outcome` adopted the saved
+profile into the draft and the sidebar without the pinning check, so
+`/connect` → add provider → save from a pinned session displayed a
+provider the driver was not using. The shared `refuses_pinned_change` now
+runs before the selection is adopted; the write itself is unaffected and
+the explanation says a new session is what uses it. Two tests: the pinned
+case saves without moving the selection or the composer draft, and the
+unpinned case still adopts the profile and returns the catalog reload,
+which also closes the reviewer's optional note that the returned action
+was unasserted.
+
+**6 — a delayed MCP approval could authorize mutation during a turn.**
+The definition response was accepted whenever no approval was pending,
+even if a turn had started since it was requested, and the decision
+handler mutated without rechecking. The response is now refused when
+settings are not editable, with a notice naming the server, and the
+`Decide` handler enforces the same guard before touching the runtime.
+`a_definition_arriving_after_a_turn_started_is_refused` covers both.
+
+**Optional, applied.** Focused tests for explicit connector confirmation
+(including that Escape starts nothing), for the Gritt-owned MCP label
+beside the connector's unreported state, and for the catalog action
+returned after a successful setup.
+
+## Validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, 0 errors |
+| `cargo test --workspace --no-fail-fast` | pass, 474 passed, 0 failed |
+| `cargo test -p gritt --test tui_pty` | pass, 10 passed |
+| `cargo test -p gritt-harness` | pass, 309 passed |
+| `GRITT_LIVE_MCP_TESTS=1 ... --test mcp_live_smoke` | pass, 1 passed |
+
+Honest note on one flake: `the_first_prompt_creates_the_session_and_new_keeps_it`
+failed once when run immediately after the full workspace suite, and its
+message was not captured. It passed on five subsequent runs, including the
+same back-to-back sequence and a run under synthetic CPU load, so it reads
+as contention rather than a defect. It is recorded here rather than left
+out; if it recurs, the PTY waits are the place to look.
+
+## Remaining follow-up
+
+Unchanged from round 1, minus the items closed above. The manual terminal
+walkthrough is still outstanding and is still the chain's, not this
+ticket's, to close.
+
+---
+
+# Round 3
+
+## Trigger
+
+Third review of PR #11 at `83ae981` returned `needs-fix` with two
+confirmed Medium findings. Round-2 fixes 1, 2, 5 and 6 were confirmed
+complete; 3 and 4 were partial, and both remaining defects are the halves
+those two left open.
+
+## Changes per finding
+
+**1 — metadata still blocked terminal input.** The `Finished` handler
+awaited `record_write` for every observed write and then the scan.
+`record_write` had been moved onto the bounded blocking pool in round 2 to
+get the stat off the loop, which fixed the stat but left the *await* on
+the loop: with both Git slots busy, the handler stopped drawing and
+stopped reading keys, Escape included. That is exactly the moment it
+matters, because a turn that just wrote files is what fills those slots.
+Recording and the follow-on scan now go through one background helper,
+`record_and_scan`, which captures the sidebar generation at the point of
+request so a result for a session the user has left is still refused when
+it lands. `a_turn_finishing_does_not_wait_for_the_workspace_observer`
+fills the pool with a `git` that blocks for two seconds and asserts the
+handler returns inside 500 ms; against the previous code it fails with the
+handler still waiting.
+
+**2 — ordinary completions could disable MCP cancellation.** A single
+`loading: Option<String>` was shared by every kind of asynchronous work.
+In the reported sequence — a slow `/models` load, its picker closed, then
+an MCP restart — the catalog response set that field to `None`, so the
+reducer's Escape saw nothing running and produced no `Action::Cancel`, and
+the runtime's cancel path was gated on the same field. The restart could
+not be cancelled at all.
+
+Work is now tracked per kind. `App::busy` is a map from `Work`
+(`Open`, `Mcp`, `Setup`, `Catalog`, `Sessions`, `Diff`) to its label;
+`App::loading()` derives the line on screen from it in priority order,
+`App::is_busy()` is what Escape acts on, and each completion ends only its
+own kind. `Runtime` records which kind occupies its ordinary slot, so
+superseding ends that kind and no other, and `cancel_work` ends every kind
+it actually stopped — signalling MCP rather than aborting it, as before.
+The round-2 test that asserted the shared field went quiet after a session
+list now asserts the opposite and correct thing: the session list ends its
+own label and the transition keeps saying it is outstanding.
+`a_catalog_response_cannot_disable_cancelling_an_mcp_restart` drives the
+reported sequence and fails against a simulated shared flag.
+
+**Optional, applied.** `a_slow_keychain_is_not_on_the_path_to_the_first_frame`
+in `tests/tui_integration.rs` builds a plane whose key provider takes
+750 ms, proves the enumeration really is that slow, then builds and draws
+the first frame from the configured defaults and the workspace and asserts
+it completes inside 200 ms.
+
+## Validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, 0 errors |
+| `cargo test --workspace --no-fail-fast` | pass, 477 passed, 0 failed |
+| `cargo test -p gritt --test tui_pty` | pass, 10 passed |
+| `cargo test -p gritt-harness` | pass, 312 passed |
+| `GRITT_LIVE_MCP_TESTS=1 ... --test mcp_live_smoke` | pass, 1 passed |
+
+Both new runtime tests were checked against the previous code and fail
+there, so neither is a test that would pass either way. The round-2 PTY
+flake did not recur in this round's runs.
+
+## Remaining follow-up
+
+Unchanged. The manual terminal walkthrough by a human is still
+outstanding, and it is the chain's to close rather than this ticket's.
+
+---
+
+# Round 4
+
+## Trigger
+
+Fourth review of PR #11 at `7915a8d` returned `needs-fix` with two
+confirmed Medium findings. The round-3 observer fix and the
+catalog/restart regression were confirmed; both remaining defects are in
+the bookkeeping that round 3 introduced.
+
+## Changes per finding
+
+**1 — MCP approval left ownership that could disable launch
+cancellation.** `Runtime::spawn` ends the *previous* kind when it installs
+a new one, but nothing retired a kind when its request simply finished. A
+definition read left `work_kind` set, and because the read and the
+lifecycle action shared one `Work::Mcp`, the sequence read → approve →
+launch → `/models` ended the live launch's label as if it were the
+superseded request. After the catalog finished, `is_busy()` was false and
+Escape produced no cancellation while `runtime.mcp` was still active.
+
+Two changes, both required. `Runtime::finish_work` ends the label and
+retires the slot's ownership in one step, and every ordinary completion
+now goes through it, so a finished request cannot stay installed as owner.
+And a definition read is its own kind, `Work::McpDefinition`: it is an
+ordinary cancellable request, the lifecycle action that follows it is
+detached with its own token, and sharing one kind is what let the
+bookkeeping of the first reach the second.
+`an_approved_launch_stays_cancellable_across_a_catalog_request` drives the
+whole sequence including the definition read that the round-3 regression
+skipped.
+
+**2 — cancelling an open left a stale highest-priority label.** The
+reservation was removed without ending `Work::Open`, which is first in the
+display order, so "Opening…" or "resuming…" stayed on screen and masked
+every later request. Releasing a session change now goes through one door,
+`Runtime::release_pending_open`, which takes the reservation, aborts its
+task, clears `session_transition`, and ends the label together; cancel,
+`/new`, and the success path all use it. The one path that previously had
+no owner at all — a result whose reservation is current but whose session
+generation has moved — releases it there too, since nothing else would
+have. The lazy-open and resume cancellation tests now assert the busy
+entry disappears and `loading()` is empty.
+
+## Validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, 0 errors |
+| `cargo test --workspace --no-fail-fast` | pass, 478 passed, 0 failed |
+| `cargo test -p gritt --test tui_pty` | pass, 10 passed |
+| `cargo test -p gritt-harness` | pass, 313 passed |
+| `GRITT_LIVE_MCP_TESTS=1 ... --test mcp_live_smoke` | pass, 1 passed |
+
+Both fixes were checked against the previous code by simulating it: the
+approval test fails with "a finished request stayed installed as the owner
+of the slot", and the lazy-open cancellation test fails with "the
+cancelled open left its label behind".
+
+## A note on the shape of these four rounds
+
+Every round after the first found the same kind of defect: two pieces of
+state that have to move together, moved separately. A reservation and its
+driver, a token and its operation, a label and the work it names, an owner
+and its completion. Each fix that only added a check left another pair
+un-paired. The ones that held are the ones that made the pairing
+structural — `release_pending_open`, `finish_work`, `begin_mcp` — so there
+is one door and no second place to forget. That is the note worth carrying
+into TKT-0020 and any later work on this loop.
+
+## Remaining follow-up
+
+Unchanged. The manual terminal walkthrough by a human is still
+outstanding and is the chain's to close.
+
+---
+
+# Round 5
+
+## Trigger
+
+Fifth review of PR #11 at `ee1da95` returned `needs-fix` with one
+confirmed Medium finding. Both round-4 scenarios were confirmed fixed; the
+finding is a regression that round 4's own fix introduced.
+
+## The finding
+
+`finish_work` matched a completion by its `Work` kind alone. Ordinary
+requests of the same kind supersede each other, so an older queued
+response satisfied the match for the newer one and retired it — ending the
+label and, worse, dropping the `JoinHandle` that was the only way to stop
+it. The reachable sequence:
+
+1. Diff A is requested; its result is queued.
+2. The user opens diff B before A's response is handled. B supersedes A
+   and owns the slot.
+3. A's completion arrives and is treated as B's, retiring B's ownership
+   and discarding its handle.
+4. `/new` can no longer cancel B, because there is nothing left to abort.
+5. B finishes and opens its diff over the fresh draft.
+
+Before round 4, A ended only the label and B's handle survived, so `/new`
+could still abort it. Round 4 traded that for the ownership retirement it
+needed, and did not carry the request identity with it.
+
+## The change
+
+The identity of ordinary work is the kind *and* the request. `ActiveWork`
+holds both, every ordinary message carries the `operation` it answers, and
+the id is allocated where the request is made. `finish_work` retires the
+slot only for the request that still owns it and *returns whether it did*,
+marked `#[must_use]`; every handler asks once and uses the same answer to
+decide both whether to retire the ownership and whether to apply the
+result. Those two decisions can no longer be made separately, which is the
+failure mode that produced findings in four consecutive rounds.
+
+A stale completion therefore changes nothing and shows nothing. That
+closes a second, quieter case in the same code: a cancelled diff used to
+open its overlay when its result eventually landed, over whatever the
+reader had moved on to.
+
+`a_queued_diff_cannot_retire_the_one_that_replaced_it` drives the reported
+sequence deterministically — A queued, B live, A's completion, `/new`,
+then B's late completion — and fails against the previous code.
+
+## Validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, 0 errors |
+| `cargo test --workspace --no-fail-fast` | pass, 478 passed, 0 failed |
+| `cargo test -p gritt --test tui_pty` | pass, 10 passed |
+| `cargo test -p gritt-harness` | pass, 314 passed |
+| `GRITT_LIVE_MCP_TESTS=1 ... --test mcp_live_smoke` | pass, 1 passed |
+
+## Remaining follow-up
+
+Unchanged. The manual terminal walkthrough by a human is still
+outstanding and is the chain's to close.

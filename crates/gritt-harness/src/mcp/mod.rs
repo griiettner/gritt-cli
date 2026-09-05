@@ -44,7 +44,7 @@ use gritt_core::{Error, Result};
 use gritt_provider::adapter::{redact_text, redact_value};
 use gritt_provider::transport::HttpTransport;
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 
 use self::connection::Connection;
 use self::registry::{render_result, RenderedResult, ToolRegistry};
@@ -55,6 +55,11 @@ pub use self::registry::{dispatch_name, is_dispatch_name, RegisteredTool};
 
 /// The file every workspace is read from. Gritt never writes it.
 pub const CONFIG_FILE: &str = ".mcp.json";
+
+/// How many lifecycle messages a slow subscriber may fall behind before the
+/// oldest are dropped. Every message carries the full state, so a lag costs
+/// intermediate frames and never correctness.
+const LIFECYCLE_QUEUE: usize = 32;
 
 /// How long shutdown waits for in-flight initializations to release their
 /// connections after they have been closed. Only a future that never returns
@@ -170,6 +175,10 @@ pub struct McpRuntime {
     /// started. A session that begins on a connector never opens the
     /// runtime; entering a native session later does.
     opened: AtomicBool,
+    /// Lifecycle delivery. Every state change publishes the whole snapshot
+    /// list, so an interface never polls and a subscriber that missed a
+    /// message still converges on the current truth (TKT-0019).
+    lifecycle: broadcast::Sender<Vec<McpServerSnapshot>>,
 }
 
 impl McpRuntime {
@@ -187,7 +196,22 @@ impl McpRuntime {
             decisions: Mutex::new(()),
             launch_gate: None,
             opened: AtomicBool::new(false),
+            lifecycle: broadcast::channel(LIFECYCLE_QUEUE).0,
         }
+    }
+
+    /// Subscribes to lifecycle changes. Each message is the complete
+    /// snapshot list, which is why a lagging receiver can be resynchronised
+    /// by the next message instead of replaying a history.
+    pub fn subscribe(&self) -> broadcast::Receiver<Vec<McpServerSnapshot>> {
+        self.lifecycle.subscribe()
+    }
+
+    /// Publishes the current snapshots to every subscriber. A send with no
+    /// subscribers is not an error.
+    async fn publish(&self) {
+        let snapshots = self.snapshots().await;
+        let _ = self.lifecycle.send(snapshots);
     }
 
     pub fn with_http_transport(mut self, transport: Arc<dyn HttpTransport>) -> Self {
@@ -363,6 +387,7 @@ impl McpRuntime {
             state.servers = next;
         }
         close_all(retired).await;
+        self.publish().await;
         Ok(())
     }
 
@@ -453,6 +478,7 @@ impl McpRuntime {
         if let Some(connection) = retired {
             connection.shutdown().await;
         }
+        self.publish().await;
         Ok(())
     }
 
@@ -551,6 +577,7 @@ impl McpRuntime {
         for launch in launches {
             self.finish_launch(launch).await;
         }
+        self.publish().await;
         self.snapshots().await
     }
 
@@ -660,6 +687,7 @@ impl McpRuntime {
         if let Some(connection) = retired {
             connection.shutdown().await;
         }
+        self.publish().await;
         Ok(())
     }
 
@@ -733,6 +761,7 @@ impl McpRuntime {
             close_all(attached).await;
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        self.publish().await;
     }
 
     /// Lets a runtime be used again after a shutdown, which the tests need
@@ -788,6 +817,7 @@ impl McpRuntime {
                 }
             }
         }
+        self.publish().await;
         self.snapshots().await
     }
 
@@ -839,6 +869,53 @@ impl McpRuntime {
                 })
                 .collect(),
         }
+    }
+
+    /// A redacted one-line summary of what approving this entry would run
+    /// or connect to, for a first-use approval prompt.
+    ///
+    /// Reading a workspace file does not authorize executing what it
+    /// names, so an interface has to be able to show the command before
+    /// the user grants it. Two rules keep this safe. Only the *shape* of
+    /// the definition leaves: a command and its arguments, an endpoint
+    /// with its query string removed, and environment or header **names**
+    /// without their values. And the result is redacted against the
+    /// credentials this entry's own interpolation produced, so a value
+    /// that reached an argument through `${TOKEN}` cannot be echoed here.
+    ///
+    /// `None` for an entry that cannot run; its state already carries the
+    /// reason.
+    pub async fn definition_summary(&self, server: &str) -> Option<String> {
+        let state = self.state.lock().await;
+        let config = state.servers.get(server)?.config.clone()?;
+        drop(state);
+        let secrets = entry_secrets(&config);
+        let summary = match &config.transport {
+            McpTransport::Stdio { command, args, env } => {
+                let mut text = format!("run: {command}");
+                for argument in args {
+                    text.push(' ');
+                    text.push_str(argument);
+                }
+                if !env.is_empty() {
+                    let names: Vec<&str> = env.keys().map(String::as_str).collect();
+                    text.push_str(&format!("\nenvironment: {}", names.join(", ")));
+                }
+                text
+            }
+            McpTransport::Http { url, headers } => {
+                // The query string can carry a token in a URL that no
+                // header rule would have caught.
+                let endpoint = url.split_once('?').map(|(head, _)| head).unwrap_or(url);
+                let mut text = format!("connect: {endpoint}");
+                if !headers.is_empty() {
+                    let names: Vec<&str> = headers.keys().map(String::as_str).collect();
+                    text.push_str(&format!("\nheaders: {}", names.join(", ")));
+                }
+                text
+            }
+        };
+        Some(redact_text(&summary, &secrets))
     }
 
     /// Every configured entry with its state, tool count, and safe reason.

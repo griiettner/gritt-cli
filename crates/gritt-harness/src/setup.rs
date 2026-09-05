@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use gritt_core::config::Config;
 use gritt_core::provider::{Protocol, ProviderProfile};
 use gritt_core::secret::Secret;
 use serde::{Deserialize, Serialize};
@@ -150,6 +151,96 @@ pub trait ProviderSetup: Send + Sync {
     /// Writes a key to the keychain entry the profile names. Never to a
     /// file.
     fn store_credential(&self, profile: &ProviderProfile, value: Secret) -> CredentialStoreOutcome;
+
+    /// Re-reads the configuration layers this service writes to.
+    ///
+    /// [`ProfileSaveOutcome::Saved`] says a file changed, not that the
+    /// running configuration did. An interface that just created a profile
+    /// needs it to be usable without a restart, and only the binary knows
+    /// which layers to merge (ADR-006), so the reload lives here too.
+    /// `None` means this service cannot reload, which is the default and
+    /// what a read-only harness answers.
+    fn reload_config(&self) -> Option<Config> {
+        None
+    }
+}
+
+/// The profile spec and the key a setup interface collected, handed to
+/// [`apply_setup`] once. The key travels here and nowhere else: it is not
+/// in the interface's action type, its transcript, or its state after the
+/// submission is taken.
+pub struct SetupSubmission {
+    pub profile: ProviderProfile,
+    /// `None` when no key was typed, which is allowed: the variable may
+    /// already be set in the environment.
+    pub secret: Option<Secret>,
+    pub destination: ConfigDestination,
+}
+
+/// Writes a profile and, when one was typed, its key. Returns the line to
+/// show and whether the setup flow may close.
+///
+/// The order matters: the profile is written first, because a key with no
+/// profile to belong to is unusable, and a keychain that refuses still
+/// leaves a usable profile as long as the variable is exported.
+pub fn apply_setup(setup: &dyn ProviderSetup, submission: SetupSubmission) -> (String, bool) {
+    let saved = setup.save_profile(&submission.profile, submission.destination);
+    let (message, ok) = match saved {
+        ProfileSaveOutcome::Saved {
+            path, shadowed_by, ..
+        } => (
+            match shadowed_by {
+                Some(layer) => format!(
+                    "saved to {}, but a {} configuration already defines this profile and wins",
+                    path.display(),
+                    match layer {
+                        ConfigDestination::User => "user",
+                        ConfigDestination::Project => "project",
+                    }
+                ),
+                None => format!("saved to {}", path.display()),
+            },
+            true,
+        ),
+        ProfileSaveOutcome::Invalid { problem } => {
+            (format!("the profile is not valid: {problem:?}"), false)
+        }
+        ProfileSaveOutcome::Unavailable { reason } => (reason, false),
+        ProfileSaveOutcome::Failed { message } => (message, false),
+    };
+    if !ok {
+        return (message, false);
+    }
+    let Some(secret) = submission.secret else {
+        return (
+            format!(
+                "{message}; no key was typed, so {} must be set in the environment",
+                submission.profile.key.env_var_name
+            ),
+            true,
+        );
+    };
+    match setup.store_credential(&submission.profile, secret) {
+        CredentialStoreOutcome::Stored { .. } => {
+            (format!("{message}; the key went to the keychain"), true)
+        }
+        CredentialStoreOutcome::KeychainUnavailable {
+            env_var_name,
+            message: reason,
+            ..
+        } => (
+            format!(
+                "{message}, but the keychain is unavailable ({reason}). Export {env_var_name} instead."
+            ),
+            // The profile exists; only the key did not land. The flow
+            // closes so the profile is usable once the variable is set.
+            true,
+        ),
+        CredentialStoreOutcome::Unavailable { reason } => (
+            format!("{message}, but no keychain writer is available: {reason}"),
+            true,
+        ),
+    }
 }
 
 /// The default when nothing was injected: every write is reported as

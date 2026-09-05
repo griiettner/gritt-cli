@@ -19,12 +19,12 @@
                                           │ Usage                              │
                                           │ in   12480                         │
                                           │ out  3210                          │
+                                          │ last 9100 in, last request         │
                                           │ ctx  8% of context                 │
                                           │                                    │
-                                          │ Cost                               │
- ╭────────────────────────────────────────│ est  ~$0.0412                      │
- │Ask Gritt to do something…              │ for  this session, listed prices   │
- ╰────────────────────────────────────────│                                    │
+ ╭────────────────────────────────────────│ Cost                               │
+ │Ask Gritt to do something…              │ est  ~$0.0412                      │
+ ╰────────────────────────────────────────│ for  this session, listed prices   │
  openai · openai/gpt-5-nano  effort medium╰────────────────────────────────────╯
 
 ## styles dark

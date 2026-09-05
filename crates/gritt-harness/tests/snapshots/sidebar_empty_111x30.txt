@@ -1,4 +1,4 @@
-# conversation 111x30
+# sidebar_empty 111x30
 
 ## text
 
@@ -12,22 +12,22 @@
        surface unchanged. 世界 renders at its real width.                       │ now  streaming
                                                                                 │
  tool  -> file_read store/mod.rs                                                │ Model
-         pub fn open() -> Result<Store>                                         │ via  openai
-         pub fn migrate() -> Result<()>                                         │ id   openai/gpt-5-nano
-         pub(crate) fn seed()                                                   │ effort medium
-                                                                                │
- tool  <- file_read ok                                                          │ Usage
-                                                                                │ in   12480
-       tool output contained ␛[31m and was rendered as text                     │ out  3210
-                                                                                │ last 9100 in, last request
-                                                                                │ ctx  8% of context
+                                                                                │ via  openai
+ tool  <- file_read ok                                                          │ id   openai/gpt-5-nano
+                                                                                │ effort medium
+       tool output contained ␛[31m and was rendered as text                     │
+                                                                                │ Usage
+                                                                                │ in   unavailable
+                                                                                │ out  unavailable
+                                                                                │ last unavailable
+                                                                                │ ctx  unavailable
                                                                                 │
                                                                                 │ Cost
-                                                                                │ est  ~$0.0412
-                                                                                │ for  this session, listed p
+                                                                                │ est  unavailable
                                                                                 │
                                                                                 │ Changed files
-                                                                                │ + crates/gritt-harness/src/
+                                                                                │ none
+                                                                                │
  ╭───────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │Ask Gritt to do something…                                                                                 │
  ╰───────────────────────────────────────────────────────────────────────────────────────────────────────────╯

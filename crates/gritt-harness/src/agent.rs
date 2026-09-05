@@ -876,6 +876,10 @@ pub enum SessionSelector {
 
 /// Everything needed to build agents: config, store, keys, transport, and
 /// the model catalog. The binary owns the concrete key source.
+/// Cloning shares every handle and copies only the configuration, which is
+/// what [`crate::control::ControlPlane::reload_config`] needs: a rebuilt
+/// plane must not open a second store, catalog, or MCP runtime.
+#[derive(Clone)]
 pub struct AgentBuilder {
     pub config: Config,
     pub store: Arc<Store>,

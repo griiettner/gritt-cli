@@ -19,6 +19,7 @@
                       │                                                                          │
                       │                                                                          │480
                       │                                                                          │10
+                      │                                                                          │00 in, last request
                       │                                                                          │ of context
                       │                                                                          │
                       │                                                                          │
@@ -32,12 +33,11 @@
                       │                                                                          │ied (pre-existing)
                       │                                                                          │
                       │                                                                          │tions
+                      │                                                                          │ed by Gritt
                       │                                                                          │ocal-memory ready
                       │                                                                          │ls
                       │                                                                          │ocal-memory starting
-                      │                                                                          │cting and negotiatin
-                      │                                                                          │ve… awaiting approva
-                      ╰ type to filter · Enter selects · Esc closes ─────────────────────────────╯ng for approval to r
+                      ╰ type to filter · Enter selects · Esc closes ─────────────────────────────╯cting and negotiatin
  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │Ask Gritt to do something…                                                                                          │
  ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

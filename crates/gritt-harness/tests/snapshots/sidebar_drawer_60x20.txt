@@ -19,8 +19,8 @@ tool  <- file_read ok │ effort medium                      │
       tool output cont│ Usage                              │
                       │ in   12480                         │
 ╭─────────────────────│ out  3210                          │
-│Ask Gritt to do somet│ ctx  8% of context                 │
-╰─────────────────────│                                    │
+│Ask Gritt to do somet│ last 9100 in, last request         │
+╰─────────────────────│ ctx  8% of context                 │
 openai · openai/gpt-5-╰────────────────────────────────────╯
 
 ## styles dark

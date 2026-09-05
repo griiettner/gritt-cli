@@ -19,6 +19,7 @@ use super::picker::{ListStatus, Picker};
 use super::sidebar::{SidebarPlacement, SIDEBAR_GUTTER, SIDEBAR_MIN_TERMINAL_WIDTH, SIDEBAR_WIDTH};
 use super::theme::Theme;
 use crate::modes::print::approval_text;
+use crate::setup::ConfigDestination;
 
 /// The composer and the home column never grow past this, so a wide
 /// terminal reads as a centred document rather than a stretched line.
@@ -150,6 +151,8 @@ pub fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 }
 
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
+    // One frame, counted for the deterministic timing harness.
+    app.count_frame();
     let area = frame.area();
     // The reducer needs the terminal width to know whether `/sidebar`
     // toggles a column or opens a drawer, and only the frame knows it.
@@ -264,6 +267,30 @@ fn home_subtitle(app: &App) -> String {
     }
 }
 
+/// A path shortened to `width` cells from the left, so the directory a
+/// user recognises is the part that survives.
+fn short_path(path: &str, width: usize) -> String {
+    use crate::tui::composer::display_width;
+    if display_width(path) <= width {
+        return path.to_owned();
+    }
+    let mut kept = String::new();
+    for part in path.rsplit('/') {
+        if part.is_empty() {
+            continue;
+        }
+        let candidate = format!("/{part}{kept}");
+        if display_width(&candidate) + 1 > width {
+            break;
+        }
+        kept = candidate;
+    }
+    if kept.is_empty() {
+        return "…".to_owned();
+    }
+    format!("…{kept}")
+}
+
 fn home_status(app: &App, width: u16) -> Vec<Line<'static>> {
     let theme = &app.theme;
     // A narrow home drops the directory and the phase before it drops the
@@ -304,7 +331,10 @@ fn home_status(app: &App, width: u16) -> Vec<Line<'static>> {
         parts.push(Span::styled("  ·  ", theme.dim()));
     }
     parts.extend([
-        Span::styled(app.status.workspace.clone(), theme.muted()),
+        // A deep workspace path is shortened from its head: the line has
+        // to keep the connection, effort, and phase that follow it, and
+        // the last components are the ones that identify the directory.
+        Span::styled(short_path(&app.status.workspace, 34), theme.muted()),
         Span::styled("  ·  ", theme.dim()),
         Span::styled(
             if app.is_connected() {
@@ -595,6 +625,13 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
         return;
     }
+    // Asynchronous work is visible and cancellable, never a frozen frame.
+    if let Some(loading) = app.loading() {
+        spans.push(Span::styled(format!("{loading}… "), theme.accent()));
+        spans.push(Span::styled("Esc cancels".to_owned(), theme.dim()));
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     spans.push(Span::styled(
         if app.is_connected() {
             format!("{} · {}", app.status.profile, app.status.model)
@@ -690,6 +727,9 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App, overlay: &Overlay, area: Rect)
         Overlay::Setup(form) => draw_setup(frame, app, form, area),
         Overlay::Notice(notice) => draw_notice(frame, app, notice, area),
         Overlay::Help { scroll } => draw_help(frame, app, *scroll, area),
+        Overlay::FileDiff { path, body, scroll } => {
+            draw_file_diff(frame, app, path, body, *scroll, area)
+        }
         Overlay::Drawer { .. } => {
             // At 110 columns or more the column is the sidebar, so a
             // drawer left open by a resize is not drawn over it.
@@ -869,6 +909,15 @@ fn draw_picker(frame: &mut Frame<'_>, app: &App, kind: PickerKind, picker: &Pick
     frame.render_widget(Paragraph::new(Text::from(window)), rows[2]);
 }
 
+/// The wire protocol, spelled the way the configuration file does.
+fn protocol_label(protocol: gritt_core::provider::Protocol) -> &'static str {
+    match protocol {
+        gritt_core::provider::Protocol::ChatCompletions => "chat_completions",
+        gritt_core::provider::Protocol::Responses => "responses",
+        gritt_core::provider::Protocol::Messages => "messages",
+    }
+}
+
 fn draw_setup(frame: &mut Frame<'_>, app: &App, form: &SetupForm, area: Rect) {
     let theme = &app.theme;
     let target = overlay_area(area, 70, 16);
@@ -876,7 +925,7 @@ fn draw_setup(frame: &mut Frame<'_>, app: &App, form: &SetupForm, area: Rect) {
     let block = panel(
         theme,
         "Provider setup".to_owned(),
-        "Tab moves · Enter confirms · Esc returns",
+        "Tab moves · Ctrl-T protocol · Ctrl-D destination · Esc returns",
     );
     let inner = block.inner(target);
     frame.render_widget(block, target);
@@ -920,10 +969,21 @@ fn draw_setup(frame: &mut Frame<'_>, app: &App, form: &SetupForm, area: Rect) {
         ]));
     }
     lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        format!("{:>14}  {:?}", "saves to", form.destination),
-        theme.muted(),
-    )));
+    lines.push(Line::from(vec![
+        Span::styled(format!("{:>14}  ", "protocol"), theme.muted()),
+        Span::styled(protocol_label(form.protocol).to_owned(), theme.text()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(format!("{:>14}  ", "saves to"), theme.muted()),
+        Span::styled(
+            match form.destination {
+                ConfigDestination::User => "the user configuration",
+                ConfigDestination::Project => "this workspace's config.toml",
+            }
+            .to_owned(),
+            theme.text(),
+        ),
+    ]));
     if let Some(outcome) = &form.outcome {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(outcome.clone(), theme.error())));
@@ -953,6 +1013,42 @@ fn draw_notice(frame: &mut Frame<'_>, app: &App, notice: &Notice, area: Rect) {
         .wrap(Wrap { trim: false }),
         inner,
     );
+}
+
+/// A changed file's diff, read only. The text came from the harness; this
+/// draws it and nothing here can write to the workspace.
+fn draw_file_diff(
+    frame: &mut Frame<'_>,
+    app: &App,
+    path: &str,
+    body: &str,
+    scroll: usize,
+    area: Rect,
+) {
+    let theme = &app.theme;
+    let target = overlay_area(area, 92, (area.height * 4 / 5).max(8));
+    frame.render_widget(Clear, target);
+    let block = panel(
+        theme,
+        format!("{path} · read only"),
+        "j/k scrolls · Esc closes",
+    );
+    let inner = block.inner(target);
+    frame.render_widget(block, target);
+    let lines: Vec<Line<'static>> = body
+        .lines()
+        .map(|line| {
+            let style = match line.as_bytes().first() {
+                Some(b'+') => theme.success(),
+                Some(b'-') => theme.error(),
+                Some(b'@') => theme.accent(),
+                _ => theme.text(),
+            };
+            Line::from(Span::styled(crate::tui::app::sanitize(line), style))
+        })
+        .collect();
+    let start = scroll.min(lines.len());
+    frame.render_widget(Paragraph::new(Text::from(lines[start..].to_vec())), inner);
 }
 
 fn draw_help(frame: &mut Frame<'_>, app: &App, scroll: usize, area: Rect) {

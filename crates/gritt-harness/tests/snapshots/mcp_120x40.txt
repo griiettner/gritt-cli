@@ -8,22 +8,23 @@
  think Reading the module, then the callers.                                             │ Session
                       ╭ MCP servers ─────────────────────────────────────────────────────────────╮i-cleanup
  gritt I read `store/m│› ▏                                                                       │ork/gritt
-       the crate uses.│Every configured entry is listed, whatever its state                      │oding
+       the crate uses.│Enter opens the actions for a server; every configured entry is listed    │oding
        世界 renders at│  gritt-local-memory                                              [ready] │reaming
                       │    6 tools                                                               │
  tool  -> file_read st│    connected; its tools are available                                    │
                       │  turso-local-memory                                           [starting] │enai
- tool  <- file_read ok│  — starting                                                              │enai/gpt-5-nano
-                      │    connecting and negotiating the protocol                               │medium
-       tool output con│  unapproved-server                                   [awaiting approval] │
-                      │  — awaiting approval                                                     │
-                      │    waiting for approval to run this definition in this workspace         │480
-                      │  broken-server                                                  [failed] │10
-                      │  — failed                                                                │ of context
-                      │    failed: the command exited with status 127                            │
-                      │  legacy-sse                                                [unsupported] │
-                      │  — unsupported                                                           │0.0412
-                      │    gritt cannot connect to it: standalone SSE is not supported; use Strea│is session, listed p
+ tool  <- file_read ok│    connecting and negotiating the protocol                               │enai/gpt-5-nano
+                      │  unapproved-server                                   [awaiting approval] │medium
+       tool output con│    waiting for approval to run this definition in this workspace         │
+                      │  broken-server                                                  [failed] │
+                      │    failed: the command exited with status 127                            │480
+                      │  legacy-sse                                                [unsupported] │10
+                      │    gritt cannot connect to it: standalone SSE is not supported; use Strea│00 in, last request
+                      │                                                                          │ of context
+                      │                                                                          │
+                      │                                                                          │
+                      │                                                                          │0.0412
+                      │                                                                          │is session, listed p
                       │                                                                          │
                       │                                                                          │ files
                       │                                                                          │s/gritt-harness/src/
@@ -32,12 +33,11 @@
                       │                                                                          │ied (pre-existing)
                       │                                                                          │
                       │                                                                          │tions
+                      │                                                                          │ed by Gritt
                       │                                                                          │ocal-memory ready
                       │                                                                          │ls
                       │                                                                          │ocal-memory starting
-                      │                                                                          │cting and negotiatin
-                      │                                                                          │ve… awaiting approva
-                      ╰ type to filter · Enter selects · Esc closes ─────────────────────────────╯ng for approval to r
+                      ╰ type to filter · Enter selects · Esc closes ─────────────────────────────╯cting and negotiatin
  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │Ask Gritt to do something…                                                                                          │
  ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
@@ -60,12 +60,10 @@ fg=Some(Rgb(221, 225, 230)) bg=Some(Rgb(20, 22, 26)) mod=NONE
 fg=Some(Rgb(221, 225, 230)) bg=Some(Rgb(30, 33, 39)) mod=NONE
 fg=Some(Rgb(221, 225, 230)) bg=Some(Rgb(45, 63, 100)) mod=BOLD
 fg=Some(Rgb(240, 113, 120)) bg=Some(Rgb(20, 22, 26)) mod=BOLD
-fg=Some(Rgb(240, 113, 120)) bg=Some(Rgb(30, 33, 39)) mod=BOLD
 
 ## styles light
 
 fg=Some(Reset) bg=Some(Reset) mod=NONE
-fg=Some(Rgb(163, 29, 44)) bg=Some(Rgb(238, 239, 242)) mod=BOLD
 fg=Some(Rgb(163, 29, 44)) bg=Some(Rgb(250, 250, 248)) mod=BOLD
 fg=Some(Rgb(29, 111, 53)) bg=Some(Rgb(250, 250, 248)) mod=NONE
 fg=Some(Rgb(34, 37, 43)) bg=Some(Rgb(205, 218, 245)) mod=BOLD
