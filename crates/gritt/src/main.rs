@@ -4,6 +4,7 @@
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use clap::{Args, Parser, Subcommand};
@@ -486,7 +487,9 @@ fn print_options(
 /// The exit path releases the MCP servers first. Those children live for the
 /// whole session and sit in their own process groups, so leaving through
 /// `process::exit` without asking them to stop would strand them.
-fn install_ctrl_c(slot: CancelSlot, mcp: Option<Arc<McpRuntime>>) {
+fn install_ctrl_c(slot: CancelSlot, mcp: Option<Arc<McpRuntime>>) -> Arc<AtomicBool> {
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&interrupted);
     tokio::spawn(async move {
         loop {
             if tokio::signal::ctrl_c().await.is_err() {
@@ -499,6 +502,11 @@ fn install_ctrl_c(slot: CancelSlot, mcp: Option<Arc<McpRuntime>>) {
                     handle.cancel();
                 }
                 _ => {
+                    // Recorded before the cleanup, because releasing the
+                    // servers can let the work in progress finish and return
+                    // first. Whichever gets there first, the run reports an
+                    // interrupt rather than success.
+                    flag.store(true, Ordering::SeqCst);
                     if let Some(mcp) = &mcp {
                         mcp.shutdown().await;
                     }
@@ -507,6 +515,7 @@ fn install_ctrl_c(slot: CancelSlot, mcp: Option<Arc<McpRuntime>>) {
             }
         }
     });
+    interrupted
 }
 
 async fn run_print(
@@ -527,7 +536,7 @@ async fn run_print(
     // launched, so a Ctrl-C during startup still releases what already
     // started. The turn's handle is dropped into the slot once it exists.
     let slot: CancelSlot = Arc::new(Mutex::new(None));
-    install_ctrl_c(Arc::clone(&slot), mcp.clone());
+    let _ = install_ctrl_c(Arc::clone(&slot), mcp.clone());
     if runs_on_native(&builder, &selector(args), connector).await {
         start_mcp(&builder, verbose).await;
     }
@@ -611,7 +620,7 @@ async fn run_repl_mode(
     }
     let mcp = builder.mcp().cloned();
     let slot: CancelSlot = Arc::new(Mutex::new(None));
-    install_ctrl_c(Arc::clone(&slot), mcp.clone());
+    let _ = install_ctrl_c(Arc::clone(&slot), mcp.clone());
     if runs_on_native(&builder, &selector(args), connector).await {
         start_mcp(&builder, verbose).await;
     }
@@ -676,7 +685,7 @@ async fn run_tui_mode(
     // interrupt here arrives as a signal, and the children sit in their own
     // process groups: without this they would survive it.
     let slot: CancelSlot = Arc::new(Mutex::new(None));
-    install_ctrl_c(Arc::clone(&slot), mcp.clone());
+    let _ = install_ctrl_c(Arc::clone(&slot), mcp.clone());
     if runs_on_native(&builder, &selector(args), connector).await {
         start_mcp(&builder, false).await;
     }
@@ -719,7 +728,7 @@ async fn mcp_command(
     // cleanup on interruption as the session modes.
     let runtime = Arc::new(runtime);
     let slot: CancelSlot = Arc::new(Mutex::new(None));
-    install_ctrl_c(Arc::clone(&slot), Some(Arc::clone(&runtime)));
+    let interrupted = install_ctrl_c(Arc::clone(&slot), Some(Arc::clone(&runtime)));
     match command {
         McpCommand::Forget => {
             store
@@ -745,6 +754,11 @@ async fn mcp_command(
         McpCommand::List => {}
     }
     let snapshots = runtime.open(&cancel).await?;
+    if interrupted.load(Ordering::SeqCst) {
+        // The servers were released by the handler; say so rather than
+        // printing a listing the interrupt already invalidated.
+        return Ok(ExitCode::from(130));
+    }
     if snapshots.is_empty() {
         println!(
             "no servers configured in {}",
