@@ -37,3 +37,6 @@ doc = false
 # Test-only: the fake external agent drives the control plane.
 gritt-connector = { workspace = true }
 tempfile = { workspace = true }
+# Test-only: `start_paused` freezes the clock so the loop's frame cap is
+# engaged deterministically instead of by racing it (TKT-0020).
+tokio = { workspace = true, features = ["test-util"] }
