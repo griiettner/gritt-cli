@@ -86,7 +86,7 @@ The call that executes is the call that was approved. A tool is frozen for
 the turn as its server, original name, and runtime generation, because a
 reload can hand the same dispatch name to a different tool.
 
-### 4. The binary injects setup, config reload, and workspace observation
+### 4. The binary injects setup, config reload, and the MCP runtime
 
 The full-screen runtime stays a client of the control plane. Two seams let
 the binary supply what only it may do, keeping configuration-layer merging

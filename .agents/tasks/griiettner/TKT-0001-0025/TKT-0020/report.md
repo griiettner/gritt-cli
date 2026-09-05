@@ -35,15 +35,22 @@ skills:
 The chain's last worker step. Four documents now describe the interface as it
 was built, one ADR records the durable contract changes the chain accepted, a
 deterministic responsiveness harness measures every budget the feature plan
-states, and three defects the measurements exposed are fixed.
+states against the production scheduler, and the defects the measurements
+exposed are fixed.
 
-Eight of the plan's nine budgets are met. The ninth, a resident-memory plateau
-over a five-minute soak, is not, and the gap is named rather than softened:
-the renderer materializes every transcript entry on each rebuild and there is
-no history paging, so memory tracks the transcript instead of levelling off.
+Most of the plan's budgets are met. Two are not, and both are named rather
+than softened: the resident-memory plateau over a five-minute soak, and
+input-to-frame under a saturating 1,000 deltas a second, which sits at the
+50 ms budget and crosses it about as often as not. Both have the same cause,
+the renderer materializing every transcript entry on each rebuild with no
+history paging, so memory tracks the transcript and a frame costs what the
+whole transcript costs. The full table and the measurement method are under
+[Benchmarks](#benchmarks); the numbers there come from the production
+scheduler, after two rounds of review corrected how they were obtained.
 
-Three fixes landed, all of them responsiveness defects the plan names as
-acceptance requirements:
+Six fixes landed, all of them responsiveness, startup-correctness, or
+secret-accuracy defects the plan names as acceptance requirements, three of
+them found by review:
 
 1. The full-screen loop drew on every wakeup, including a 50 ms tick with no
    input behind it. An idle session burned 2.5% of a core and wrote about 540
@@ -258,33 +265,40 @@ above. There are three harnesses and they do not carry equal weight.
 
 | Scenario | Budget | Measured | Verdict |
 | --- | --- | --- | --- |
-| Launch with existing config | first usable composer within 500 ms | 39 ms | **MET** |
-| Launch, model list requested and never answered | independent of provider readiness | 30 ms | **MET** |
+| Launch with existing config | first usable composer within 500 ms | 24 ms | **MET** |
+| Launch, model list requested and never answered | independent of provider readiness | 42 ms, with the request confirmed to have reached the fixture and stayed open | **MET** |
 | Typing, input to frame (idle transcript, micro) | p95 below 50 ms | p50 2.155 ms, **p95 2.271 ms**, n=500 | **MET** |
 | Picker navigation (micro) | p95 below 50 ms | p50 2.492 ms, **p95 2.660 ms**, n=500 | **MET** |
 | Scrolling (micro) | p95 below 50 ms | p50 2.171 ms, **p95 2.306 ms**, n=500 | **MET** |
-| Input to frame under 1,000 deltas/s (integrated) | p95 below 50 ms | p50 47.204 ms, **p95 52.488 ms**, n=98 | **NOT MET**, by 2.5 ms |
-| Sustained output, delta drain rate (integrated) | keep up with 1,000/s | **975/s** | **MET** |
+| Input to frame under 1,000 deltas/s (integrated) | p95 below 50 ms | p50 19.8 to 29.4 ms, **p95 48.9 to 51.1 ms over six runs** | **NOT MET**, at the budget and over it more often than not |
+| Sustained output, delta drain rate (integrated) | keep up with 1,000/s | **954 to 969/s** | **MET** |
 | Sustained output, render work at 120x40 (micro) | p95 below 16 ms | p50 14.511 ms, **p95 15.083 ms**, n=686 | **MET**, by 0.9 ms |
-| Render cap under load (integrated) | 30 fps | **20 fps**, 198 frames in 10 s | **MET** |
-| Bounded queues under load (integrated) | bounded, nothing dropped | peak **52**, final **0** | **MET** |
-| Cancel under load (integrated) | visible canceling state within 100 ms | **2.664 ms**, cancellation token fired, frame changed | **MET** |
+| Render cap under load (integrated) | 30 fps | **19 fps**, 192 frames in 10 s | **MET** |
+| Bounded queues under load (integrated) | bounded, nothing dropped | largest batch drained in one step **52**, final **0** | **MET** |
+| Cancel under load (integrated) | visible canceling state within 100 ms | **27.9 to 52.0 ms** from Escape queued to the frame after the turn's token fired | **MET** |
 | Idle CPU over 30 s | below 1% of one core | **0.2%** | **MET** |
 | Idle screen, no continuous full redraw | no redraw | **0 bytes** over 30 idle seconds | **MET** |
 | Resident memory plateau over a five-minute soak | a stable plateau | baseline 38,800 KiB, peak **762,336 KiB**; middle third 532,352 KiB, last third 762,336 KiB | **NOT MET** |
 
 Two budgets are missed. Both are named below rather than softened.
 
-### What the integrated run changed
+The integrated rows come from `Scheduler::step`, the loop's own iteration,
+driven against a `TestBackend` with input queued onto the same channel the
+key reader thread writes to. Input latency is timed from the moment a key is
+**queued**, so its scheduling wait is inside the number, and the
+cancellation is a real Escape delivered through that channel while the
+stream is still producing. An earlier version of this report measured a
+reimplementation of the scheduler and was rejected for it.
 
-Before this ticket's loop fixes, measured on the same harness:
+### What the loop fixes changed
+
+Before this ticket's loop fixes, measured on the same scheduler:
 
 | Measure | Before | After |
 | --- | --- | --- |
-| Messages handled | 693 of 9,552 produced (69/s) | 9,755 of 9,752 produced (**975/s**) |
-| Queue peak | 8,863 | **52** |
-| Queue at end | 8,862 | **0** |
-| Frames in 10 s | 777 (78 fps) | **198 (20 fps)** |
+| Messages handled | 693 of 9,552 produced (69/s) | 9,605 of 9,602 produced (**960/s**) |
+| Backlog | grew to **8,863** and never recovered | largest batch **52**, queue empty at the end |
+| Frames in 10 s | 777 (78 fps) | **192 (19 fps)** |
 | 1 MiB tool result delivered | no, still queued | **yes** |
 
 The loop drew a frame per message and a turn emits a text delta per token
@@ -294,6 +308,13 @@ waiting message before the next draw, and takes input ahead of a queued
 message. Nothing is dropped: every message reaches the same handler in the
 same order, and only the intermediate frames between them are skipped.
 
+The frame cap introduced one defect of its own, found in the second review
+and fixed here: it could suppress the frame after an approval arrived, so a
+keystroke landing in that window would approve a tool call or an MCP launch
+that had never been drawn. The cap now yields to an undrawn approval, and a
+decision key is refused until the prompt has been on screen. See
+[the review fixes update](updates/2026-09-05-review-fixes.md).
+
 An earlier version of this report claimed the `UiMsg` channel's producers
 were "only discrete completions rather than a stream". That was wrong.
 `ChannelUi::event` sends every streaming event through it, which is exactly
@@ -301,13 +322,15 @@ why the queue grew.
 
 ### The two misses, stated specifically
 
-**Input to frame under sustained load: 52.488 ms against 50 ms.** One cycle
-is a coalesced drain of about fifty deltas plus one frame, and the frame is a
-full-transcript rebuild. A keypress waits for the cycle in progress. The load
-is 1,000 deltas per second, which is roughly ten to twenty times what a
-provider actually streams; the microbenchmark figure of 2.271 ms is what
-typing costs when output is not saturating the channel. Both numbers are
-reported because neither alone describes the product.
+**Input to frame under sustained load: p95 between 48.9 and 51.1 ms across
+six runs, against a 50 ms budget.** It sits on the line, clearing it in two
+runs of six, so it is recorded as missed rather than met. One cycle is a coalesced drain
+of about fifty deltas plus one frame, and the frame is a full-transcript
+rebuild; a keypress waits for the cycle in progress. The load is 1,000 deltas
+per second, roughly ten to twenty times what a provider actually streams, and
+the microbenchmark figure of 2.271 ms is what typing costs when output is not
+saturating the channel. Both are reported because neither alone describes the
+product.
 
 **Resident memory over the five-minute soak.** Over 300 seconds the harness
 delivered 2,791,000 text deltas into a 10,000-message transcript and consumed
@@ -324,7 +347,7 @@ app then slices the roughly 35 visible lines out of the result, and every
 incoming delta invalidates the cache. History paging, which the plan asks for
 ("page old history rather than keeping every rendered line in memory"), does
 not exist. Limiting rendering to visible content is the single change that
-would close the plateau, the 0.9 ms render-work margin, and the 2.5 ms input
+would close the plateau, the 0.9 ms render-work margin, and the input
 overshoot together. It is follow-up 1.
 
 ### Other recorded figures
@@ -336,13 +359,17 @@ overshoot together. It is follow-up 1.
 | 1 MiB tool result (integrated) | delivered through the real channel mid-stream and present in the transcript at the end of the run |
 | Several MCP servers plus one hung server, under load | 3 of 4 reached `Ready`; the hung entry became `Failed { "initialize did not answer within 5s" }` and did not hold the others |
 | Cancel under load (micro, reducer only) | 18.149 ms worst of 50 rounds |
+| Frames drawn while MCP initialized (micro) | p50 1.451 ms, p95 3.846 ms, n=382 |
 
 Queue bounds, for the record: the MCP lifecycle broadcast is bounded at 32
 messages and every message carries the whole snapshot list, so a lagged
 subscriber loses intermediate frames and never correctness. The `UiMsg`
 channel is still an unbounded channel; what changed is that the loop now
-drains it every iteration, so under the plan's load it stays at a peak of 52
-and returns to zero. A capacity that makes growth impossible is follow-up 2.
+drains it every iteration, so the largest batch one step handled was 52 and
+the queue was empty at the end of the run. Measuring it from outside the
+loop always finds it empty, because `step` drains inside itself, so the
+batch size is the honest figure. A capacity that makes growth impossible is
+follow-up 2.
 
 ## Regression review
 
@@ -383,7 +410,17 @@ and returns to zero. A capacity that makes growth impossible is follow-up 2.
    before any entry was published, so the interface said no servers were
    configured. Opening moved into the interface, and a failure arrives as a
    message that shows the configuration error.
-6. **An overstated secret guarantee in a doc comment**
+6. **Approvals could be accepted before being displayed**
+   (`crates/gritt-harness/src/tui/run.rs`). Found in the second review, and
+   introduced by fix 3: the frame cap could suppress the frame after an
+   approval arrived, so a keystroke landing in that window approved a tool
+   call or an MCP launch that was never drawn. The cap now yields to an
+   undrawn approval, and a decision key is refused until the prompt has been
+   on screen once. Guarded by
+   `an_approval_is_drawn_before_a_decision_key_is_accepted`, which pauses the
+   clock so the cap is engaged deterministically and fails with the guard
+   removed.
+7. **An overstated secret guarantee in a doc comment**
    (`crates/gritt-harness/src/mcp/mod.rs`). `definition_summary` claimed a
    value reaching an *argument* through `${TOKEN}` could not be echoed. It
    cannot, but because arguments are never interpolated at all, not because
@@ -496,27 +533,31 @@ exit status 0. The configured key string appeared nowhere in either stream.
 - **Acceptance:** Partial, and stated precisely. Docs match the implemented
   commands and limitations, verified against source and corrected after
   review; benchmark evidence now measures the production load path and
-  records p50/p95 latency, CPU, memory, queue depth, and drain rate; the
-  single `.mcp.json` entry has an honest result; full validation is green.
-  Two of the plan's budgets are not met: the resident-memory plateau, and
-  input-to-frame under a sustained 1,000 deltas per second, which overshoots
-  by 2.5 ms. Both have the same cause, named in follow-up 1. The plan's own
+  records p50/p95 latency, CPU, memory, queue behaviour, and drain rate from
+  `Scheduler::step` rather than from a copy of it; the single `.mcp.json`
+  entry has an honest result; full validation is green. Two of the plan's
+  budgets are not met: the resident-memory plateau, and input-to-frame under
+  a sustained 1,000 deltas per second, which measures p95 between 49.5 and
+  51.1 ms against a 50 ms budget across five runs. Both have the same cause, named in follow-up 1. The plan's own
   acceptance criterion permits a recorded run that "identifies specific
   remaining performance gaps". **One verification is outstanding rather than
   failed: the real-terminal walkthrough by a human has not been performed.**
   No agent can perform it. It stays pending with the checklist below, and the
   chain's verification contract is not satisfied until a human completes and
   records it. Next actions: follow-up 1, and the human walkthrough.
-- **Scope:** Held. Six fixes, all of them responsiveness, startup-correctness,
-  or secret-accuracy defects the parent criteria require, three of them found
-  by review. No new product capability, no change to
+- **Scope:** Held. Seven fixes, all of them responsiveness,
+  startup-correctness, or secret-accuracy defects the parent criteria
+  require, four of them found across two review rounds. One of those, the
+  approval-before-draw defect, was introduced by this ticket's own frame cap
+  and caught by review rather than by me. No new product capability, no change to
   the provider or session contract beyond recording it, no LSP or skill
   execution, no test or criterion weakened. No new dependency.
 - **Validation:** Eleven commands, all pass. Counts and environment above. The
   live MCP smoke needed the server's index to complete once before it could
   pass; that is recorded rather than hidden. Two regressions found by the
   reviewer were reproduced before being fixed, and their guard tests were
-  verified to fail with the fix reverted.
+  verified to fail with the fix reverted. The same was done for the
+  approval-before-draw guard found in round two.
 - **Security and safety:** No new unsafe file or network access, no injection
   path, no auth bypass, no destructive behaviour, no dependency added. The
   audit found no reachable secret leak. One doc comment overstating a

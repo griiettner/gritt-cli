@@ -208,3 +208,131 @@ Follow-up 1 gains a second piece of evidence. Limiting rendering to visible
 content would close the memory plateau, the render-work margin, and the
 2.5 ms input-under-load overshoot, all of which are the cost of rebuilding
 the whole transcript per frame.
+
+---
+
+# Round 2
+
+## Trigger
+
+Second reviewer verdict `needs-fix` on PR #12 at `eea68c2`: two High and two
+Medium, all confirmed. Round 1's findings 2, 3 and 6 were accepted. The human
+walkthrough remains an external dependency rather than a worker defect.
+
+The first High is the one worth reading: the frame cap I added in round 1 to
+meet the idle budget introduced a safety defect. Fixing one budget broke
+something that matters more than a budget.
+
+## Finding 1: approvals could be accepted before being displayed
+
+**What was wrong.** `y` approves the moment it reaches the reducer. The frame
+cap can suppress the frame after an approval arrives, so a keystroke landing
+in that window approved a tool call or an MCP trust launch that had never
+been on screen. Before the cap the loop drew on every iteration, so the
+question could not arise. This is a permission-boundary defect, not a
+rendering one.
+
+**What landed.** Two guards, one of which makes the other unreachable and is
+kept so that it stays unreachable:
+
+- the frame cap yields to an approval that has not been drawn, so the draw
+  at the top of a step always precedes the `select!` that reads a key;
+- a decision key arriving while an approval is pending but undrawn is
+  discarded rather than applied.
+
+**Regression.** `an_approval_is_drawn_before_a_decision_key_is_accepted`
+runs the real `Scheduler` against a `TestBackend` with `start_paused`, so no
+time passes between the first frame and the approval and the cap is engaged
+deterministically instead of by racing it. It asserts the frame that shows
+`approve?` precedes the decision reaching the responder. Verified to fail
+with the guards removed: the decision is sent while the prompt has never
+been drawn. This added `tokio`'s `test-util` feature as a dev-dependency of
+`gritt-harness`; nothing in the product depends on it.
+
+## Finding 2: the benchmark duplicated the scheduler instead of driving it
+
+**What was wrong.** The round 1 benchmark called shared handlers but kept its
+own copy of the scheduling rules, and the copy differed from production: it
+skipped the drain after input, polled instead of using the deadline branch,
+started latency timing when it processed a key rather than when the key was
+queued, and cancelled after aborting the producer while drawing past the cap.
+Numbers from it could not establish input latency, cancellation under load,
+or protect the scheduler from regressing.
+
+**What landed.** The loop body is extracted into `Scheduler::step`, generic
+over the `ratatui` backend. `event_loop` is now `while !quit { step() }`
+around it, and `LoopHarness` exposes the same `step` against a `TestBackend`
+with an injected input channel. There is one implementation of draw timing,
+drain order, and input priority, and both callers use it.
+
+The benchmark accordingly: input is queued onto the channel the key reader
+thread writes to and timestamped **when queued**, so its scheduling wait is
+inside the measurement; cancellation is a real Escape delivered through that
+channel halfway through the run while the stream is still producing, with the
+latency measured to the frame after the turn's token fired; and queue
+evidence is the largest batch one step drained, because `step` drains inside
+itself and sampling from outside always finds the channel empty.
+
+**Revised numbers.** Driving the real scheduler moved two classifications:
+
+| Measure | Round 1 (copied scheduler) | Round 2 (production scheduler) |
+| --- | --- | --- |
+| Input to frame under load, p95 | 52.488 ms, NOT MET | 48.9 to 51.1 ms over six runs, **NOT MET**, on the line |
+| Cancel under load | 2.664 ms, after the producer stopped | **27.9 to 52.0 ms**, during the stream |
+| Queue evidence | peak depth 52 | largest batch drained in one step 52, empty at the end |
+| Drain rate | 975/s | 954 to 969/s |
+| Frame rate | 20 fps | 19 fps |
+
+The input figure straddles the budget rather than clearing or missing it
+cleanly, clearing it in two runs of six, and the range is reported rather
+than a single run so that is visible. It is recorded as missed.
+
+## Finding 3: the pending-catalog test overwrote its own fixture
+
+`Session::start` unconditionally rewrote `config.toml`, replacing the
+stalling provider with `127.0.0.1:9`, so the test measured a connection
+refusal rather than a request left hanging, and the shared `local` profile
+allowed cache reuse. Config writing is now split out
+(`start_with_existing_config`), the profile name is unique per run so the
+catalog is cold, and the fixture counts request lines it has read and holds
+open. The test asserts at least one request reached it and stayed pending.
+
+## Finding 4: idle synchronization still mistook silence for completion
+
+Two seconds of silence is not proof that startup finished, because profile
+discovery reaches the operating system keychain before it looks at the
+environment and that call has no bound the test controls. The idle tests now
+run against a configuration with **no profiles at all**, so there is nothing
+to resolve and no keychain call; combined with the empty `PATH` that already
+suppressed agent probes, every asynchronous startup dependency is controlled.
+The quiescence wait is kept as well, and the zero-byte assertion is
+unchanged.
+
+## Optional items
+
+The report summary no longer says eight of nine budgets pass, and ADR-013's
+section heading no longer claims workspace observation is injected; both now
+match their corrected bodies.
+
+## Validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --no-fail-fast` | 495 passed, 0 failed |
+| `cargo test --manifest-path .agents/cli/Cargo.toml` | 107 passed, 0 failed |
+| `cargo test -p gritt --test tui_pty` | 13 passed, 0 failed |
+| `GRITT_LIVE_MCP_TESTS=1 ... mcp_live_smoke` | 1 passed; `gritt` ready, 3 tools |
+| `GRITT_LIVE_CONNECTOR_TESTS=1 ... live` | 3 passed |
+| `GRITT_LIVE_TESTS=1 -p gritt-provider --test live` | 3 skipped honestly |
+| `GRITT_BENCH=1 ... --test tui_load` (release) | 1 passed |
+| `GRITT_BENCH=1 ... --test tui_responsiveness` (release) | 6 passed |
+| `GRITT_BENCH=1 ... --test tui_bench` (release) | 5 passed |
+
+## Remaining follow-up
+
+Unchanged. Follow-up 1 now accounts for three separate results: the memory
+plateau, the render-work margin, and the input-under-load figure sitting on
+its budget. The human real-terminal walkthrough is still outstanding and is
+still the chain's to close.
