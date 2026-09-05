@@ -342,7 +342,9 @@ async fn the_combined_workload_on_the_real_event_loop() {
     let mut queue_samples: Vec<usize> = Vec::new();
     let mut peak_batch = 0usize;
     let mut input_latency: Vec<Duration> = Vec::new();
-    let mut answered = 0usize;
+    let mut consumed = 0usize;
+    let mut awaiting_frame: Vec<Instant> = Vec::new();
+    let mut cancel_awaiting: Option<Instant> = None;
     let run_start = Instant::now();
     let deadline = Duration::from_secs(seconds);
     let mut cancelled_at: Option<Instant> = None;
@@ -381,22 +383,39 @@ async fn the_combined_workload_on_the_real_event_loop() {
         // which is the number the plan's bounded-queue requirement is
         // about.
         peak_batch = peak_batch.max(step.messages);
+
+        // Attribution, in this order and for this reason: `step` draws
+        // *before* it takes input and drains messages, so the frame it
+        // just produced shows the state as of the end of the previous
+        // step. It completes what earlier steps handled and nothing this
+        // step is about to handle. `a_step_draws_before_it_handles_input`
+        // in `run.rs` is the deterministic guard on that ordering.
         if step.drew {
             frames += 1;
-            // Every key queued before this frame and not yet answered is
-            // answered by it.
-            let queue = typed.lock().unwrap();
             let now = Instant::now();
-            while answered < queue.len() && queue[answered] <= now {
-                input_latency.push(now.duration_since(queue[answered]));
-                answered += 1;
+            for queued in awaiting_frame.drain(..) {
+                input_latency.push(now.duration_since(queued));
             }
-            drop(queue);
-            if cancel_latency.is_none() {
-                if let Some(at) = cancelled_at {
-                    if cancel_token.is_cancelled() {
-                        cancel_latency = Some(at.elapsed());
-                    }
+            if let Some(queued) = cancel_awaiting.take() {
+                cancel_latency = Some(now.duration_since(queued));
+            }
+        }
+
+        // Whatever this step handled now waits for a later frame. Typed
+        // keys are counted by what actually reached the composer, so the
+        // one-off Escape below is never mistaken for one of them.
+        let applied = harness.app().composer.text().chars().count();
+        {
+            let queue = typed.lock().unwrap();
+            while consumed < applied.min(queue.len()) {
+                awaiting_frame.push(queue[consumed]);
+                consumed += 1;
+            }
+        }
+        if cancel_latency.is_none() && cancel_awaiting.is_none() {
+            if let Some(at) = cancelled_at {
+                if cancel_token.is_cancelled() {
+                    cancel_awaiting = Some(at);
                 }
             }
         }
