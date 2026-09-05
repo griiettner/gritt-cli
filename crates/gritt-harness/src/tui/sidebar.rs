@@ -242,17 +242,20 @@ pub fn mcp_state_word(state: &McpServerState) -> &'static str {
 }
 
 fn truncate(text: &str, width: usize) -> String {
-    if super::composer::display_width(text) <= width {
+    use super::composer::{clusters, display_width};
+    if display_width(text) <= width {
         return text.to_owned();
     }
     let mut out = String::new();
     let mut used = 0;
-    for c in text.chars() {
-        let next = super::composer::display_width(c.encode_utf8(&mut [0u8; 4]));
+    // Cut between whole characters so a truncated path never ends on a
+    // combining mark whose base was dropped.
+    for (_, cluster) in clusters(text) {
+        let next = display_width(cluster);
         if used + next > width.saturating_sub(1) {
             break;
         }
-        out.push(c);
+        out.push_str(cluster);
         used += next;
     }
     out.push('…');

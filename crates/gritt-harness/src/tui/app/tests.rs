@@ -5,6 +5,7 @@
 use super::*;
 use crate::tui::fixture;
 use crate::tui::sidebar::SidebarPlacement;
+
 use crate::tui::theme::{Theme, ThemeMode};
 use chrono::Utc;
 use gritt_core::event::EventSource;
@@ -161,6 +162,12 @@ fn tab_completes_a_suggestion_and_otherwise_moves_focus() {
         "Tab completed instead of moving"
     );
     app.composer.clear();
+    // A terminal wide enough for the column, so focus can rest on it.
+    app.set_metrics(Metrics {
+        transcript_lines: 40,
+        transcript_height: 10,
+        terminal_width: 120,
+    });
     app.on_key(key(KeyCode::Tab));
     assert_eq!(app.focus, Focus::Transcript);
     app.on_key(key(KeyCode::Tab));
@@ -169,6 +176,120 @@ fn tab_completes_a_suggestion_and_otherwise_moves_focus() {
     assert_eq!(app.focus, Focus::Composer);
     app.on_key(key(KeyCode::BackTab));
     assert_eq!(app.focus, Focus::Sidebar);
+}
+
+/// Finding 3 (round 2): Tab must not park the keyboard on a sidebar that
+/// is not on screen, or the scroll keys go somewhere invisible.
+#[test]
+fn focus_skips_the_sidebar_when_its_column_is_not_on_screen() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    // A narrow conversation: the column is collapsed.
+    app.set_metrics(Metrics {
+        transcript_lines: 60,
+        transcript_height: 10,
+        terminal_width: 80,
+    });
+    assert!(!app.sidebar_column_visible());
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!(app.focus, Focus::Transcript);
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!(
+        app.focus,
+        Focus::Composer,
+        "Tab stopped on a hidden sidebar"
+    );
+    app.on_key(key(KeyCode::BackTab));
+    assert_eq!(app.focus, Focus::Transcript);
+
+    // The reviewer's sequence: Tab twice then PageUp must move the
+    // transcript, not a sidebar offset nobody can see.
+    app.focus = Focus::Composer;
+    app.on_key(key(KeyCode::Tab));
+    app.on_key(key(KeyCode::Tab));
+    let before = app.top;
+    app.on_key(key(KeyCode::PageUp));
+    assert_ne!(app.top, before, "PageUp moved nothing");
+    assert_eq!(app.sidebar_scroll, 0, "the hidden sidebar ate the scroll");
+}
+
+/// Finding 3 (round 2): hiding the column while it holds focus.
+#[test]
+fn hiding_the_column_moves_focus_off_it() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.set_metrics(Metrics {
+        transcript_lines: 60,
+        transcript_height: 10,
+        terminal_width: 120,
+    });
+    app.on_key(key(KeyCode::Tab));
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!(app.focus, Focus::Sidebar);
+    app.dispatch(Command::Sidebar, None);
+    assert!(!app.sidebar_enabled);
+    assert_eq!(app.focus, Focus::Composer);
+
+    // And the same when a resize takes the column away.
+    app.dispatch(Command::Sidebar, None);
+    app.on_key(key(KeyCode::Tab));
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!(app.focus, Focus::Sidebar);
+    app.on_resize(80, 24);
+    assert_eq!(app.focus, Focus::Composer);
+    let before = app.top;
+    app.on_key(key(KeyCode::PageUp));
+    assert_ne!(app.top, before);
+}
+
+/// Finding 1 (round 2): a drawer opened narrow is not drawn once the
+/// column fits, so it must not stay on the stack eating keys.
+#[test]
+fn a_drawer_left_open_by_a_resize_does_not_swallow_input() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.set_metrics(Metrics {
+        transcript_lines: 60,
+        transcript_height: 10,
+        terminal_width: 80,
+    });
+    app.dispatch(Command::Sidebar, None);
+    assert!(
+        matches!(app.top_overlay(), Some(Overlay::Drawer { .. })),
+        "a narrow terminal opens the drawer"
+    );
+    // The terminal grows past the column threshold.
+    app.on_resize(120, 40);
+    assert!(app.overlays.is_empty(), "the invisible drawer stayed open");
+    assert!(app.sidebar_enabled, "the drawer became the column");
+    assert_eq!(app.sidebar_placement(120), SidebarPlacement::Column);
+    // Typing reaches the composer instead of an overlay nobody can see.
+    type_text(&mut app, "hello");
+    assert_eq!(app.composer.text(), "hello");
+    assert_eq!(
+        app.on_key(key(KeyCode::Enter)),
+        Action::Submit("hello".into())
+    );
+}
+
+/// The same defect reached without a resize event, in case one is missed:
+/// the reducer reconciles from the geometry the last frame measured.
+#[test]
+fn a_stale_drawer_is_reconciled_before_the_next_key_is_routed() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.set_metrics(Metrics {
+        transcript_lines: 60,
+        transcript_height: 10,
+        terminal_width: 80,
+    });
+    app.dispatch(Command::Sidebar, None);
+    assert_eq!(app.overlays.len(), 1);
+    // A frame is drawn at the new width but no resize event arrives.
+    app.set_metrics(Metrics {
+        transcript_lines: 60,
+        transcript_height: 10,
+        terminal_width: 120,
+    });
+    type_text(&mut app, "x");
+    assert!(app.overlays.is_empty());
+    assert_eq!(app.composer.text(), "x");
 }
 
 #[test]

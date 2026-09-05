@@ -550,3 +550,94 @@ fn the_fixture_label_survives_the_narrowest_home() {
         );
     }
 }
+
+/// Finding 2 (round 2): a combining mark must stay on the row with the
+/// character it modifies. At 60x20 the home composer has 56 interior
+/// columns, so 57 ASCII characters followed by `e` + U+0301 lands the
+/// accent exactly on a wrap boundary.
+#[test]
+fn a_combining_mark_never_wraps_away_from_its_character() {
+    let mut app = fixture::home(Theme::new(ThemeMode::Dark));
+    let draft = format!("{}e\u{0301}", "x".repeat(57));
+    type_text(&mut app, &draft);
+    assert_eq!(app.composer.text(), draft);
+    let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let text = text_of(terminal.backend().buffer());
+    // The base character and its accent are on the same row, and that row
+    // is the one the cursor is on.
+    let cursor = terminal.get_cursor_position().unwrap();
+    let rows: Vec<&str> = text.lines().collect();
+    let row = rows[cursor.y as usize];
+    assert!(
+        row.contains("e\u{0301}"),
+        "the accent left its character behind; cursor row was {row:?} in:\n{text}"
+    );
+    assert!(
+        !rows.iter().any(|line| line.trim() == "\u{0301}"),
+        "a combining mark was drawn on a row of its own:\n{text}"
+    );
+    // The base text is still on screen: the one-row composer did not
+    // scroll it away to make room for a row holding only the accent.
+    assert!(text.contains("xxxx"), "the draft scrolled away:\n{text}");
+    // The cursor sits after the whole character, one cell wide.
+    let before = &draft[..draft.len() - "e\u{0301}".len()];
+    let expected = (before.len() % 56) + 1;
+    assert_eq!(
+        cursor.x as usize % 56,
+        expected % 56,
+        "the accent was charged more than one cell"
+    );
+}
+
+/// The same rule for the transcript's long-word splitting.
+#[test]
+fn transcript_wrapping_keeps_combining_marks_with_their_characters() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::Dark));
+    app.push(
+        gritt_harness::tui::EntryKind::Assistant,
+        format!("{}e\u{0301}{}", "y".repeat(80), "z".repeat(20)),
+    );
+    let text = text_of(&render_app(&app, 60, 20));
+    assert!(
+        !text.lines().any(|line| line.trim() == "\u{0301}"),
+        "a combining mark was wrapped onto its own row:\n{text}"
+    );
+    assert!(text.contains("e\u{0301}"), "{text}");
+}
+
+/// Renders an already-built app, for cases the named-screen table cannot
+/// express.
+fn render_app(app: &App, width: u16, height: u16) -> Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| draw(frame, app)).unwrap();
+    terminal.backend().buffer().clone()
+}
+
+/// Finding 1 (round 2), through the renderer: after the terminal grows,
+/// the drawer is gone and the column is drawn in its place.
+#[test]
+fn a_drawer_becomes_the_column_when_the_terminal_grows() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::Dark));
+    // The sidebar identity line appears nowhere else on screen, and it is
+    // the first thing either form draws, so it fits at every size.
+    let sidebar = "Gritt 0.1.0";
+    // Draw narrow first so the app measures that width.
+    let narrow = text_of(&render_app(&app, 80, 24));
+    assert!(!narrow.contains(sidebar), "{narrow}");
+    app.dispatch(Command::Sidebar, None);
+    let drawer = text_of(&render_app(&app, 80, 24));
+    assert!(
+        drawer.contains(sidebar),
+        "the drawer did not open:\n{drawer}"
+    );
+
+    app.on_resize(120, 40);
+    let wide = text_of(&render_app(&app, 120, 40));
+    assert!(wide.contains(sidebar), "the column is missing:\n{wide}");
+    assert!(wide.contains("Changed files"), "{wide}");
+    assert!(app.overlays.is_empty(), "the drawer outlived its placement");
+    // And the composer takes input again.
+    type_text(&mut app, "typing works");
+    assert_eq!(app.composer.text(), "typing works");
+}

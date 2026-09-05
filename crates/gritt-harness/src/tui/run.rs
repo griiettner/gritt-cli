@@ -153,6 +153,10 @@ async fn fixture_loop(
                     app.on_paste(&text);
                     Action::None
                 }
+                TerminalEvent::Resize(columns, rows) => {
+                    app.on_resize(columns, rows);
+                    Action::None
+                }
                 _ => Action::None,
             },
             _ = tick.tick() => Action::None,
@@ -238,7 +242,12 @@ async fn event_loop(
                         app.on_paste(&text);
                         Action::None
                     }
-                    TerminalEvent::Resize(_, _) => Action::None,
+                    TerminalEvent::Resize(columns, rows) => {
+                        // Placement depends on the width; a drawer or a
+                        // focused sidebar may no longer exist.
+                        app.on_resize(columns, rows);
+                        Action::None
+                    }
                     _ => Action::None,
                 }
             }

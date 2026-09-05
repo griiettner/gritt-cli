@@ -17,7 +17,7 @@ pub mod run;
 pub mod sidebar;
 pub mod theme;
 
-pub use app::{Action, App, Entry, EntryKind, Focus, Layout, Overlay, PickerKind, View};
+pub use app::{Action, App, Entry, EntryKind, Focus, Layout, Metrics, Overlay, PickerKind, View};
 pub use command::Command;
 pub use composer::Composer;
 pub use fixture::FixtureScreen;

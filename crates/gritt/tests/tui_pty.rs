@@ -576,10 +576,10 @@ fn the_fixture_home_walkthrough_runs_by_keyboard_and_never_opens_a_session() {
 fn the_fixture_conversation_shows_the_sidebar_only_above_110_columns() {
     for (cols, expect_sidebar) in [(111u16, true), (109u16, false)] {
         let Fixture {
+            master,
             mut child,
             output: rx,
             input: mut writer,
-            ..
         } = spawn_fixture("conversation", cols, 30);
         let mut seen = String::new();
         wait_for(&rx, &mut seen, ALT_SCREEN_ON, Duration::from_secs(20));
@@ -603,6 +603,32 @@ fn the_fixture_conversation_shows_the_sidebar_only_above_110_columns() {
             writer.write_all(b"/sidebar\r").unwrap();
             writer.flush().unwrap();
             wait_for(&rx, &mut seen, "Changed files", Duration::from_secs(20));
+            writer.write_all(&[0x1b]).unwrap();
+            writer.flush().unwrap();
+            thread::sleep(Duration::from_millis(200));
+
+            // Reopen it, then grow the terminal past the column threshold.
+            // The drawer is no longer drawn, so it must not still be
+            // taking the keyboard: what is typed has to reach the
+            // composer that is visible.
+            writer.write_all(b"/sidebar\r").unwrap();
+            writer.flush().unwrap();
+            thread::sleep(Duration::from_millis(300));
+            master
+                .resize(PtySize {
+                    rows: 40,
+                    cols: 120,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            thread::sleep(Duration::from_millis(500));
+            // Ctrl-P is ignored by the drawer and opens the palette from
+            // the main view, so the palette appearing proves the key
+            // reached the visible interface and not a stale overlay.
+            writer.write_all(&[0x10]).unwrap();
+            writer.flush().unwrap();
+            wait_for(&rx, &mut seen, "same registry", Duration::from_secs(20));
             writer.write_all(&[0x1b]).unwrap();
             writer.flush().unwrap();
             thread::sleep(Duration::from_millis(200));

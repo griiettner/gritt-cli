@@ -176,9 +176,103 @@ the responsiveness fixture and its budgets are step 5 of the feature plan
 and outside this ticket. `ticket sync` then `ticket validate` reported
 `tkt_validate ok (0 warnings)`.
 
+## Round 2
+
+The re-review confirmed fixes 1, 2, 3, 4, and 7 and returned three new
+medium findings, all in the code round 1 introduced: the drawer and the
+composer wrapping. Findings are in `/tmp/review-tkt-0018-r2-findings.md`.
+
+**R2-1: an invisible drawer captured input after a resize.** Round 1 made
+the renderer skip a drawer at 110 columns or more, but left the overlay on
+the stack, and the reducer still routed keys into it. Opening `/sidebar` at
+80 columns and resizing to 120 left the visible composer deaf until Escape.
+Hiding something in the renderer while the reducer still believes in it was
+the mistake; the two now agree on one rule. `App::reconcile_layout` drops
+state the current size cannot support: it pops any drawer once the column
+fits, turning it into the column the user asked for, and moves focus off a
+sidebar that is not on screen. It runs from the new `App::on_resize`, which
+both event loops call on a `Resize` event, and again at the top of
+`on_key`, so a missed or coalesced resize cannot leave a key routed into
+something invisible. Covered by
+`a_drawer_left_open_by_a_resize_does_not_swallow_input`,
+`a_stale_drawer_is_reconciled_before_the_next_key_is_routed`,
+`a_drawer_becomes_the_column_when_the_terminal_grows` (through the
+renderer), and a PTY assertion: the fixture conversation opens the drawer
+at 109 columns, resizes to 120, and Ctrl-P still opens the palette, which a
+stale drawer would have swallowed.
+
+**R2-2: composer wrapping split combining marks from their characters.**
+`composer_rows` iterated Unicode scalars and forced a zero-width mark to
+one cell with `.max(1)`, so at 60x20 a combining acute after 57 characters
+was pushed onto a row of its own and the one-row composer scrolled the base
+text away. Wrapping, cursor movement, deletion, word navigation, transcript
+long-word splitting, and sidebar truncation now all step over grapheme
+clusters, and each cluster is charged its real display width rather than a
+forced minimum of one. Ratatui's own `styled_graphemes` was tried first and
+rejected: it filters control characters out of its output, so byte offsets
+computed from it desync on a pasted tab, and the composer needs exact
+offsets to place a cursor. Covered by
+`a_combining_mark_travels_with_the_character_it_modifies` (cursor and
+delete), `a_combining_mark_never_wraps_away_from_its_character` (the
+reviewer's exact 60x20 case, asserting the drawn text, that no row holds a
+lone mark, that the base text did not scroll away, and that the cursor is
+charged one cell), and
+`transcript_wrapping_keeps_combining_marks_with_their_characters`.
+
+**R2-3: a hidden sidebar consumed the scroll keys.** Tab and BackTab
+selected `Focus::Sidebar` unconditionally while PageUp and PageDown routed
+to the sidebar offset whenever focus was there, so in a narrow conversation
+Tab twice then PageUp moved nothing anyone could see. Focus now only stops
+on panes that are drawn: Tab and BackTab skip the sidebar unless
+`sidebar_column_visible()`, the scroll keys check the same predicate, and
+`reconcile_layout` normalizes focus when the column goes away by resize or
+by `/sidebar`. Covered by
+`focus_skips_the_sidebar_when_its_column_is_not_on_screen` (including the
+reviewer's Tab, Tab, PageUp sequence) and `hiding_the_column_moves_focus_off_it`
+(both the toggle and the resize path).
+
+### Dependency added
+
+`unicode-segmentation` 1.13.3, MIT OR Apache-2.0, from the unicode-rs
+group, added to the workspace and to `gritt-harness`. Checked before
+adding, as the CLI skill requires: it is already a direct dependency of
+`ratatui-core` and `ratatui-widgets`, so it is compiled into every Gritt
+binary today and this edge adds no new code and no new transitive
+dependency. `Cargo.lock` grew by one line, the edge itself. Source is 712
+KiB, mostly Unicode tables and tests, with no build script. The
+alternative, grouping scalars by zero display width, would have handled the
+reported combining-mark case but not clusters generally, and the reviewer
+asked for grapheme boundaries.
+
+### Round 2 validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --no-fail-fast` | pass, 419 tests, 0 failed |
+| `cargo test -p gritt --test tui_pty` | pass, 6 tests |
+
+419 passing, up from 411: 8 tests added. No snapshot golden changed, which
+is itself worth recording: the grapheme rewrite altered no fixture
+rendering, because the fixtures hold CJK and long identifiers but no
+combining marks, and those already wrapped correctly.
+
+`.agents/gritt-agent ticket chain-check --ticket TKT-0018 --base main`:
+
+```text
+NOTE: current branch: tkt-0018-03-tui-foundation
+NOTE: base branch `main` sha: 77aaa22cb1c5
+NOTE: changed files against `main`: 64
+tkt_chain_check ok (0 warning(s))
+```
+
 ## Remaining follow-up
 
 The `Picker::window` helper is now unused by the picker renderer, which
 computes its window in lines instead of rows; it stays because the row-based
 form is still the right shape for a flat list and is covered by its own
-test. Everything else remaining is the follow-up list in `report.md`.
+test. Grapheme clusters are handled through `unicode-segmentation`, so
+emoji sequences and flags wrap as single units; terminal support for
+drawing them still varies, which is a rendering limit rather than a Gritt
+one. Everything else remaining is the follow-up list in `report.md`.

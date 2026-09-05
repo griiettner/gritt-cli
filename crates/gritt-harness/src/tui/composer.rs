@@ -8,10 +8,28 @@
 //! or an emoji occupies the same number of cells here as when drawn.
 
 use ratatui::text::Span;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Display width of a string in terminal cells.
 pub fn display_width(text: &str) -> usize {
     Span::raw(text).width()
+}
+
+/// The user-perceived characters of `text` with their byte offsets. A
+/// combining mark belongs to the character it modifies, so `e` followed by
+/// U+0301 is one cluster one cell wide, never two things to move over,
+/// delete separately, or break a line between.
+pub fn clusters(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    text.grapheme_indices(true)
+}
+
+/// The byte offset of the cluster boundary at or before `at`.
+fn cluster_start(text: &str, at: usize) -> usize {
+    clusters(text)
+        .take_while(|(offset, _)| *offset < at)
+        .last()
+        .map(|(offset, _)| offset)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -312,19 +330,16 @@ impl Composer {
 
     // -- boundaries -----------------------------------------------------
 
+    /// The previous cluster boundary: Left and Backspace step over a whole
+    /// character, accents included.
     fn prev_boundary(&self, at: usize) -> usize {
-        at - self.text[..at]
-            .chars()
-            .next_back()
-            .map(char::len_utf8)
-            .unwrap_or(1)
+        cluster_start(&self.text[..at], at)
     }
 
     fn next_boundary(&self, at: usize) -> usize {
-        at + self.text[at..]
-            .chars()
+        at + clusters(&self.text[at..])
             .next()
-            .map(char::len_utf8)
+            .map(|(_, cluster)| cluster.len())
             .unwrap_or(1)
     }
 
@@ -347,16 +362,23 @@ impl Composer {
     fn offset_for_column(&self, start: usize, column: usize) -> usize {
         let end = self.line_end(start);
         let mut width = 0;
-        let mut offset = start;
-        for c in self.text[start..end].chars() {
-            let next = display_width(c.encode_utf8(&mut [0u8; 4]));
+        for (offset, cluster) in clusters(&self.text[start..end]) {
+            let next = display_width(cluster);
             if width + next > column {
-                return offset;
+                return start + offset;
             }
             width += next;
-            offset += c.len_utf8();
         }
         end
+    }
+
+    /// Whether the cluster starting at `offset` is whitespace. A cluster
+    /// is whitespace when the character it is built on is.
+    fn is_space_at(&self, start: usize, end: usize) -> bool {
+        self.text[start..end]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
     }
 
     /// Skips whitespace backwards, then the word before the cursor.
@@ -364,11 +386,7 @@ impl Composer {
         let mut offset = at;
         while offset > 0 {
             let previous = self.prev_boundary(offset);
-            if self.text[previous..offset]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_whitespace())
-            {
+            if self.is_space_at(previous, offset) {
                 offset = previous;
             } else {
                 break;
@@ -376,11 +394,7 @@ impl Composer {
         }
         while offset > 0 {
             let previous = self.prev_boundary(offset);
-            if self.text[previous..offset]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_whitespace())
-            {
+            if self.is_space_at(previous, offset) {
                 break;
             }
             offset = previous;
@@ -392,11 +406,7 @@ impl Composer {
         let mut offset = at;
         while offset < self.text.len() {
             let next = self.next_boundary(offset);
-            if self.text[offset..next]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_whitespace())
-            {
+            if self.is_space_at(offset, next) {
                 offset = next;
             } else {
                 break;
@@ -404,11 +414,7 @@ impl Composer {
         }
         while offset < self.text.len() {
             let next = self.next_boundary(offset);
-            if self.text[offset..next]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_whitespace())
-            {
+            if self.is_space_at(offset, next) {
                 break;
             }
             offset = next;
@@ -507,6 +513,26 @@ mod tests {
         assert!(composer.is_empty());
         composer.set_text(held);
         assert_eq!(composer.text(), "draft /quit\nsecond\nthird");
+    }
+
+    #[test]
+    fn a_combining_mark_travels_with_the_character_it_modifies() {
+        // `e` + U+0301 is one character one cell wide, not two.
+        let mut composer = Composer::from_text("cafe\u{0301}");
+        assert_eq!(display_width(composer.text()), 4);
+        assert_eq!(composer.column(), 4);
+        composer.move_left(false);
+        assert_eq!(composer.cursor(), "caf".len(), "Left split the accent off");
+        assert_eq!(composer.column(), 3);
+        composer.move_right(false);
+        assert_eq!(composer.cursor(), composer.text().len());
+        // Backspace removes the whole character, not just its accent.
+        composer.backspace();
+        assert_eq!(composer.text(), "caf");
+        // And it is one cluster to the wrapper as well.
+        let text = "cafe\u{0301}";
+        assert_eq!(clusters(text).count(), 4);
+        assert_eq!(clusters(text).last().unwrap().1, "e\u{0301}");
     }
 
     #[test]

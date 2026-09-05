@@ -14,7 +14,7 @@ use super::app::{
     SetupForm, View,
 };
 use super::command;
-use super::composer::display_width;
+use super::composer::{clusters, display_width};
 use super::picker::{ListStatus, Picker};
 use super::sidebar::{SidebarPlacement, SIDEBAR_GUTTER, SIDEBAR_MIN_TERMINAL_WIDTH, SIDEBAR_WIDTH};
 use super::theme::Theme;
@@ -79,14 +79,15 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
             used = 0;
         }
         if word_width > width {
-            // A word longer than the line is split by character.
-            for c in word.chars() {
-                let cell = display_width(c.encode_utf8(&mut [0u8; 4])).max(1);
-                if used + cell > width {
+            // A word longer than the line is split, but only between whole
+            // characters: an accent never lands on the next row alone.
+            for (_, cluster) in clusters(word) {
+                let cell = display_width(cluster);
+                if used + cell > width && used > 0 {
                     out.push(std::mem::take(&mut line));
                     used = 0;
                 }
-                line.push(c);
+                line.push_str(cluster);
                 used += cell;
             }
             continue;
@@ -508,6 +509,10 @@ struct ComposerRow {
 /// break first, then each is hard-wrapped at `width` display cells; an
 /// editor's cursor has to land on a predictable cell, so this does not
 /// wrap on words the way the transcript does.
+///
+/// Breaks fall on character boundaries, not scalar boundaries: `e` plus a
+/// combining acute is one character one cell wide, so it is never split
+/// across two rows and never charged two cells.
 fn composer_rows(text: &str, width: usize) -> Vec<ComposerRow> {
     let width = width.max(1);
     let mut rows = Vec::new();
@@ -516,9 +521,11 @@ fn composer_rows(text: &str, width: usize) -> Vec<ComposerRow> {
         let mut chunk = String::new();
         let mut chunk_start = line_start;
         let mut used = 0;
-        for (offset, c) in line.char_indices() {
-            let cell = display_width(c.encode_utf8(&mut [0u8; 4])).max(1);
-            if used + cell > width {
+        for (offset, cluster) in clusters(line) {
+            let cell = display_width(cluster);
+            // `used > 0` keeps a zero-width cluster with what precedes it
+            // and stops a wide glyph from looping on an empty row.
+            if used + cell > width && used > 0 {
                 rows.push(ComposerRow {
                     start: chunk_start,
                     text: std::mem::take(&mut chunk),
@@ -526,7 +533,7 @@ fn composer_rows(text: &str, width: usize) -> Vec<ComposerRow> {
                 chunk_start = line_start + offset;
                 used = 0;
             }
-            chunk.push(c);
+            chunk.push_str(cluster);
             used += cell;
         }
         rows.push(ComposerRow {

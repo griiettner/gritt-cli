@@ -454,6 +454,49 @@ impl App {
         self.metrics.get().terminal_width >= sidebar::SIDEBAR_MIN_TERMINAL_WIDTH
     }
 
+    /// Whether the sidebar column is on screen, which is what decides
+    /// whether focus may rest on it.
+    pub fn sidebar_column_visible(&self) -> bool {
+        self.sidebar_fits_beside() && self.sidebar_enabled
+    }
+
+    /// The terminal changed size. The drawer and the focus are both tied
+    /// to a placement that may no longer hold, so both are reconciled
+    /// before the next key is read.
+    pub fn on_resize(&mut self, width: u16, height: u16) {
+        let previous = self.metrics.get();
+        self.metrics.set(Metrics {
+            terminal_width: width,
+            transcript_height: height as usize,
+            ..previous
+        });
+        self.reconcile_layout();
+    }
+
+    /// Drops state that the current terminal size cannot support.
+    ///
+    /// A drawer opened on a narrow terminal is not drawn once the column
+    /// fits, so leaving it on the stack would let an invisible overlay
+    /// swallow every key. Focus on a hidden sidebar would swallow the
+    /// scroll keys the same way.
+    pub fn reconcile_layout(&mut self) {
+        if self.sidebar_fits_beside() {
+            while let Some(position) = self
+                .overlays
+                .iter()
+                .position(|overlay| matches!(overlay, Overlay::Drawer { .. }))
+            {
+                // The drawer becomes the column: the user asked to see
+                // this information and the wide layout has room for it.
+                self.close_drawer(position);
+                self.sidebar_enabled = true;
+            }
+        }
+        if self.focus == Focus::Sidebar && !self.sidebar_column_visible() {
+            self.focus = Focus::Composer;
+        }
+    }
+
     pub fn top_overlay(&self) -> Option<&Overlay> {
         self.overlays.last()
     }
@@ -1034,6 +1077,9 @@ impl App {
     /// Overlay priority, top first: an approval, then the overlay stack,
     /// then `/` suggestions, then the focused pane.
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
+        // A resize may have invalidated the drawer or the focused pane
+        // since the last key; neither may capture this one.
+        self.reconcile_layout();
         if self.pending.is_some() {
             return self.approval_key(key);
         }
@@ -1467,17 +1513,20 @@ impl App {
                     Action::None
                 }
             }
+            // Focus only stops on panes that are actually on screen, so
+            // Tab can never park the keyboard on a hidden sidebar.
             (KeyCode::Tab, _) => {
                 self.focus = match self.focus {
                     Focus::Composer => Focus::Transcript,
-                    Focus::Transcript => Focus::Sidebar,
-                    Focus::Sidebar => Focus::Composer,
+                    Focus::Transcript if self.sidebar_column_visible() => Focus::Sidebar,
+                    Focus::Transcript | Focus::Sidebar => Focus::Composer,
                 };
                 Action::None
             }
             (KeyCode::BackTab, _) => {
                 self.focus = match self.focus {
-                    Focus::Composer => Focus::Sidebar,
+                    Focus::Composer if self.sidebar_column_visible() => Focus::Sidebar,
+                    Focus::Composer => Focus::Transcript,
                     Focus::Transcript => Focus::Composer,
                     Focus::Sidebar => Focus::Transcript,
                 };
@@ -1523,7 +1572,7 @@ impl App {
                 // The sidebar column scrolls on its own; the transcript
                 // pane scrolls outright; from the composer, a move with
                 // nowhere to go scrolls the transcript instead.
-                if self.focus == Focus::Sidebar {
+                if self.focus == Focus::Sidebar && self.sidebar_column_visible() {
                     self.sidebar_scroll = self.sidebar_scroll.saturating_sub(1);
                 } else if self.focus == Focus::Transcript || !self.composer.move_up(shift) {
                     self.scroll_up(1);
@@ -1531,7 +1580,7 @@ impl App {
                 Action::None
             }
             (KeyCode::Down, _) => {
-                if self.focus == Focus::Sidebar {
+                if self.focus == Focus::Sidebar && self.sidebar_column_visible() {
                     self.sidebar_scroll = self.sidebar_scroll.saturating_add(1);
                 } else if self.focus == Focus::Transcript || !self.composer.move_down(shift) {
                     self.scroll_down(1);
@@ -1547,7 +1596,7 @@ impl App {
                 Action::None
             }
             (KeyCode::PageUp, _) => {
-                if self.focus == Focus::Sidebar {
+                if self.focus == Focus::Sidebar && self.sidebar_column_visible() {
                     self.sidebar_scroll = self.sidebar_scroll.saturating_sub(10);
                 } else {
                     self.scroll_up(10);
@@ -1555,7 +1604,7 @@ impl App {
                 Action::None
             }
             (KeyCode::PageDown, _) => {
-                if self.focus == Focus::Sidebar {
+                if self.focus == Focus::Sidebar && self.sidebar_column_visible() {
                     self.sidebar_scroll = self.sidebar_scroll.saturating_add(10);
                 } else {
                     self.scroll_down(10);
