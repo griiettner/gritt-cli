@@ -1,4 +1,22 @@
 subskills:
+  - id: write-markdown
+    title: Markdown
+    file: markdown/SKILL.md
+    tags:
+      - presentation
+      - markdown
+    read_when:
+      - authoring canonical Markdown for documentation or feature plans
+      - coordinating Markdown with an HTML companion
+  - id: write-html
+    title: HTML
+    file: html/SKILL.md
+    tags:
+      - presentation
+      - html
+    read_when:
+      - creating or updating an HTML companion for documentation or a feature plan
+      - using the shared HTML design assets and browser verification
   - id: write-process
     title: Process
     file: process/SKILL.md

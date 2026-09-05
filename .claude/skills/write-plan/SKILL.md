@@ -1,6 +1,6 @@
 ---
 name: write-plan
-description: "Create or update feature plans under .agents/plans. Use when planning a cross-cutting product feature outside ticket execution."
+description: Writes feature plans and proposals under .agents/plans. Use when the user requests a product feature plan or proposal outside ticket execution.
 disable-model-invocation: true
 ---
 

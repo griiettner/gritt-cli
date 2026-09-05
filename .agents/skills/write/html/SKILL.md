@@ -1,11 +1,13 @@
 ---
-name: write-docs-html
-description: Authors the HTML half of a paired doc, using the design system under html/template. Use when writing or updating the .html file for write-docs.
+name: write-html
+description: Presents Markdown content as an HTML companion using shared design assets. Use when a documentation or planning workflow requires HTML.
 ---
 
 # HTML
 
-Read [write-docs](../SKILL.md) first.
+Read [write](../SKILL.md) first for prose guidance. The calling workflow
+supplies the outline, canonical Markdown, and output paths. Preserve its
+document structure, whether documentation or a feature proposal.
 
 The design system lives in [template/](template/). When something here is ambiguous, [template/example.html](template/example.html) is the reference render.
 
@@ -37,6 +39,7 @@ SVG when a `docCharts` function covers it.
 1. Copy `template/shell.html` to the doc path and `template/assets/` next to it.
    Keep the relative `assets/` paths.
 2. Set the title, the masthead status chip, and one nav link per section.
+   Link to the canonical Markdown and add the reciprocal link there.
 3. Copy the blocks each section needs out of `template/components.html`.
 4. Put every chart mount call in the bottom `<script>`, after the markup.
 5. Delete unused sections and every `SLOT` comment. No `SLOT` text ships.
@@ -55,6 +58,16 @@ If the `.html` path exists, edit it. Do not write a new document.
    restyle or reorder untouched markup, and do not "clean up" the assets.
 4. If the paired Markdown exists, update the matching claim there. Do not
    rebuild the HTML from the Markdown.
+
+## Verification
+
+- The companion and Markdown share claims, section coverage, and sourced
+  numbers, with working reciprocal links.
+- Local assets load without network access and no template placeholders remain.
+- Open the page in a browser and check narrow layout, light and dark themes,
+  navigation, and any chart interactions. Report checks that could not run.
+- Apply the prose pass from `write` to new text or changed passages while
+  preserving chart data, claims, and unaffected markup.
 
 ## Components
 

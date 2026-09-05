@@ -1,6 +1,6 @@
 ---
 name: write-plan
-description: "Create or update feature plans under .agents/plans. Use when planning a cross-cutting product feature outside ticket execution."
+description: Writes feature plans and proposals under .agents/plans. Use when the user requests a product feature plan or proposal outside ticket execution.
 disable-model-invocation: true
 ---
 
@@ -13,10 +13,8 @@ completion report.
 
 ## Workflow
 
-1. Read `AGENTS.md` and `.agents/skills/write/SKILL.md` first. The `write`
-   skill is the main writing reference. For a new or substantial plan, also
-   load its `process` and `voice` guidance, then only the pattern guidance that
-   applies.
+1. Read [write](../write/SKILL.md) first and follow its prose workflow.
+   Read `AGENTS.md` for repository context routing.
 2. Query local memory before source search. If local memory is unavailable,
    use `.agents/memory/MEMORY.md` and the smallest relevant indexes.
 3. Use [assets/feature-plan-template.md](assets/feature-plan-template.md) as
@@ -39,9 +37,11 @@ completion report.
    affected files or crates, behavior, tests, and an exit condition.
 9. Include acceptance criteria, verification commands, risks, security or
    compatibility constraints, and a completion condition.
-10. Save the canonical plan as `.agents/plans/<name>.md`. Create or update
-   `<name>.html` only when a paired presentation is requested or an existing
-   plan already has one. Never edit generated indexes directly.
+10. Load [Markdown](../write/markdown/SKILL.md) and save the canonical plan as
+    `.agents/plans/<name>.md`. Create or update `<name>.html` only when a paired
+    presentation is requested or the plan being updated already has one.
+    For that branch, load [HTML](../write/html/SKILL.md) for shared design
+    assets and browser verification. Both files use the plan's outline.
 11. Run the relevant validation for the plan and report the file, decisions
     locked, validation performed, and unresolved risks.
 
@@ -69,6 +69,9 @@ completion report.
 - Check every referenced path exists or is explicitly marked as a proposed new
   path.
 - Check that phases have dependency order and exit conditions.
+- Distinguish accepted decisions, proposed decisions, assumptions, and open
+  questions. A proposal is not an accepted architectural rule.
+- When paired, run the shared Markdown/HTML parity and presentation checks.
 - Run `./.agents/gritt-agent ticket validate` when the plan changes durable
   project terminology or references ticket and memory artifacts.
 - If the skill itself changed, run `./.agents/gritt-agent skill audit --skill

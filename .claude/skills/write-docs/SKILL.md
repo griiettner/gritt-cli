@@ -1,6 +1,6 @@
 ---
 name: write-docs
-description: Writes paired Markdown and self-contained HTML docs. Use when the user asks for documentation, a proposal, a comparison, findings, a design write-up, or an HTML report with charts.
+description: Writes documentation of existing systems and processes. Use when the user requests documentation or updates to it.
 disable-model-invocation: true
 ---
 

@@ -52,7 +52,18 @@ Do not load all pattern files for a one-word edit. Do load all of them when the 
 | Ticket, skill, or review prose written in place | process, voice, reports, then the pattern files that still apply after a scan |
 | Technical or encyclopedic register | process, voice (technical gate), then the pattern files |
 
-## Sub-skills
+## Presentation routing
+
+Load presentation guidance only when the requested output needs it. Ordinary
+prose work does not load HTML instructions or design assets. The calling
+workflow owns the outline and destination; these sub-skills own presentation.
+
+- [Markdown](markdown/SKILL.md): canonical Markdown and companion parity for
+  documentation or feature plans.
+- [HTML](html/SKILL.md): HTML companions, shared design assets, and browser
+  verification for documentation or feature plans.
+
+## Prose sub-skills
 
 Nested under `write/`. Not separately invocable.
 
