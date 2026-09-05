@@ -161,8 +161,9 @@ fn tab_completes_a_suggestion_and_otherwise_moves_focus() {
         Focus::Composer,
         "Tab completed instead of moving"
     );
-    app.composer.clear();
-    // A terminal wide enough for the column, so focus can rest on it.
+    // A conversation on a terminal wide enough for the column, which is
+    // the only layout where anything but the composer is drawn.
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
     app.set_metrics(Metrics {
         transcript_lines: 40,
         transcript_height: 10,
@@ -176,6 +177,80 @@ fn tab_completes_a_suggestion_and_otherwise_moves_focus() {
     assert_eq!(app.focus, Focus::Composer);
     app.on_key(key(KeyCode::BackTab));
     assert_eq!(app.focus, Focus::Sidebar);
+}
+
+/// Finding 1 (round 3): home draws neither the transcript pane nor the
+/// sidebar column, however wide the terminal is, so focus has nowhere to
+/// go but the composer and the arrow keys stay with the cursor.
+#[test]
+fn home_keeps_focus_on_the_composer_however_wide_the_terminal() {
+    let mut app = fixture::home(Theme::new(ThemeMode::NoColor));
+    app.set_metrics(Metrics {
+        transcript_lines: 0,
+        transcript_height: 10,
+        terminal_width: 120,
+    });
+    assert_eq!(app.layout(), Layout::Home);
+    assert!(
+        app.sidebar_enabled,
+        "the column is on, it is just not drawn"
+    );
+    assert!(!app.sidebar_column_visible());
+    assert!(!app.transcript_is_focusable());
+
+    // The reviewer's sequence: a multiline draft, Tab twice, then Up.
+    app.on_paste("first line\nsecond line");
+    app.on_key(key(KeyCode::Tab));
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!(app.focus, Focus::Composer, "Tab left the composer on home");
+    let row_before = app.composer.row();
+    app.on_key(key(KeyCode::Up));
+    assert_eq!(
+        app.composer.row(),
+        row_before - 1,
+        "Up did not move the cursor"
+    );
+    assert_eq!(
+        app.sidebar_scroll, 0,
+        "an undrawn sidebar took the arrow key"
+    );
+    app.on_key(key(KeyCode::BackTab));
+    assert_eq!(app.focus, Focus::Composer);
+}
+
+/// Focus left on a pane by a layout change is normalized before the next
+/// key, the same way a stale drawer is.
+#[test]
+fn focus_left_on_a_pane_that_home_does_not_draw_is_normalized() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.set_metrics(Metrics {
+        transcript_lines: 40,
+        transcript_height: 10,
+        terminal_width: 120,
+    });
+    app.on_key(key(KeyCode::Tab));
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!(app.focus, Focus::Sidebar);
+    // `/new` empties the transcript, which is what returns home.
+    app.dispatch(Command::New, None);
+    assert_eq!(app.layout(), Layout::Home);
+    app.reconcile_layout();
+    assert_eq!(app.focus, Focus::Composer);
+
+    // The same when focus sat on the transcript pane.
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.set_metrics(Metrics {
+        transcript_lines: 40,
+        transcript_height: 10,
+        terminal_width: 120,
+    });
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!(app.focus, Focus::Transcript);
+    app.dispatch(Command::New, None);
+    // Reconciliation also runs at the top of the next key.
+    type_text(&mut app, "x");
+    assert_eq!(app.focus, Focus::Composer);
+    assert_eq!(app.composer.text(), "x");
 }
 
 /// Finding 3 (round 2): Tab must not park the keyboard on a sidebar that

@@ -233,16 +233,36 @@ reviewer's Tab, Tab, PageUp sequence) and `hiding_the_column_moves_focus_off_it`
 
 ### Dependency added
 
-`unicode-segmentation` 1.13.3, MIT OR Apache-2.0, from the unicode-rs
-group, added to the workspace and to `gritt-harness`. Checked before
-adding, as the CLI skill requires: it is already a direct dependency of
-`ratatui-core` and `ratatui-widgets`, so it is compiled into every Gritt
-binary today and this edge adds no new code and no new transitive
-dependency. `Cargo.lock` grew by one line, the edge itself. Source is 712
-KiB, mostly Unicode tables and tests, with no build script. The
-alternative, grouping scalars by zero display width, would have handled the
-reported combining-mark case but not clusters generally, and the reviewer
-asked for grapheme boundaries.
+`unicode-segmentation` 1.13.3, added to `[workspace.dependencies]` and to
+`gritt-harness`. The alternative, grouping scalars by zero display width,
+would have handled the reported combining-mark case but not clusters
+generally, and the reviewer asked for grapheme boundaries.
+
+The CLI skill requires a recorded check before adding a crate. Checked on
+2026-09-05, against the vendored source in the local registry
+(`~/.cargo/registry/src/index.crates.io-*/unicode-segmentation-1.13.3/`)
+and this repository's `Cargo.lock`:
+
+| Question | Evidence | Source |
+| --- | --- | --- |
+| Licence | `license = "MIT OR Apache-2.0"`, with `LICENSE-MIT`, `LICENSE-APACHE`, and `COPYRIGHT` in the package | vendored `Cargo.toml` and package root |
+| Owner | `repository = "https://github.com/unicode-rs/unicode-segmentation"`, the unicode-rs working group that also publishes `unicode-width` | vendored `Cargo.toml` |
+| Already in the build | `ratatui-core` 0.1.2 and `ratatui-widgets` 0.3.2 both list it, and so do `unicode-truncate` 2.0.1 and `convert_case` 0.10.0 | `Cargo.lock` |
+| Cost of the edge | `Cargo.lock` grew by exactly one line, the new edge; no package was added or bumped | `git diff --stat Cargo.lock` |
+| Size | 400 KiB of source, mostly generated Unicode tables; 712 KiB including tests and benches | `du -sh` on the vendored package |
+| Transitive deps | none at build time; its only dependencies are dev-dependencies for its own tests | vendored `Cargo.toml` |
+| Platform support | `#![no_std]` with an explicit no-std section in its documentation, so nothing is platform-specific | vendored `src/lib.rs:35,55` |
+| Safety | `#![deny(missing_docs, unsafe_code)]`; no `unsafe` block in the crate | vendored `src/lib.rs:50` |
+| Toolchain | `edition = "2018"`, `rust-version = "1.85.0"`, below this workspace's 1.88 floor | vendored `Cargo.toml` |
+| Registry only | plain version requirement in `[workspace.dependencies]`; no Git dependency | this repository's `Cargo.toml` |
+
+Release history and downloads were not checked: this environment has no
+network access, so crates.io could not be read. The reviewer independently
+consulted
+[the upstream package page](https://docs.rs/crate/unicode-segmentation/1.13.3)
+in round 3 and accepted the addition on that basis, noting its release
+history and no-std support. Everything in the table above was verified
+locally and can be re-checked from the paths named.
 
 ### Round 2 validation
 
@@ -257,6 +277,75 @@ asked for grapheme boundaries.
 is itself worth recording: the grapheme rewrite altered no fixture
 rendering, because the fixtures hold CJK and long identifiers but no
 combining marks, and those already wrapped correctly.
+
+`.agents/gritt-agent ticket chain-check --ticket TKT-0018 --base main`:
+
+```text
+NOTE: current branch: tkt-0018-03-tui-foundation
+NOTE: base branch `main` sha: 77aaa22cb1c5
+NOTE: changed files against `main`: 64
+tkt_chain_check ok (0 warning(s))
+```
+
+## Round 3
+
+The third review confirmed round 2's drawer and grapheme fixes and accepted
+the dependency, and returned two medium findings: one an incomplete fix
+from round 2, one a performance regression introduced by it. Findings are
+in `/tmp/review-tkt-0018-r3-findings.md`.
+
+**R3-1: wide home still allowed focus onto a sidebar it never draws.**
+Round 2 made focus depend on `terminal_width` and `sidebar_enabled`, which
+is the placement rule for the conversation layout. Home is a centred
+wordmark and composer and draws neither the column nor a transcript pane,
+so at 120 columns Tab twice still parked focus on the sidebar and Up moved
+an invisible scroll offset instead of the composer cursor. The predicate
+now requires the conversation layout, and the same reasoning applies to the
+transcript pane, which home does not draw either: `focus_is_available`
+answers for all three panes, `next_focus` walks the cycle and stops only on
+a pane that is drawn, and `reconcile_layout` normalizes focus off any pane
+that is not. On home the cycle is the composer alone, so the arrow keys
+always belong to the cursor. Covered by
+`home_keeps_focus_on_the_composer_however_wide_the_terminal`, which drives
+the reviewer's exact sequence (multiline paste, Tab, Tab, Up) and asserts
+the cursor moved and `sidebar_scroll` did not, and by
+`focus_left_on_a_pane_that_home_does_not_draw_is_normalized`, which covers
+`/new` returning home while focus sits on the sidebar and on the transcript.
+
+**R3-2: backward word editing became quadratic.** Round 2 replaced
+scalar stepping with `cluster_start`, which scans forward from the start of
+the buffer for every backward boundary. `word_start` calls that once per
+grapheme, so a Ctrl-W or Ctrl-Left after a long unbroken paste did work
+proportional to the square of the draft length, synchronously on the
+interface thread. The forward scan is gone: `last_cluster_len` uses
+`graphemes(true).next_back()`, so a backward step costs the length of the
+cluster it crosses rather than the length of everything before it, and
+`word_start` becomes linear in the word. Covered by
+`backward_word_editing_does_not_rescan_the_whole_draft`, which builds a
+100,000-character unbroken draft and bounds Ctrl-Left, Ctrl-W, and ten
+thousand Left presses at five seconds each. The bound is deliberately loose
+so a slow machine cannot make it flaky; the quadratic form needed on the
+order of a hundred million grapheme visits for the same draft and fails the
+bound by orders of magnitude. The whole composer suite runs in 0.05s.
+
+This one was mine to catch and I did not: round 2 changed how far a
+backward step scans and I only checked that it landed in the right place.
+
+### Round 3 validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --no-fail-fast` | pass, 422 tests, 0 failed |
+| `cargo test -p gritt --test tui_pty` | pass, 6 tests |
+
+422 passing, up from 419: 3 tests added. No snapshot golden changed; the
+focus and traversal rules are reducer behaviour and alter no drawn frame.
+
+The two optional follow-ups were taken: the dependency check above now
+records dated, sourced evidence for each question the CLI skill asks, and
+`report.md` no longer claims no dependency was added.
 
 `.agents/gritt-agent ticket chain-check --ticket TKT-0018 --base main`:
 

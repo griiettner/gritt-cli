@@ -455,9 +455,26 @@ impl App {
     }
 
     /// Whether the sidebar column is on screen, which is what decides
-    /// whether focus may rest on it.
+    /// whether focus may rest on it. The home layout is a centred
+    /// wordmark and composer and never draws the column, however wide the
+    /// terminal is, so width and the user's toggle are not enough.
     pub fn sidebar_column_visible(&self) -> bool {
-        self.sidebar_fits_beside() && self.sidebar_enabled
+        self.layout() == Layout::Conversation && self.sidebar_fits_beside() && self.sidebar_enabled
+    }
+
+    /// The home layout draws no transcript pane either, so focus has
+    /// nowhere to go there but the composer.
+    pub fn transcript_is_focusable(&self) -> bool {
+        self.layout() == Layout::Conversation
+    }
+
+    /// Whether focus may rest on a pane at all.
+    fn focus_is_available(&self, focus: Focus) -> bool {
+        match focus {
+            Focus::Composer => true,
+            Focus::Transcript => self.transcript_is_focusable(),
+            Focus::Sidebar => self.sidebar_column_visible(),
+        }
     }
 
     /// The terminal changed size. The drawer and the focus are both tied
@@ -492,7 +509,9 @@ impl App {
                 self.sidebar_enabled = true;
             }
         }
-        if self.focus == Focus::Sidebar && !self.sidebar_column_visible() {
+        // Focus on a pane that is not drawn would send the scroll keys
+        // somewhere invisible, so it returns to the composer.
+        if !self.focus_is_available(self.focus) {
             self.focus = Focus::Composer;
         }
     }
@@ -920,6 +939,27 @@ impl App {
             PickerKind::Mcp => self.mcp_picker(),
         };
         self.overlays.push(Overlay::Picker { kind, picker });
+    }
+
+    /// The next pane in the cycle that is actually on screen. On home
+    /// that is the composer every time, because nothing else is drawn.
+    fn next_focus(&self, forward: bool) -> Focus {
+        const ORDER: [Focus; 3] = [Focus::Composer, Focus::Transcript, Focus::Sidebar];
+        let at = ORDER
+            .iter()
+            .position(|pane| *pane == self.focus)
+            .unwrap_or(0);
+        for step in 1..=ORDER.len() {
+            let next = if forward {
+                (at + step) % ORDER.len()
+            } else {
+                (at + ORDER.len() - step) % ORDER.len()
+            };
+            if self.focus_is_available(ORDER[next]) {
+                return ORDER[next];
+            }
+        }
+        Focus::Composer
     }
 
     /// Runs a registry command. Every entry point — `/` submission, the
@@ -1516,20 +1556,11 @@ impl App {
             // Focus only stops on panes that are actually on screen, so
             // Tab can never park the keyboard on a hidden sidebar.
             (KeyCode::Tab, _) => {
-                self.focus = match self.focus {
-                    Focus::Composer => Focus::Transcript,
-                    Focus::Transcript if self.sidebar_column_visible() => Focus::Sidebar,
-                    Focus::Transcript | Focus::Sidebar => Focus::Composer,
-                };
+                self.focus = self.next_focus(true);
                 Action::None
             }
             (KeyCode::BackTab, _) => {
-                self.focus = match self.focus {
-                    Focus::Composer if self.sidebar_column_visible() => Focus::Sidebar,
-                    Focus::Composer => Focus::Transcript,
-                    Focus::Transcript => Focus::Composer,
-                    Focus::Sidebar => Focus::Transcript,
-                };
+                self.focus = self.next_focus(false);
                 Action::None
             }
             (KeyCode::Enter, _) => {

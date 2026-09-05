@@ -118,8 +118,12 @@ not write the system clipboard.
 
 **A snapshot crate.** `insta` was considered and not added. The ticket
 prefers no new dependency, and a plain golden file plus
-`GRITT_UPDATE_SNAPSHOTS=1` gives the same review loop. No dependency was
-added by this ticket at all, so no licence check was needed.
+`GRITT_UPDATE_SNAPSHOTS=1` gives the same review loop.
+
+One dependency was added: `unicode-segmentation`, in review round 2, with
+the check recorded below and in the update file. The original version of
+this section said no dependency was added at all; that was written before
+round 2 and is corrected here.
 
 **A `unicode-width` dependency for display width.** Not needed:
 `ratatui::text::Span::raw(s).width()` is the same measurement the renderer
@@ -127,13 +131,13 @@ uses, so the composer's column arithmetic and the drawn glyph cannot
 disagree. `composer::display_width` is that one line.
 
 **Grapheme segmentation** was needed, and `unicode-segmentation` 1.13.3
-(MIT OR Apache-2.0, unicode-rs) was added in review round 2 after the
-reviewer found that scalar-by-scalar wrapping split combining marks off
-their characters. It is already a direct dependency of `ratatui-core`, so
-the edge adds no code to the build; `Cargo.lock` grew by one line.
-Ratatui's own `styled_graphemes` was tried first and rejected because it
-filters control characters, which desyncs the byte offsets the composer
-needs to place its cursor. Details in the update file.
+was added in review round 2 after the reviewer found that scalar-by-scalar
+wrapping split combining marks off their characters. Ratatui's own
+`styled_graphemes` was tried first and rejected because it filters control
+characters, which desyncs the byte offsets the composer needs to place its
+cursor. The full check is in the update file; the short form is that it was
+already compiled into every Gritt binary as a dependency of `ratatui-core`,
+so the edge added one line to `Cargo.lock` and no code to the build.
 
 **One golden file per theme.** Rejected: the text is identical across
 palettes by design, so three files per screen would be three copies of the
@@ -216,10 +220,10 @@ Run from `/Users/griiettner/Projects/grittflow/gritt-cli-tkt-0018`:
 | `cargo clippy --workspace --all-targets -- -D warnings` | pass, no warnings |
 | `cargo test -p gritt-harness` | pass, 226 tests (128 lib, 98 integration) |
 | `cargo test -p gritt --test tui_pty` | pass, 6 tests |
-| `cargo test --workspace --no-fail-fast` | pass, 419 tests, 0 failed |
+| `cargo test --workspace --no-fail-fast` | pass, 422 tests, 0 failed |
 
-Counts are after two rounds of review fixes; the first gate on this branch
-saw 395. See the update file for what each round changed.
+Counts are after three rounds of review fixes; the first gate on this
+branch saw 395. See the update file for what each round changed.
 
 Tests added: 27 reducer tests in `src/tui/app/tests.rs`, 20 unit tests
 across `theme`, `composer`, `command`, `picker`, `sidebar`, and `fixture`,
@@ -318,12 +322,14 @@ What a human should still check, because a PTY byte stream cannot:
 
 ## Follow-up
 
-0. **Two review rounds landed on this branch.** Ten findings in total, one
-   high and nine medium. The high one and the round 2 findings are worth
-   reading before extending this code: they were all cases where two parts
-   of the interface disagreed about state (a highlight index against a
+0. **Three review rounds landed on this branch.** Twelve findings in
+   total, one high and eleven medium. Most were one of two shapes, and both
+   are worth knowing before extending this code. The first is two parts of
+   the interface disagreeing about state: a highlight index against a
    filtered list, a renderer hiding an overlay the reducer still routed to,
-   a scalar loop against a grapheme). See
+   a focus predicate that knew the terminal width but not the layout. The
+   second is a fix that moved the cost rather than removing it: making
+   backward cursor steps grapheme-aware turned them quadratic. See
    [the update file](updates/2026-09-05-review-fixes.md).
 1. **TKT-0019 wiring.** `ModelCatalogView`, `AgentSummary`, and
    `SidebarModel` are populated by `fixture.rs` today. They exist to be

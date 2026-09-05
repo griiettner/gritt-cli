@@ -23,13 +23,14 @@ pub fn clusters(text: &str) -> impl Iterator<Item = (usize, &str)> {
     text.grapheme_indices(true)
 }
 
-/// The byte offset of the cluster boundary at or before `at`.
-fn cluster_start(text: &str, at: usize) -> usize {
-    clusters(text)
-        .take_while(|(offset, _)| *offset < at)
-        .last()
-        .map(|(offset, _)| offset)
-        .unwrap_or(0)
+/// The length of the last cluster of `text`, or 0 when it is empty.
+///
+/// This walks backwards from the end rather than forwards from the start.
+/// The forward form is the obvious one and it is quadratic: every
+/// backward step over a word would rescan the whole draft before it, so a
+/// Ctrl-W after a long unbroken paste would block the interface.
+fn last_cluster_len(text: &str) -> usize {
+    text.graphemes(true).next_back().map(str::len).unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -331,9 +332,13 @@ impl Composer {
     // -- boundaries -----------------------------------------------------
 
     /// The previous cluster boundary: Left and Backspace step over a whole
-    /// character, accents included.
+    /// character, accents included. Costs the length of the cluster being
+    /// stepped over, not the length of everything before it.
     fn prev_boundary(&self, at: usize) -> usize {
-        cluster_start(&self.text[..at], at)
+        match last_cluster_len(&self.text[..at]) {
+            0 => at.saturating_sub(1),
+            len => at - len,
+        }
     }
 
     fn next_boundary(&self, at: usize) -> usize {
@@ -513,6 +518,54 @@ mod tests {
         assert!(composer.is_empty());
         composer.set_text(held);
         assert_eq!(composer.text(), "draft /quit\nsecond\nthird");
+    }
+
+    /// Backward movement and deletion must cost the text they cross, not
+    /// the text before it. The forward scan this replaced needed on the
+    /// order of a hundred million grapheme visits for this draft, which
+    /// is minutes of blocked interface; the bound here is loose enough to
+    /// survive a slow machine and still fails outright on a quadratic
+    /// implementation.
+    #[test]
+    fn backward_word_editing_does_not_rescan_the_whole_draft() {
+        use std::time::{Duration, Instant};
+
+        // One unbroken run: no whitespace to cut the backward scan short.
+        let draft = "a".repeat(100_000);
+        let mut composer = Composer::from_text(draft.clone());
+        let budget = Duration::from_secs(5);
+
+        let start = Instant::now();
+        composer.move_word_left(false);
+        assert_eq!(composer.cursor(), 0);
+        assert!(
+            start.elapsed() < budget,
+            "Ctrl-Left over 100k characters took {:?}",
+            start.elapsed()
+        );
+
+        composer.move_text_end(false);
+        let start = Instant::now();
+        composer.delete_word_back();
+        assert!(composer.is_empty());
+        assert!(
+            start.elapsed() < budget,
+            "Ctrl-W over 100k characters took {:?}",
+            start.elapsed()
+        );
+
+        // Stepping backwards one character at a time is the same rule.
+        let mut composer = Composer::from_text(draft);
+        let start = Instant::now();
+        for _ in 0..10_000 {
+            composer.move_left(false);
+        }
+        assert_eq!(composer.cursor(), 90_000);
+        assert!(
+            start.elapsed() < budget,
+            "10k Left presses took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
