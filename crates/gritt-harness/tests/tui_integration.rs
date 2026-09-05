@@ -471,6 +471,34 @@ async fn approving_a_server_from_the_overlay_launches_it_and_publishes_the_chang
     );
     type_text(&mut app, "Approve");
     let action = app.on_key(key(KeyCode::Enter));
+    // Approving asks for the definition first: reading a workspace file
+    // does not authorize running what it names.
+    let Action::Mcp(McpRequest::RequestApproval { server }) = action else {
+        panic!("expected a request for the definition, got {action:?}")
+    };
+
+    // The real, redacted summary from the runtime, shown in the shared
+    // approval overlay.
+    let definition = fixture
+        .mcp
+        .definition_summary(&server)
+        .await
+        .expect("a configured entry has a definition");
+    assert!(
+        definition.contains(FIXTURE),
+        "the executable being trusted is not shown: {definition}"
+    );
+    assert!(
+        definition.contains("FIXTURE_MARKER"),
+        "the environment names are not shown: {definition}"
+    );
+    assert!(
+        !definition.contains(&fixture.marker.to_string_lossy().to_string()),
+        "an environment value leaked into the summary: {definition}"
+    );
+    app.request_mcp_approval(server.clone(), definition);
+    assert!(app.pending.is_some(), "no approval overlay was shown");
+    let action = app.on_key(key(KeyCode::Char('y')));
     let Action::Mcp(McpRequest::Decide { server, decision }) = action else {
         panic!("expected a typed decision, got {action:?}")
     };

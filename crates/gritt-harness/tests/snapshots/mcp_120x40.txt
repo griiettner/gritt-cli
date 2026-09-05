@@ -19,7 +19,8 @@
                       │  broken-server                                                  [failed] │
                       │    failed: the command exited with status 127                            │480
                       │  legacy-sse                                                [unsupported] │10
-                      │    gritt cannot connect to it: standalone SSE is not supported; use Strea│ of context
+                      │    gritt cannot connect to it: standalone SSE is not supported; use Strea│00 in, last request
+                      │                                                                          │ of context
                       │                                                                          │
                       │                                                                          │
                       │                                                                          │0.0412
@@ -32,12 +33,11 @@
                       │                                                                          │ied (pre-existing)
                       │                                                                          │
                       │                                                                          │tions
+                      │                                                                          │ed by Gritt
                       │                                                                          │ocal-memory ready
                       │                                                                          │ls
                       │                                                                          │ocal-memory starting
-                      │                                                                          │cting and negotiatin
-                      │                                                                          │ve… awaiting approva
-                      ╰ type to filter · Enter selects · Esc closes ─────────────────────────────╯ng for approval to r
+                      ╰ type to filter · Enter selects · Esc closes ─────────────────────────────╯cting and negotiatin
  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │Ask Gritt to do something…                                                                                          │
  ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

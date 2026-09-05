@@ -510,6 +510,8 @@ fn unicode_cursor_movement_steps_by_character() {
 #[test]
 fn changing_the_provider_clears_the_model_and_the_catalog() {
     let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    // An unpinned draft: the pinned case is its own test below.
+    app.session_pinned = false;
     assert_eq!(app.draft.model.as_deref(), Some("openai/gpt-5-nano"));
     app.select_profile("anthropic");
     assert_eq!(app.draft.profile.as_deref(), Some("anthropic"));
@@ -533,6 +535,7 @@ fn changing_the_model_revalidates_the_effort_against_it() {
 #[test]
 fn the_effort_picker_offers_auto_and_explains_every_refusal() {
     let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.session_pinned = false;
     let picker = app.effort_picker();
     assert_eq!(picker.rows()[0].id, "auto");
     assert!(picker.rows()[0].availability.is_available());
@@ -872,7 +875,7 @@ fn resuming_a_session_is_refused_while_a_turn_runs() {
         Action::RefreshSessions
     );
     app.on_key(key(KeyCode::Enter));
-    assert!(app.notice.as_deref().unwrap().contains("running turn"));
+    assert!(app.notice.as_deref().unwrap().contains("work in flight"));
     app.running = false;
     app.dispatch(Command::Sessions, None);
     assert!(matches!(app.on_key(key(KeyCode::Enter)), Action::Resume(_)));
@@ -1345,13 +1348,37 @@ fn mcp_lists_every_state_and_offers_the_typed_actions() {
     );
     type_text(&mut app, "Approve");
     let action = app.on_key(key(KeyCode::Enter));
+    // Approving launches a program, so the row asks for the definition
+    // rather than granting anything.
     assert_eq!(
         action,
+        Action::Mcp(McpRequest::RequestApproval {
+            server: "waiting".into()
+        })
+    );
+    // What the runtime does with it: the same modal overlay a tool
+    // approval uses, showing what would run.
+    app.request_mcp_approval("waiting".into(), "run: /usr/bin/probe --serve".into());
+    let pending = app.pending.as_ref().expect("no approval was shown");
+    assert_eq!(pending.request.tool, "mcp_server_launch");
+    assert_eq!(pending.request.resource, "mcp:waiting");
+    assert!(pending
+        .preview
+        .as_deref()
+        .unwrap_or_default()
+        .contains("/usr/bin/probe"));
+    // Settings stay refused while it is open.
+    assert_eq!(app.dispatch(Command::Models, None), Action::None);
+    // Answering it records the trust decision, not a tool approval.
+    assert_eq!(
+        app.on_key(key(KeyCode::Char('y'))),
         Action::Mcp(McpRequest::Decide {
             server: "waiting".into(),
             decision: TrustDecision::Approved,
         })
     );
+    assert!(app.pending.is_none());
+    assert!(app.mcp_approval.is_none(), "the launch decision was kept");
 
     // A failed server offers a restart; an invalid one does not.
     app.dispatch(Command::Mcp, None);
@@ -1470,10 +1497,46 @@ fn cost_and_context_come_from_reported_figures_or_stay_unavailable() {
         app.sidebar.cost.scope.is_some(),
         "the estimate has no scope"
     );
-    // The prompt tokens of the last request are the context, not the
-    // cumulative total.
-    assert_eq!(app.sidebar.usage.context_tokens, Some(1_000_000));
-    assert_eq!(app.sidebar.usage.occupancy(), Some(5.0));
+    // The prompt tokens of the last request are shown under their own
+    // label. They are a lower bound on the context, not its size, so
+    // occupancy stays unavailable until a source reports it.
+    assert_eq!(app.sidebar.usage.last_request_input, Some(1_000_000));
+    assert_eq!(app.sidebar.usage.context_tokens, None);
+    assert_eq!(
+        app.sidebar.usage.occupancy(),
+        None,
+        "occupancy was derived from the last request's prompt tokens"
+    );
+}
+
+/// A turn that reports only one half of its usage makes the totals a
+/// floor, and a floor is not priced.
+#[test]
+fn partial_usage_withholds_the_cost_estimate_and_says_so() {
+    let mut app = plain();
+    app.set_model_facts(Some(&model("m")));
+    app.on_event(&event(EventKind::Usage {
+        usage: Usage {
+            input_tokens: Some(1_000_000),
+            output_tokens: None,
+            ..Usage::default()
+        },
+    }));
+    // The unreported half did not become a zero.
+    assert_eq!(app.sidebar.usage.input_tokens, Some(1_000_000));
+    assert_eq!(app.sidebar.usage.output_tokens, None);
+    assert!(app.sidebar.usage.incomplete);
+    assert_eq!(app.sidebar.cost.estimate_usd, None);
+    // A later complete event cannot repair the total, so the estimate
+    // stays withheld rather than pricing a floor as if it were a total.
+    app.on_event(&event(EventKind::Usage {
+        usage: Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(10),
+            ..Usage::default()
+        },
+    }));
+    assert_eq!(app.sidebar.cost.estimate_usd, None);
 }
 
 /// A successful native write becomes a changed-file observation; a failed
@@ -1539,4 +1602,21 @@ fn synthetic_events_and_a_frame_counter_are_reachable_without_a_terminal() {
     assert_eq!(app.frames(), 50, "a frame went uncounted");
     // Coalescing: fifty deltas are one transcript entry, not fifty.
     assert_eq!(app.entries.len(), 1);
+}
+
+/// The key composer is reachable from `App`'s `Debug`. Only its length may
+/// leave the form.
+#[test]
+fn debugging_the_setup_form_cannot_print_the_key() {
+    let mut form = SetupForm::for_preset(&PRESETS[0]);
+    for c in "sk-never-printed".chars() {
+        form.current_for_test().insert_char(c);
+    }
+    let text = format!("{form:?}");
+    assert!(!text.contains("sk-never-printed"), "{text}");
+    assert!(text.contains("secret_len: 16"), "{text}");
+    // And through the state that owns it.
+    let mut app = plain();
+    app.overlays.push(Overlay::Setup(form));
+    assert!(!format!("{:?}", app.overlays).contains("sk-never-printed"));
 }

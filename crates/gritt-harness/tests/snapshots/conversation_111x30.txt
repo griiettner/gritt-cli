@@ -19,6 +19,7 @@
  tool  <- file_read ok                                                          │ Usage
                                                                                 │ in   12480
        tool output contained ␛[31m and was rendered as text                     │ out  3210
+                                                                                │ last 9100 in, last request
                                                                                 │ ctx  8% of context
                                                                                 │
                                                                                 │ Cost
@@ -27,7 +28,6 @@
                                                                                 │
                                                                                 │ Changed files
                                                                                 │ + crates/gritt-harness/src/
-                                                                                │   modified
  ╭───────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │Ask Gritt to do something…                                                                                 │
  ╰───────────────────────────────────────────────────────────────────────────────────────────────────────────╯

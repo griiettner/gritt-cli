@@ -970,7 +970,19 @@ fn the_live_walkthrough_runs_at_eighty_by_twenty_four() {
         "the column was drawn at 80 columns"
     );
     send(&mut writer, b"/sidebar\r");
+    wait_for(&rx, &mut seen, "Session", Duration::from_secs(20));
+    // A 24-row drawer cannot show every section at once, so it scrolls on
+    // its own: the sections below the fold are reachable rather than cut.
+    send(&mut writer, b"jjjjjjjj");
     wait_for(&rx, &mut seen, "Changed files", Duration::from_secs(20));
+    // Unknown usage is drawn as unavailable, never as a zero, and the
+    // last request's prompt tokens have their own label.
+    let drawer = plain(&seen);
+    assert!(drawer.contains("in unavailable"), "{drawer}");
+    assert!(
+        !drawer.contains("in 0"),
+        "an unknown count was drawn as zero"
+    );
     escape(&mut writer);
 
     // Every configured MCP entry is accounted for, including one that

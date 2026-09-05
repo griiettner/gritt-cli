@@ -19,25 +19,25 @@
                      │ /sidebar    Toggle the session information sidebar                         │
                      │ /mcp        Inspect configured MCP servers and their tools                 │80
                      │ /help       Show commands, keys, and current limitations                   │0
-                     │ /quit       Leave Gritt and restore the terminal  [Ctrl-Q]                 │of context
-                     │                                                                            │
+                     │ /quit       Leave Gritt and restore the terminal  [Ctrl-Q]                 │0 in, last request
+                     │                                                                            │of context
                      │Keys                                                                        │
-                     │ Enter                     send the prompt                                  │.0412
-                     │ Ctrl-J / Shift-Enter      insert a newline                                 │s session, listed p
-                     │ Tab                       move focus, or complete a suggestion             │
-                     │ Esc                       close the top overlay, then cancel a running turn│files
-                     │ Ctrl-P                    the command palette                              │/gritt-harness/src/
-                     │ Ctrl-G                    return to the latest output                      │ed
-                     │ Ctrl-Y                    copy the draft or transcript to the Gritt buffer │.md
-                     │ Ctrl-A / Ctrl-W / Ctrl-U  select all, delete word, delete to line start    │ed (pre-existing)
-                     │ Ctrl-Q                    quit                                             │
-                     │                                                                            │ions
-                     │Limitations                                                                 │cal-memory ready
-                     │ · A session is pinned to its provider and model; /new changes them.        │s
-                     │ · An installed agent manages its own model, effort, and permissions.       │cal-memory starting
-                     │ · Cost is an estimate from listed prices, never a billed amount.           │ting and negotiatin
-                     │ · Ctrl-Y copies inside Gritt; it does not write the system clipboard.      │e… awaiting approva
-                     ╰ j/k scrolls · Esc closes ──────────────────────────────────────────────────╯g for approval to r
+                     │ Enter                     send the prompt                                  │
+                     │ Ctrl-J / Shift-Enter      insert a newline                                 │.0412
+                     │ Tab                       move focus, or complete a suggestion             │s session, listed p
+                     │ Esc                       close the top overlay, then cancel a running turn│
+                     │ Ctrl-P                    the command palette                              │files
+                     │ Ctrl-G                    return to the latest output                      │/gritt-harness/src/
+                     │ Ctrl-Y                    copy the draft or transcript to the Gritt buffer │ed
+                     │ Ctrl-A / Ctrl-W / Ctrl-U  select all, delete word, delete to line start    │.md
+                     │ Ctrl-Q                    quit                                             │ed (pre-existing)
+                     │                                                                            │
+                     │Limitations                                                                 │ions
+                     │ · A session is pinned to its provider and model; /new changes them.        │d by Gritt
+                     │ · An installed agent manages its own model, effort, and permissions.       │cal-memory ready
+                     │ · Cost is an estimate from listed prices, never a billed amount.           │s
+                     │ · Ctrl-Y copies inside Gritt; it does not write the system clipboard.      │cal-memory starting
+                     ╰ j/k scrolls · Esc closes ──────────────────────────────────────────────────╯ting and negotiatin
  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │Ask Gritt to do something…                                                                                          │
  ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

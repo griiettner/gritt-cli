@@ -158,12 +158,22 @@ pub enum Action {
     ScanChanges,
     /// Open a read-only diff for a changed file.
     OpenFileDiff(String),
+    /// Start a session on an installed agent, chosen explicitly from its
+    /// detail view rather than by highlighting its row.
+    SelectConnector(ConnectorId),
 }
 
 /// What `/mcp` asks the runtime to do. The runtime calls the same typed
 /// API `gritt mcp trust` uses; nothing here is a parsed string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpRequest {
+    /// Fetch a safe summary of what this server would run or connect to
+    /// and put it in front of the user. Approving is a launch decision, so
+    /// it goes through the same modal overlay a tool approval does rather
+    /// than being granted by a highlighted row.
+    RequestApproval {
+        server: String,
+    },
     Decide {
         server: String,
         decision: TrustDecision,
@@ -297,9 +307,9 @@ impl SetupField {
     }
 }
 
-/// The provider setup screens. In this step it is an overlay over fixture
-/// state: nothing here writes a config file or a keychain entry.
-#[derive(Debug, Clone)]
+/// The provider setup screens. The write itself is the injected
+/// `ProviderSetup`; this only collects the fields.
+#[derive(Clone)]
 pub struct SetupForm {
     pub name: Composer,
     pub base_url: Composer,
@@ -315,6 +325,26 @@ pub struct SetupForm {
     /// True while the write is in flight, so a second Enter cannot start
     /// a second one.
     pub saving: bool,
+}
+
+/// The derived `Debug` would have printed the key composer's buffer.
+/// Nothing logs this today, but the type is reachable from `App`'s
+/// `Debug`, and a secret that only one careless format string away from a
+/// transcript is not a boundary. Only the length leaves.
+impl std::fmt::Debug for SetupForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetupForm")
+            .field("name", &self.name.text())
+            .field("base_url", &self.base_url.text())
+            .field("env_var", &self.env_var.text())
+            .field("secret_len", &self.secret_len())
+            .field("field_index", &self.field_index)
+            .field("destination", &self.destination)
+            .field("protocol", &self.protocol)
+            .field("outcome", &self.outcome)
+            .field("saving", &self.saving)
+            .finish()
+    }
 }
 
 impl Default for SetupForm {
@@ -365,6 +395,12 @@ impl SetupForm {
     /// itself has no accessor, so it cannot reach a transcript or a log.
     pub fn secret_len(&self) -> usize {
         self.secret.text().chars().count()
+    }
+
+    /// The focused field, for the test that proves the key never prints.
+    #[cfg(test)]
+    pub fn current_for_test(&mut self) -> &mut Composer {
+        self.current()
     }
 
     fn current(&mut self) -> &mut Composer {
@@ -428,6 +464,10 @@ pub struct Notice {
     pub body: String,
     /// Set when the notice is the "this needs a new session" explanation.
     pub is_error: bool,
+    /// When set, this notice is a detail view with something to accept:
+    /// Enter selects that connector. A notice with `None` only closes, so
+    /// nothing can be started by acknowledging an explanation.
+    pub confirm: Option<ConnectorId>,
 }
 
 /// Everything that can sit above the main layout, most recent last.
@@ -536,6 +576,16 @@ pub struct App {
     pub connector: Option<ConnectorId>,
     /// The server `/mcp` opened an action list for.
     pub mcp_target: Option<String>,
+    /// Set while the pending approval is an MCP server launch rather than
+    /// a tool call, so answering it records a trust decision instead of
+    /// answering a tool the agent is waiting on.
+    pub mcp_approval: Option<String>,
+    /// True between asking for a session and having one.
+    ///
+    /// The driver that answers is not known yet, so a prompt submitted
+    /// now would run on the session being left. Submission and settings
+    /// both wait, and Escape cancels the transition.
+    pub session_transition: bool,
     /// File writes seen this turn, by call id, promoted to the changed
     /// list only when their result says the write succeeded.
     pending_writes: std::collections::BTreeMap<String, String>,
@@ -610,6 +660,8 @@ impl App {
             session_id: None,
             connector: None,
             mcp_target: None,
+            mcp_approval: None,
+            session_transition: false,
             pricing: None,
             pending_writes: std::collections::BTreeMap::new(),
             observed_writes: Vec::new(),
@@ -859,19 +911,30 @@ impl App {
                 self.push(EntryKind::System, format!("{decision:?}"));
             }
             EventKind::Usage { usage } => {
+                // A count the provider did not report is unknown, not
+                // zero. Adding `unwrap_or(0)` would turn an unreported
+                // total into a reported one and let a cost estimate be
+                // computed from it.
                 let total = &mut self.status.usage;
-                total.input_tokens =
-                    Some(total.input_tokens.unwrap_or(0) + usage.input_tokens.unwrap_or(0));
-                total.output_tokens =
-                    Some(total.output_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0));
+                if let Some(input) = usage.input_tokens {
+                    total.input_tokens = Some(total.input_tokens.unwrap_or(0) + input);
+                }
+                if let Some(output) = usage.output_tokens {
+                    total.output_tokens = Some(total.output_tokens.unwrap_or(0) + output);
+                }
+                if usage.input_tokens.is_none() || usage.output_tokens.is_none() {
+                    // The totals can only be a floor from here on, so the
+                    // estimate is withheld and the sidebar says why.
+                    self.sidebar.usage.incomplete = true;
+                }
                 self.sidebar.usage.input_tokens = total.input_tokens;
                 self.sidebar.usage.output_tokens = total.output_tokens;
-                // The prompt tokens of the most recent request are the
-                // tokens that were in the model's context for it. The
-                // cumulative totals above are not, and the sidebar keeps
-                // the two apart.
+                // The prompt tokens of one request are a fact about that
+                // request. They are a lower bound on the context, not its
+                // size, so they get their own label and never feed
+                // occupancy.
                 if let Some(prompt) = usage.input_tokens {
-                    self.sidebar.usage.context_tokens = Some(prompt);
+                    self.sidebar.usage.last_request_input = Some(prompt);
                 }
                 self.recompute_cost();
             }
@@ -946,7 +1009,35 @@ impl App {
 
     pub fn request_approval(&mut self, pending: PendingApproval) {
         self.diff_scroll = 0;
+        self.mcp_approval = None;
         self.pending = Some(pending);
+    }
+
+    /// Puts a first-use MCP launch in front of the user, with the
+    /// redacted definition the harness produced.
+    ///
+    /// The same modal overlay a tool approval uses: reading a workspace
+    /// file does not authorize running what it names, so the executable
+    /// and its arguments are shown before anything starts.
+    pub fn request_mcp_approval(&mut self, server: String, definition: String) {
+        self.diff_scroll = 0;
+        self.pending = Some(PendingApproval {
+            request: ApprovalRequest {
+                id: gritt_core::event::ApprovalId(format!("mcp-launch:{server}")),
+                tool: "mcp_server_launch".into(),
+                resource: format!("mcp:{server}"),
+                reason: "a workspace file names this server; running it needs approval".into(),
+                call_id: None,
+            },
+            decision: Decision {
+                outcome: gritt_core::policy::PolicyOutcome::Ask,
+                reason: "first use of this exact server definition".into(),
+                destructive: false,
+                rule: None,
+            },
+            preview: Some(definition),
+        });
+        self.mcp_approval = Some(server);
     }
 
     // -- picker construction -------------------------------------------
@@ -1407,8 +1498,11 @@ impl App {
     }
 
     /// Whether settings may change right now.
+    ///
+    /// A session transition counts: the choices would be applied against a
+    /// driver that is about to be replaced.
     pub fn settings_are_editable(&self) -> bool {
-        !self.running && self.pending.is_none()
+        !self.running && self.pending.is_none() && !self.session_transition
     }
 
     /// Takes a freshly loaded session list. When the session picker is
@@ -1512,18 +1606,34 @@ impl App {
         }
     }
 
+    /// Answers the pending approval. An MCP launch decision is recorded
+    /// as trust; anything else answers the tool call the agent is waiting
+    /// on. Both leave through this one path, so a late key cannot answer
+    /// an approval that has already been taken away.
+    fn answer_approval(&mut self, approved: bool) -> Action {
+        self.pending = None;
+        self.view = View::Transcript;
+        if let Some(server) = self.mcp_approval.take() {
+            return Action::Mcp(McpRequest::Decide {
+                server,
+                decision: if approved {
+                    TrustDecision::Approved
+                } else {
+                    TrustDecision::Denied
+                },
+            });
+        }
+        Action::Approve(if approved {
+            ApprovalDecision::Approved
+        } else {
+            ApprovalDecision::Denied
+        })
+    }
+
     fn approval_key(&mut self, key: KeyEvent) -> Action {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.pending = None;
-                self.view = View::Transcript;
-                Action::Approve(ApprovalDecision::Approved)
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.pending = None;
-                self.view = View::Transcript;
-                Action::Approve(ApprovalDecision::Denied)
-            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => self.answer_approval(true),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.answer_approval(false),
             KeyCode::Char('d') => {
                 self.view = if self.view == View::Diff {
                     View::Transcript
@@ -1637,9 +1747,15 @@ impl App {
                 };
                 Action::None
             }
-            Some(Overlay::Notice(_)) => {
+            Some(Overlay::Notice(notice)) => {
                 if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                    let confirm = notice.confirm;
                     self.overlays.pop();
+                    // Only a detail view carries a confirmation, so an
+                    // ordinary explanation still just closes.
+                    if let Some(id) = confirm {
+                        return Action::SelectConnector(id);
+                    }
                 }
                 Action::None
             }
@@ -1773,9 +1889,11 @@ impl App {
                         body: format!(
                             "{agent} runs its own harness. Gritt supervises it and relays its \
                              approvals; its model and effort are managed by the agent and are \
-                             not set here."
+                             not set here.\n\nEnter starts a session on it. Escape returns \
+                             without starting anything."
                         ),
                         is_error: false,
+                        confirm: connector_id(agent),
                     }));
                 }
                 Action::None
@@ -1814,8 +1932,8 @@ impl App {
             PickerKind::Sessions => {
                 self.overlays.pop();
                 self.view = View::Transcript;
-                if self.running {
-                    self.notice = Some("finish or cancel the running turn first".into());
+                if self.running || self.session_transition {
+                    self.notice = Some("finish or cancel the work in flight first".into());
                     return Action::None;
                 }
                 Action::Resume(SessionId(id))
@@ -1830,12 +1948,24 @@ impl App {
                     self.overlays.pop();
                     return Action::None;
                 };
+                // Every action here changes what the running agent can
+                // call. Like the other settings, they wait for a turn or
+                // an approval to finish rather than changing the tool set
+                // underneath it.
+                if !self.settings_are_editable() {
+                    self.notice = Some(if self.pending.is_some() {
+                        "answer the approval first; MCP servers cannot change during it".into()
+                    } else {
+                        "a turn is running; Esc cancels it before MCP servers change".to_owned()
+                    });
+                    return Action::None;
+                }
                 self.overlays.pop();
                 match id.as_str() {
-                    "approve" => Action::Mcp(McpRequest::Decide {
-                        server,
-                        decision: TrustDecision::Approved,
-                    }),
+                    // Approving launches a program. What is being trusted
+                    // has to be visible first, so this asks for the
+                    // definition and the modal overlay, not for the grant.
+                    "approve" => Action::Mcp(McpRequest::RequestApproval { server }),
                     "deny" => Action::Mcp(McpRequest::Decide {
                         server,
                         decision: TrustDecision::Denied,
@@ -1871,9 +2001,51 @@ impl App {
         }
     }
 
+    /// Whether a pinned session refuses this (provider, model) pair, and
+    /// says so.
+    ///
+    /// The check is on the pair, not on either half: the driver keeps
+    /// running the provider and model its transcript was produced under,
+    /// so changing *either* would leave the interface displaying settings
+    /// the driver is not using. A model of the same name under another
+    /// provider is a different model, which a model-only comparison would
+    /// have missed.
+    fn refuses_pinned_change(&mut self, profile: &str, model: Option<&str>) -> bool {
+        if !self.session_pinned || self.status.model.is_empty() {
+            return false;
+        }
+        let same_profile = profile == self.status.profile;
+        let same_model = model.is_none_or(|model| model == self.status.model);
+        if same_profile && same_model {
+            return false;
+        }
+        let wanted = match model {
+            Some(model) => format!("{model} on {profile}"),
+            None => profile.to_owned(),
+        };
+        self.overlays.push(Overlay::Notice(Notice {
+            title: "Changing this needs a new session".into(),
+            body: format!(
+                "This session is pinned to {} on {}. Gritt cannot move its stored transcript \
+                 and continuation state to {wanted}. Run /new to start a session on the new \
+                 choice; this one stays in /sessions and your composer draft is kept.",
+                self.status.model, self.status.profile
+            ),
+            is_error: false,
+            confirm: None,
+        }));
+        true
+    }
+
     /// Selecting a provider clears the model, because a model belongs to
     /// the profile it was chosen under.
     pub fn select_profile(&mut self, profile: &str) {
+        // Nothing below this line may run on a pinned session: the draft,
+        // the catalog, the sidebar's provider, and the effort would all
+        // move away from what the driver is really using.
+        if self.refuses_pinned_change(profile, None) {
+            return;
+        }
         let had_model = self.draft.model.clone();
         self.draft = self.draft.clone().with_profile(profile);
         if had_model.is_some() && self.draft.model.is_none() {
@@ -1899,18 +2071,14 @@ impl App {
     /// session that already has history, explains that the change needs a
     /// new session instead of silently discarding context.
     pub fn select_model(&mut self, model: &str) {
-        if self.session_pinned && self.status.model != model && !self.status.model.is_empty() {
-            self.overlays.push(Overlay::Notice(Notice {
-                title: "Changing the model needs a new session".into(),
-                body: format!(
-                    "This session is pinned to {} on {}. Gritt cannot move its stored \
-                     transcript and continuation state to {model}. Run /new to start a \
-                     session on the new model; this one stays in /sessions and your \
-                     composer draft is kept.",
-                    self.status.model, self.status.profile
-                ),
-                is_error: false,
-            }));
+        // The profile the model would be chosen under, which is what makes
+        // an identically named model on another provider a change.
+        let profile = self
+            .draft
+            .profile
+            .clone()
+            .unwrap_or_else(|| self.status.profile.clone());
+        if self.refuses_pinned_change(&profile, Some(model)) {
             return;
         }
         self.draft = self.draft.clone().with_model(model);
@@ -2137,6 +2305,12 @@ impl App {
                 Action::None
             }
             Parsed::Prompt(prompt) => {
+                if self.session_transition {
+                    // The driver this would run on is being replaced. The
+                    // draft stays in the composer.
+                    self.notice = Some("the session is still opening; Esc cancels it".into());
+                    return Action::None;
+                }
                 if self.running {
                     self.notice = Some("a turn is running; Esc cancels it".into());
                     return Action::None;
@@ -2238,6 +2412,8 @@ impl App {
         self.connector = None;
         self.running = false;
         self.pending = None;
+        self.mcp_approval = None;
+        self.session_transition = false;
         self.pending_writes.clear();
         self.observed_writes.clear();
         self.status.session.clear();
@@ -2296,7 +2472,13 @@ impl App {
     pub fn apply_mcp(&mut self, snapshots: Vec<McpServerSnapshot>) {
         self.mcp = snapshots;
         self.sidebar.integrations.mcp = Some(self.mcp.clone());
-        self.sidebar.integrations.mcp_owner = self.connector.map(|id| id.as_str().to_owned());
+        // These servers are Gritt's, whatever kind of session is open:
+        // they come from Gritt's runtime and Gritt's `.mcp.json`. An
+        // external agent owns its own MCP clients (ADR-010) and does not
+        // report their state, so that is named as unknown beside them
+        // rather than this list being relabelled as the agent's.
+        self.sidebar.integrations.mcp_owner = Some("Gritt".to_owned());
+        self.sidebar.integrations.connector_mcp = self.connector.map(|id| id.as_str().to_owned());
         self.refresh_open_picker();
     }
 
@@ -2330,6 +2512,7 @@ impl App {
                 title: path,
                 body: reason,
                 is_error: true,
+                confirm: None,
             })),
         }
     }
@@ -2358,21 +2541,54 @@ impl App {
     /// The outcome of a setup write, shown on the form. `close` follows a
     /// success: the flow returns to the picker underneath with its search
     /// and the composer draft intact.
-    pub fn setup_outcome(&mut self, message: String, close: bool) {
+    /// Returns the work the outcome created: after a successful write the
+    /// profile's catalog has to be loaded again, because the one cached
+    /// before the credential existed is a completed failure and reopening
+    /// `/models` would show it rather than retry.
+    pub fn setup_outcome(&mut self, message: String, close: bool) -> Action {
         let position = self
             .overlays
             .iter()
             .rposition(|overlay| matches!(overlay, Overlay::Setup(_)));
-        let Some(position) = position else { return };
-        if close {
-            self.overlays.remove(position);
-            self.notice = Some(message);
-            return;
+        let Some(position) = position else {
+            return Action::None;
+        };
+        if !close {
+            if let Overlay::Setup(form) = &mut self.overlays[position] {
+                form.saving = false;
+                form.outcome = Some(message);
+            }
+            return Action::None;
         }
-        if let Overlay::Setup(form) = &mut self.overlays[position] {
-            form.saving = false;
-            form.outcome = Some(message);
+        let profile = match &self.overlays[position] {
+            Overlay::Setup(form) => form.name.text().trim().to_owned(),
+            _ => String::new(),
+        };
+        // Only the form leaves. The picker underneath keeps its query and
+        // its highlight, and the composer draft was never touched.
+        self.overlays.remove(position);
+        self.notice = Some(message);
+        if profile.is_empty() {
+            return Action::None;
         }
+        // The credential changed, so the state cached under the old one is
+        // no longer an answer about this profile.
+        if self.catalog.profile == profile {
+            self.selection += 1;
+            self.catalog = ModelCatalogView {
+                profile: profile.clone(),
+                ..ModelCatalogView::default()
+            };
+        }
+        // A model picker underneath is for the profile that was just set
+        // up when the round trip came from `/models`; either way it is
+        // rebuilt from current state before it is looked at again.
+        if self.draft.profile.as_deref() != Some(profile.as_str()) {
+            self.draft = self.draft.clone().with_profile(&profile);
+            self.sidebar.model.backend = Some(profile.clone());
+        }
+        self.refresh_open_picker();
+        self.request_catalog()
     }
 
     /// A draft that could not open. The draft is kept, so correcting one
@@ -2385,6 +2601,7 @@ impl App {
             title,
             body,
             is_error: true,
+            confirm: None,
         }));
     }
 
@@ -2424,6 +2641,13 @@ impl App {
             return;
         };
         let usage = &self.sidebar.usage;
+        // An estimate needs complete usage for the whole session. A turn
+        // that reported one half leaves the totals a floor, and pricing a
+        // floor would understate the cost without saying so.
+        if usage.incomplete {
+            self.sidebar.cost = Default::default();
+            return;
+        }
         let (Some(input), Some(output)) = (usage.input_tokens, usage.output_tokens) else {
             self.sidebar.cost = Default::default();
             return;
@@ -2460,6 +2684,18 @@ impl App {
                 self.draft.effort = Some(effort);
             }
             None => self.sidebar.model.effort = None,
+        }
+    }
+
+    /// Rebuilds the connection dialog if it is the picker on screen, for
+    /// results that change what it can offer: credential availability and
+    /// the installed-agent probe.
+    pub fn refresh_connection_picker(&mut self) {
+        if self.top_overlay().and_then(Overlay::picker_kind) == Some(PickerKind::Connect) {
+            let rows = self.connection_picker().rows().to_vec();
+            if let Some(Overlay::Picker { picker, .. }) = self.overlays.last_mut() {
+                picker.replace_rows(rows);
+            }
         }
     }
 
@@ -2614,6 +2850,14 @@ pub fn describe_draft_error(error: &DraftError) -> (String, String) {
             format!("`{name}` was created in {}. Sessions do not move between workspaces.", workspace.display()),
         ),
     }
+}
+
+/// The connector a row label names, or `None` when it is not one Gritt
+/// knows. Row ids are built from the same list, so this cannot drift.
+fn connector_id(name: &str) -> Option<ConnectorId> {
+    ConnectorId::ORDER
+        .into_iter()
+        .find(|id| id.as_str() == name && *id != ConnectorId::Native)
 }
 
 fn protocol_word(protocol: Protocol) -> &'static str {

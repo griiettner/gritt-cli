@@ -304,8 +304,12 @@ pub fn conversation(theme: Theme) -> App {
     app.sidebar.usage = UsageSection {
         input_tokens: Some(12_480),
         output_tokens: Some(3_210),
+        // A fixture may show occupancy because it states its own source;
+        // the live path leaves it unavailable until one exists.
         context_tokens: Some(31_500),
         context_limit: Some(400_000),
+        last_request_input: Some(9_100),
+        incomplete: false,
     };
     app.sidebar.cost = CostSection {
         estimate_usd: Some(0.0412),
@@ -328,7 +332,8 @@ pub fn conversation(theme: Theme) -> App {
     };
     app.sidebar.integrations = IntegrationsSection {
         mcp: Some(mcp_servers()),
-        mcp_owner: None,
+        mcp_owner: Some("Gritt".into()),
+        connector_mcp: None,
     };
     app
 }

@@ -109,6 +109,14 @@ pub trait GitRunner: Send + Sync {
     fn run(&self, root: &Path, args: &[&str]) -> std::io::Result<std::process::Output>;
 }
 
+/// At most this many scans or diffs run at once.
+///
+/// Git and the filesystem are reached from blocking workers, and a
+/// workspace can produce a refresh after every tool call. Without a bound,
+/// a slow repository would let refreshes pile up and occupy the blocking
+/// pool; with it, the newest request waits for the previous one instead.
+const MAX_CONCURRENT_SCANS: usize = 2;
+
 /// The real one: the `git` executable, with the workspace as `-C`.
 pub struct SystemGit;
 
@@ -143,6 +151,8 @@ pub struct WorkspaceChanges {
     /// `false` when the workspace is not a Git repository or `git` cannot
     /// be run, which is what makes the list partial.
     is_repository: RwLock<bool>,
+    /// Bounds how much blocking work this service can have in flight.
+    scans: tokio::sync::Semaphore,
 }
 
 impl WorkspaceChanges {
@@ -157,6 +167,7 @@ impl WorkspaceChanges {
             baseline: RwLock::new(None),
             observed: RwLock::new(BTreeMap::new()),
             is_repository: RwLock::new(false),
+            scans: tokio::sync::Semaphore::new(MAX_CONCURRENT_SCANS),
         }
     }
 
@@ -174,7 +185,7 @@ impl WorkspaceChanges {
         if self.baseline.read().await.is_some() {
             return;
         }
-        match self.status() {
+        match self.status().await {
             Some(entries) => {
                 *self.is_repository.write().await = true;
                 *self.baseline.write().await =
@@ -205,7 +216,7 @@ impl WorkspaceChanges {
     /// where it is not.
     pub async fn scan(&self) -> ChangedFiles {
         let baseline = self.baseline.read().await.clone();
-        if let Some(entries) = self.status() {
+        if let Some(entries) = self.status().await {
             *self.is_repository.write().await = true;
             let baseline = baseline.unwrap_or_default();
             let files = entries
@@ -245,10 +256,22 @@ impl WorkspaceChanges {
         let path = self.relative(path);
         if *self.is_repository.read().await {
             for args in [
-                vec!["diff", "--no-color", "--", path.as_str()],
-                vec!["diff", "--no-color", "--cached", "--", path.as_str()],
+                vec![
+                    "diff".to_owned(),
+                    "--no-color".to_owned(),
+                    "--".to_owned(),
+                    path.clone(),
+                ],
+                vec![
+                    "diff".to_owned(),
+                    "--no-color".to_owned(),
+                    "--cached".to_owned(),
+                    "--".to_owned(),
+                    path.clone(),
+                ],
             ] {
-                if let Some(text) = self.git_text(&args) {
+                if let Some(bytes) = self.git_bytes(args).await {
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
                     if !text.trim().is_empty() {
                         return FileDiff::Text {
                             path: path.clone(),
@@ -258,8 +281,14 @@ impl WorkspaceChanges {
                 }
             }
         }
-        match std::fs::read_to_string(self.root.join(&path)) {
-            Ok(content) => {
+        // A file Git does not track is read for its content, which is a
+        // blocking read and belongs on a blocking worker like the rest.
+        let target = self.root.join(&path);
+        let read = self
+            .blocking(move || std::fs::read_to_string(&target))
+            .await;
+        match read {
+            Some(Ok(content)) => {
                 let body: String = content
                     .lines()
                     .map(|line| format!("+{line}\n"))
@@ -269,27 +298,67 @@ impl WorkspaceChanges {
                     body: truncate_diff(&body),
                 }
             }
-            Err(error) => FileDiff::Unavailable {
+            Some(Err(error)) => FileDiff::Unavailable {
                 path,
                 reason: format!("cannot read this file: {error}"),
+            },
+            None => FileDiff::Unavailable {
+                path,
+                reason: "reading this file did not finish".into(),
             },
         }
     }
 
-    /// `git status --porcelain`, or `None` when this is not a repository
-    /// or `git` cannot be run. A non-zero exit is not an error to report:
-    /// it means the same thing as a missing executable here.
-    fn status(&self) -> Option<Vec<StatusEntry>> {
-        let text = self.git_text(&["status", "--porcelain", "--untracked-files=all"])?;
-        Some(parse_status(&text))
+    /// `git status --porcelain=v1 -z`, or `None` when this is not a
+    /// repository or `git` cannot be run. A non-zero exit is not an error
+    /// to report: it means the same thing as a missing executable here.
+    ///
+    /// `-z` is not an optimisation. Without it Git quotes any path that is
+    /// not plain ASCII under the default `core.quotePath`, and a filename
+    /// containing ` -> ` is indistinguishable from a rename record. The
+    /// NUL-separated form has neither problem: paths are literal bytes and
+    /// a rename is two records.
+    async fn status(&self) -> Option<Vec<StatusEntry>> {
+        let bytes = self
+            .git_bytes(vec![
+                "status".to_owned(),
+                "--porcelain=v1".to_owned(),
+                "-z".to_owned(),
+                "--untracked-files=all".to_owned(),
+            ])
+            .await?;
+        Some(parse_status_z(&bytes))
     }
 
-    fn git_text(&self, args: &[&str]) -> Option<String> {
-        let output = self.git.run(&self.root, args).ok()?;
+    /// Runs Git on a blocking worker. `std::process::Command::output`
+    /// blocks until the child exits, so a slow repository would otherwise
+    /// occupy a Tokio worker thread.
+    async fn git_bytes(&self, args: Vec<String>) -> Option<Vec<u8>> {
+        let git = Arc::clone(&self.git);
+        let root = self.root.clone();
+        let output = self
+            .blocking(move || {
+                let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+                git.run(&root, &borrowed)
+            })
+            .await?;
+        let output = output.ok()?;
         if !output.status.success() {
             return None;
         }
-        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+        Some(output.stdout)
+    }
+
+    /// Runs one blocking closure under the concurrency bound. `None` means
+    /// the worker did not finish, which a caller reports rather than
+    /// treating as an answer.
+    async fn blocking<T, F>(&self, work: F) -> Option<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let _permit = self.scans.acquire().await.ok()?;
+        tokio::task::spawn_blocking(work).await.ok()
     }
 
     /// Paths are reported relative to the workspace root, whichever form
@@ -318,28 +387,42 @@ struct StatusEntry {
     status: ChangeStatus,
 }
 
-/// Parses `git status --porcelain` v1 lines. A rename reports its new
-/// path, which is the one that exists on disk.
-fn parse_status(text: &str) -> Vec<StatusEntry> {
+fn status_for(code: &str) -> ChangeStatus {
+    match code {
+        "??" => ChangeStatus::Untracked,
+        c if c.contains('R') => ChangeStatus::Renamed,
+        c if c.contains('C') => ChangeStatus::Renamed,
+        c if c.contains('D') => ChangeStatus::Deleted,
+        c if c.contains('A') => ChangeStatus::Added,
+        _ => ChangeStatus::Modified,
+    }
+}
+
+/// Parses `git status --porcelain=v1 -z`.
+///
+/// Each record is `XY <path>` terminated by NUL. A rename or copy is two
+/// records: the status record carrying the **new** path, then a bare
+/// record carrying the path it came from. Nothing is quoted or escaped in
+/// this form, so a path is taken literally and a filename containing
+/// ` -> ` is no longer mistaken for a rename.
+fn parse_status_z(bytes: &[u8]) -> Vec<StatusEntry> {
     let mut out = Vec::new();
-    for line in text.lines() {
-        if line.len() < 4 {
+    let mut records = bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(|record| String::from_utf8_lossy(record).into_owned());
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
             continue;
         }
-        let code = &line[..2];
-        let rest = line[3..].trim();
-        let path = match rest.split_once(" -> ") {
-            Some((_, new)) => new,
-            None => rest,
-        };
-        let path = path.trim_matches('"').to_owned();
-        let status = match code {
-            "??" => ChangeStatus::Untracked,
-            c if c.contains('R') => ChangeStatus::Renamed,
-            c if c.contains('D') => ChangeStatus::Deleted,
-            c if c.contains('A') => ChangeStatus::Added,
-            _ => ChangeStatus::Modified,
-        };
+        let code = &record[..2];
+        let path = record[3..].to_owned();
+        let status = status_for(code);
+        if status == ChangeStatus::Renamed {
+            // The origin path follows as its own record and is consumed
+            // here so it is never reported as a change of its own.
+            let _origin = records.next();
+        }
         out.push(StatusEntry { path, status });
     }
     out
@@ -403,11 +486,16 @@ mod tests {
         }
     }
 
+    /// `-z` records: `XY <path>` terminated by NUL, no trailing newline.
+    fn z(records: &[&str]) -> String {
+        records.iter().map(|record| format!("{record}\0")).collect()
+    }
+
     #[tokio::test]
     async fn changes_present_at_open_are_labelled_pre_existing() {
         let git = Arc::new(FakeGit::new(&[
-            " M src/lib.rs\n",
-            " M src/lib.rs\n?? notes.md\nA  added.rs\n",
+            &z(&[" M src/lib.rs"]),
+            &z(&[" M src/lib.rs", "?? notes.md", "A  added.rs"]),
         ]));
         let changes = WorkspaceChanges::with_git("/tmp/ws", git);
         changes.capture_baseline().await;
@@ -442,17 +530,47 @@ mod tests {
         assert_eq!(files[0].path, "notes.txt");
     }
 
+    /// A rename is two `-z` records, new path first, and the origin record
+    /// is consumed rather than reported as a change of its own.
     #[test]
     fn a_rename_reports_the_path_that_exists_on_disk() {
-        let entries = parse_status("R  old/name.rs -> new/name.rs\nD  gone.rs\n");
+        let entries =
+            parse_status_z(z(&["R  new/name.rs", "old/name.rs", "D  gone.rs"]).as_bytes());
+        assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].path, "new/name.rs");
         assert_eq!(entries[0].status, ChangeStatus::Renamed);
+        assert_eq!(entries[1].path, "gone.rs");
         assert_eq!(entries[1].status, ChangeStatus::Deleted);
+    }
+
+    /// The two cases the line-based parser got wrong: a path Git would
+    /// have quoted under `core.quotePath`, and an ordinary filename that
+    /// contains the rename separator.
+    #[test]
+    fn unicode_paths_and_paths_containing_the_rename_arrow_survive() {
+        let entries = parse_status_z(
+            z(&[
+                " M src/世界.rs",
+                "?? notes -> draft.md",
+                "?? \"already quoted\".md",
+            ])
+            .as_bytes(),
+        );
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].path, "src/世界.rs");
+        assert_eq!(
+            entries[1].path, "notes -> draft.md",
+            "an ordinary filename was mistaken for a rename record"
+        );
+        assert_eq!(
+            entries[2].path, "\"already quoted\".md",
+            "quotes that are part of the name were stripped"
+        );
     }
 
     #[tokio::test]
     async fn the_baseline_is_captured_once_so_gritts_own_writes_stay_visible() {
-        let git = Arc::new(FakeGit::new(&["", " M src/lib.rs\n"]));
+        let git = Arc::new(FakeGit::new(&["", &z(&[" M src/lib.rs"])]));
         let changes = WorkspaceChanges::with_git("/tmp/ws", git);
         changes.capture_baseline().await;
         // A second call must not adopt the session's own change as the

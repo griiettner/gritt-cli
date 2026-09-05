@@ -154,7 +154,8 @@ fn build(name: &str, theme: Theme) -> App {
             };
             app.sidebar.integrations = IntegrationsSection {
                 mcp: Some(Vec::new()),
-                mcp_owner: None,
+                mcp_owner: Some("Gritt".into()),
+                connector_mcp: None,
             };
             app.sidebar.usage = Default::default();
             app.sidebar.cost = Default::default();

@@ -19,6 +19,7 @@
                                                                                 │ Usage
                                                                                 │ in   unavailable
                                                                                 │ out  unavailable
+                                                                                │ last unavailable
                                                                                 │ ctx  unavailable
                                                                                 │
                                                                                 │ Cost
@@ -26,7 +27,6 @@
                                                                                 │
                                                                                 │ Changed files
                                                                                 │ not collected yet
-                                                                                │
                                                                                 │
  ╭───────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │Ask Gritt to do something…                                                                                 │

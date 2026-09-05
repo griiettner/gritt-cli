@@ -19,25 +19,25 @@
                       │    Switch to the planning phase                                          │
                       │  /code                                                                   │480
                       │    Switch to the coding phase                                            │10
-                      │  /sessions                                                      [Ctrl-S] │ of context
-                      │    Search and resume sessions for this workspace                         │
+                      │  /sessions                                                      [Ctrl-S] │00 in, last request
+                      │    Search and resume sessions for this workspace                         │ of context
                       │  /new                                                                    │
-                      │    Start a fresh draft without deleting the current session              │0.0412
-                      │  /details                                                                │is session, listed p
-                      │    Expand or collapse tool output                                        │
-                      │  /sidebar                                                                │ files
-                      │    Toggle the session information sidebar                                │s/gritt-harness/src/
-                      │  /mcp                                                                    │ied
-                      │    Inspect configured MCP servers and their tools                        │E.md
+                      │    Start a fresh draft without deleting the current session              │
+                      │  /details                                                                │0.0412
+                      │    Expand or collapse tool output                                        │is session, listed p
+                      │  /sidebar                                                                │
+                      │    Toggle the session information sidebar                                │ files
+                      │  /mcp                                                                    │s/gritt-harness/src/
+                      │    Inspect configured MCP servers and their tools                        │ied
+                      │                                                                          │E.md
                       │                                                                          │ied (pre-existing)
                       │                                                                          │
                       │                                                                          │tions
+                      │                                                                          │ed by Gritt
                       │                                                                          │ocal-memory ready
                       │                                                                          │ls
                       │                                                                          │ocal-memory starting
-                      │                                                                          │cting and negotiatin
-                      │                                                                          │ve… awaiting approva
-                      ╰ type to filter · Enter selects · Esc closes ─────────────────────────────╯ng for approval to r
+                      ╰ type to filter · Enter selects · Esc closes ─────────────────────────────╯cting and negotiatin
  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │Ask Gritt to do something…                                                                                          │
  ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

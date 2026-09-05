@@ -19,6 +19,7 @@
                                                                                          │ Usage
                                                                                          │ in   unavailable
                                                                                          │ out  unavailable
+                                                                                         │ last unavailable
                                                                                          │ ctx  unavailable
                                                                                          │
                                                                                          │ Cost
@@ -28,9 +29,8 @@
                                                                                          │ none
                                                                                          │
                                                                                          │ Integrations
+                                                                                         │ MCP owned by Gritt
                                                                                          │ no MCP servers configured
-                                                                                         │
-                                                                                         │
                                                                                          │
                                                                                          │
                                                                                          │

@@ -19,7 +19,8 @@
                       │    openai/o4-mini-思考                                                   │
                       │  GPT-4o (May 2024)                                              [openai] │480
                       │    openai/gpt-4o-2024-05-13                                              │10
-                      │    deprecated; replaced by openai/gpt-4o                                 │ of context
+                      │    deprecated; replaced by openai/gpt-4o                                 │00 in, last request
+                      │                                                                          │ of context
                       │                                                                          │
                       │                                                                          │
                       │                                                                          │0.0412
@@ -32,12 +33,11 @@
                       │                                                                          │ied (pre-existing)
                       │                                                                          │
                       │                                                                          │tions
+                      │                                                                          │ed by Gritt
                       │                                                                          │ocal-memory ready
                       │                                                                          │ls
                       │                                                                          │ocal-memory starting
-                      │                                                                          │cting and negotiatin
-                      │                                                                          │ve… awaiting approva
-                      ╰ type to filter · Enter selects · Esc closes ─────────────────────────────╯ng for approval to r
+                      ╰ type to filter · Enter selects · Esc closes ─────────────────────────────╯cting and negotiatin
  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │Ask Gritt to do something…                                                                                          │
  ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

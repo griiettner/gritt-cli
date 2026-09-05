@@ -76,10 +76,23 @@ pub struct ModelSection {
 pub struct UsageSection {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
-    /// Tokens currently in the model's context, when the driver reports
-    /// it. Not the cumulative total above.
+    /// Tokens currently in the model's context, when a source reports it.
+    ///
+    /// Nothing populates this today. The prompt tokens of the last request
+    /// are a *lower bound* on it, not the value: the driver may add tool
+    /// results and continuation state after it, and a provider that caches
+    /// prompt tokens reports them differently again. Until a source
+    /// establishes the current size, occupancy stays unavailable rather
+    /// than being derived from something adjacent.
     pub context_tokens: Option<u64>,
     pub context_limit: Option<u64>,
+    /// The prompt tokens the most recent request reported, under its own
+    /// label. A fact about one request, never occupancy.
+    pub last_request_input: Option<u64>,
+    /// Set when a usage event arrived without one of its counts, which
+    /// makes the totals a floor rather than a total and withholds the cost
+    /// estimate.
+    pub incomplete: bool,
 }
 
 impl UsageSection {
@@ -111,10 +124,13 @@ pub use crate::changes::{ChangeSource, ChangeStatus, ChangedFile, ChangedFiles};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IntegrationsSection {
     pub mcp: Option<Vec<McpServerSnapshot>>,
-    /// Set only when a connector session owns its own MCP clients, so the
-    /// sidebar labels the state by owner instead of implying Gritt's
-    /// `.mcp.json` controls it.
+    /// Who owns the servers in `mcp`. Always Gritt for this list: it comes
+    /// from Gritt's runtime and Gritt's `.mcp.json`.
     pub mcp_owner: Option<String>,
+    /// The connector whose *own* MCP clients Gritt cannot see. Set while a
+    /// connector session is active, so the unknown is stated instead of
+    /// Gritt's list standing in for it (ADR-010).
+    pub connector_mcp: Option<String>,
 }
 
 /// Everything the sidebar shows for one session.
@@ -257,6 +273,21 @@ impl SidebarModel {
             tokens(self.usage.output_tokens),
             width,
         ));
+        lines.push(field(
+            theme,
+            "last",
+            match self.usage.last_request_input {
+                Some(count) => format!("{count} in, last request"),
+                None => "unavailable".to_owned(),
+            },
+            width,
+        ));
+        if self.usage.incomplete {
+            lines.push(Line::from(Span::styled(
+                truncate("partial usage reported; totals are a floor", width),
+                theme.dim(),
+            )));
+        }
         match self.usage.occupancy() {
             Some(fraction) => lines.push(field(
                 theme,
@@ -327,6 +358,12 @@ impl SidebarModel {
                 lines.push(Line::from(Span::styled(
                     truncate(&format!("MCP owned by {owner}"), width),
                     theme.muted(),
+                )));
+            }
+            if let Some(connector) = &self.integrations.connector_mcp {
+                lines.push(Line::from(Span::styled(
+                    truncate(&format!("{connector}'s own MCP: not reported"), width),
+                    theme.dim(),
                 )));
             }
             if servers.is_empty() {
@@ -508,6 +545,7 @@ mod tests {
                     },
                 ]),
                 mcp_owner: None,
+                connector_mcp: None,
             },
             ..SidebarModel::default()
         };
@@ -524,6 +562,7 @@ mod tests {
             integrations: IntegrationsSection {
                 mcp: Some(Vec::new()),
                 mcp_owner: None,
+                connector_mcp: None,
             },
             ..SidebarModel::default()
         };

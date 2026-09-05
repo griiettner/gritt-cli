@@ -13,9 +13,10 @@
                                                                                          │ Usage
  tool  -> file_read store/mod.rs                                                         │ in   12480
                                                                                          │ out  3210
- tool  <- file_read ok                                                                   │ ctx  8% of context
-                                                                                         │
-       tool output contained ␛[31m and was rendered as text                              │ Cost
+ tool  <- file_read ok                                                                   │ last 9100 in, last request
+                                                                                         │ ctx  8% of context
+       tool output contained ␛[31m and was rendered as text                              │
+                                                                                         │ Cost
                                                                                          │ est  ~$0.0412
                                                                                          │ for  this session, listed p
                                                                                          │
@@ -37,7 +38,6 @@
                                                                                          │ + crates/gritt-harness/src/
                                                                                          │   modified
                                                                                          │ · crates/gritt-harness/src/
-                                                                                         │   modified (pre-existing)
  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │Ask Gritt to do something…                                                                                          │
  ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

@@ -19,25 +19,25 @@
                       │  openrouter                                           [chat completions] │
                       │    https://openrouter.ai/api/v1                                          │480
                       │    no key; set OPENROUTER_API_KEY or run setup · catalog not loaded      │10
-                      │                                                                          │ of context
-                      │Installed agents                                                          │
+                      │                                                                          │00 in, last request
+                      │Installed agents                                                          │ of context
                       │  codex                                                       [installed] │
-                      │    0.48.0                                                                │0.0412
-                      │    signed in · Managed by agent                                          │is session, listed p
-                      │  claude-code                                                 [installed] │
-                      │    2.1.4                                                                 │ files
-                      │    not signed in · Managed by agent                                      │s/gritt-harness/src/
-                      │  cursor-agent                                            [not installed] │ied
-                      │    version unknown  — install this agent to select it                    │E.md
-                      │    auth state not reported · Managed by agent                            │ied (pre-existing)
-                      │                                                                          │
-                      │Add a provider                                                            │tions
-                      │  Set up local…                                        [chat completions] │ocal-memory ready
-                      │    http://127.0.0.1:8080/v1                                              │ls
-                      │    not configured yet                                                    │ocal-memory starting
-                      │  Custom endpoint…                                               [custom] │cting and negotiatin
-                      │    any OpenAI-compatible, Responses, or Messages endpoint                │ve… awaiting approva
-                      ╰ type to filter · Enter selects · Esc closes ─────────────────────────────╯ng for approval to r
+                      │    0.48.0                                                                │
+                      │    signed in · Managed by agent                                          │0.0412
+                      │  claude-code                                                 [installed] │is session, listed p
+                      │    2.1.4                                                                 │
+                      │    not signed in · Managed by agent                                      │ files
+                      │  cursor-agent                                            [not installed] │s/gritt-harness/src/
+                      │    version unknown  — install this agent to select it                    │ied
+                      │    auth state not reported · Managed by agent                            │E.md
+                      │                                                                          │ied (pre-existing)
+                      │Add a provider                                                            │
+                      │  Set up local…                                        [chat completions] │tions
+                      │    http://127.0.0.1:8080/v1                                              │ed by Gritt
+                      │    not configured yet                                                    │ocal-memory ready
+                      │  Custom endpoint…                                               [custom] │ls
+                      │    any OpenAI-compatible, Responses, or Messages endpoint                │ocal-memory starting
+                      ╰ type to filter · Enter selects · Esc closes ─────────────────────────────╯cting and negotiatin
  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │Ask Gritt to do something…                                                                                          │
  ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

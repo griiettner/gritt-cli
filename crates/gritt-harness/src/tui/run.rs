@@ -28,14 +28,20 @@ use crate::control::{ControlPlane, DraftOpen, ProfileCatalog};
 use crate::draft::SessionDraft;
 use crate::driver::Driver;
 use crate::policy::Decision;
+use crate::CancellationToken;
 
 enum UiMsg {
-    Event(Event),
+    Event {
+        generation: u64,
+        event: Event,
+    },
     Approval {
+        generation: u64,
         pending: PendingApproval,
         responder: oneshot::Sender<ApprovalDecision>,
     },
     Finished {
+        generation: u64,
         agent: Box<dyn Driver>,
         result: Result<TurnOutcome>,
     },
@@ -55,11 +61,12 @@ enum UiMsg {
     /// generation the request started under; a driver for a session the
     /// user has already left is closed instead of adopted.
     Opened {
+        /// The transition this answers. Only the transition the loop is
+        /// still waiting for may be applied; anything else was superseded
+        /// or cancelled and its driver is closed instead of adopted.
+        operation: u64,
         generation: u64,
         result: Result<DraftOpen>,
-        /// The prompt that triggered the lazy open, run once the session
-        /// exists. `None` for `/resume` and `/sessions`.
-        prompt: Option<String>,
     },
     Changes {
         generation: u64,
@@ -69,22 +76,41 @@ enum UiMsg {
     /// Live MCP state, from the runtime's subscription rather than a poll.
     Mcp(Vec<McpServerSnapshot>),
     McpOutcome(Result<()>),
+    /// A redacted definition for a first-use launch approval.
+    McpApproval {
+        server: String,
+        definition: String,
+    },
+    /// Credential availability, computed off the event path because
+    /// resolving one reaches the keychain.
+    Profiles(Vec<crate::setup::ProfileSummary>),
+    /// A plane rebuilt around re-read configuration, with the summaries
+    /// that were computed against it, both off the event path.
+    Reloaded {
+        plane: Box<ControlPlane>,
+        profiles: Vec<crate::setup::ProfileSummary>,
+    },
     Setup {
         message: String,
         /// True when the write succeeded and the form should close.
         close: bool,
-        /// True when the configuration should be re-read afterwards.
-        reload: bool,
     },
 }
 
 struct ChannelUi {
     tx: mpsc::UnboundedSender<UiMsg>,
+    /// The session generation this turn started under. Every message it
+    /// sends carries it, so output from a session the user has left is
+    /// refused rather than populating the one now on screen.
+    generation: u64,
 }
 
 impl Ui for ChannelUi {
     fn event(&mut self, event: &Event) {
-        let _ = self.tx.send(UiMsg::Event(event.clone()));
+        let _ = self.tx.send(UiMsg::Event {
+            generation: self.generation,
+            event: event.clone(),
+        });
     }
 
     fn approve<'a>(
@@ -99,7 +125,11 @@ impl Ui for ChannelUi {
             decision: decision.clone(),
             preview: preview.map(str::to_owned),
         };
-        let _ = self.tx.send(UiMsg::Approval { pending, responder });
+        let _ = self.tx.send(UiMsg::Approval {
+            generation: self.generation,
+            pending,
+            responder,
+        });
         Box::pin(async move { receiver.await.unwrap_or(ApprovalDecision::Denied) })
     }
 }
@@ -225,6 +255,20 @@ async fn fixture_loop(
 /// The plane sits behind an `Arc` so a task can hold it while the loop
 /// keeps drawing, and so a configuration reload replaces the handle
 /// instead of mutating a value a task is already using.
+/// A session change that has been asked for and not yet answered.
+///
+/// The transition is *reserved*: the old driver is held here rather than
+/// left idle, so a prompt submitted while it is in flight cannot start a
+/// turn on the session being left. A failure puts the old driver back.
+struct PendingOpen {
+    operation: u64,
+    /// The prompt that triggered a lazy open, run once the session exists
+    /// and returned to the composer if it never does.
+    prompt: Option<String>,
+    /// The driver being replaced, restored if the open fails.
+    previous: Option<Box<dyn Driver>>,
+}
+
 struct Runtime {
     plane: Arc<ControlPlane>,
     changes: Arc<WorkspaceChanges>,
@@ -233,11 +277,40 @@ struct Runtime {
     /// it, and Escape aborts it, so the loading line always describes work
     /// that is really running.
     work: Option<JoinHandle<()>>,
+    /// Monotonic id for cancellable operations whose result must be
+    /// matched to the request that is still wanted.
+    operations: u64,
+    /// The session change in flight, if any.
+    pending_open: Option<PendingOpen>,
+    /// The token of the MCP operation in flight.
+    ///
+    /// MCP work is never aborted. Its future owns child processes and
+    /// launch slots, and dropping it would skip the shutdown that releases
+    /// them; the token asks it to stop and its own cleanup runs.
+    mcp_cancel: Option<CancellationToken>,
 }
 
 impl Runtime {
+    /// Reserves the next operation id.
+    fn next_operation(&mut self) -> u64 {
+        self.operations += 1;
+        self.operations
+    }
+
+    /// Abandons the session change in flight, if any, and returns it. A
+    /// result already queued for it can no longer match.
+    fn take_pending_open(&mut self) -> Option<PendingOpen> {
+        self.pending_open.take()
+    }
+
     /// Replaces the background request, aborting whatever it superseded.
     fn spawn(&mut self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        // Superseding uses the same rule as cancelling: an MCP operation
+        // is signalled and left to clean up, everything else is dropped.
+        if let Some(token) = self.mcp_cancel.take() {
+            token.cancel();
+            self.work = None;
+        }
         if let Some(previous) = self.work.take() {
             previous.abort();
         }
@@ -251,7 +324,18 @@ impl Runtime {
         tokio::spawn(future);
     }
 
+    /// Stops the background request.
+    ///
+    /// MCP work is signalled rather than aborted: its future owns a child
+    /// process and a launch slot, and aborting it would drop both before
+    /// the shutdown that releases them, leaving the process alive until
+    /// the application exits.
     fn cancel_work(&mut self) {
+        if let Some(token) = self.mcp_cancel.take() {
+            token.cancel();
+            self.work = None;
+            return;
+        }
         if let Some(work) = self.work.take() {
             work.abort();
         }
@@ -358,12 +442,12 @@ async fn event_loop(
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
     let mut runtime = Runtime {
         plane: Arc::new(plane),
-        changes: Arc::new(WorkspaceChanges::new({
-            let plane = &app.status.workspace;
-            plane.clone()
-        })),
+        changes: Arc::new(WorkspaceChanges::new(app.status.workspace.clone())),
         tx: ui_tx.clone(),
         work: None,
+        operations: 0,
+        pending_open: None,
+        mcp_cancel: None,
     };
     let mut idle_agent: Option<Box<dyn Driver>> = None;
     if let Some(agent) = agent {
@@ -375,6 +459,7 @@ async fn event_loop(
     // attributed to this session.
     scan_changes(&runtime, app.sidebar.generation);
     probe_agents(&runtime);
+    load_profiles(&runtime);
     subscribe_mcp(&runtime);
     let mut handle: Option<CancelHandle> = None;
     let mut responder: Option<oneshot::Sender<ApprovalDecision>> = None;
@@ -475,6 +560,21 @@ fn scan_changes(runtime: &Runtime, generation: u64) {
     });
 }
 
+/// Resolves credential availability for every configured profile.
+///
+/// `keys.key()` reaches the keychain, which can block for as long as the
+/// operating system wants, so this is blocking work and never runs on the
+/// loop.
+fn load_profiles(runtime: &Runtime) {
+    let plane = Arc::clone(&runtime.plane);
+    let tx = runtime.tx.clone();
+    runtime.spawn_detached(async move {
+        if let Ok(profiles) = tokio::task::spawn_blocking(move || plane.profile_summaries()).await {
+            let _ = tx.send(UiMsg::Profiles(profiles));
+        }
+    });
+}
+
 fn probe_agents(runtime: &Runtime) {
     let plane = Arc::clone(&runtime.plane);
     let tx = runtime.tx.clone();
@@ -526,15 +626,40 @@ async fn on_message(
     msg: UiMsg,
 ) -> Result<Action> {
     match msg {
-        UiMsg::Event(event) => app.on_event(&event),
+        UiMsg::Event { generation, event } => {
+            // Output from a session the user has left may not populate the
+            // one on screen.
+            if app.sidebar.accepts(generation) {
+                app.on_event(&event);
+            }
+        }
         UiMsg::Approval {
+            generation,
             pending,
             responder: sender,
         } => {
+            if !app.sidebar.accepts(generation) {
+                // The turn belongs to a session that is gone. Denying is
+                // the only safe answer, and it is answered here rather
+                // than shown, so no key can approve it later.
+                let _ = sender.send(ApprovalDecision::Denied);
+                return Ok(Action::None);
+            }
             *responder = Some(sender);
             app.request_approval(pending);
         }
-        UiMsg::Finished { agent, result } => {
+        UiMsg::Finished {
+            generation,
+            agent,
+            result,
+        } => {
+            if !app.sidebar.accepts(generation) {
+                // A turn that finished on a session the user has left.
+                // Its driver is dropped rather than restored as the idle
+                // one, which would have put the old session back.
+                drop(agent);
+                return Ok(Action::None);
+            }
             app.running = false;
             *handle = None;
             if let Err(error) = result {
@@ -581,38 +706,42 @@ async fn on_message(
             app.agents = agents;
             // The connection dialog may already be open; its rows fill in
             // where the user is looking rather than after they close it.
-            if app.top_overlay().and_then(super::app::Overlay::picker_kind)
-                == Some(super::app::PickerKind::Connect)
-            {
-                let rows = app.connection_picker().rows().to_vec();
-                if let Some(super::app::Overlay::Picker { picker, .. }) = app.overlays.last_mut() {
-                    picker.replace_rows(rows);
-                }
-            }
+            app.refresh_connection_picker();
         }
         UiMsg::Opened {
+            operation,
             generation,
             result,
-            prompt,
         } => {
-            app.loading = None;
-            if !app.sidebar.accepts(generation) {
-                // The user left this session while it was opening. The
-                // driver is dropped rather than adopted over the current
-                // one, and the prompt is not sent anywhere.
+            // Only the transition the loop is still waiting for may be
+            // applied. A cancelled or superseded one has already given the
+            // prompt back and put the previous driver where it belongs, so
+            // this driver is closed instead of adopted.
+            let matches = runtime
+                .pending_open
+                .as_ref()
+                .is_some_and(|pending| pending.operation == operation);
+            if !matches || !app.sidebar.accepts(generation) {
+                if let Ok(DraftOpen::Opened { driver, .. }) = result {
+                    drop(driver);
+                }
                 return Ok(Action::None);
             }
+            let pending = runtime.take_pending_open().expect("checked above");
+            app.loading = None;
+            app.session_transition = false;
             match result {
                 Ok(DraftOpen::Opened {
-                    driver,
-                    catalog: _,
-                    warnings,
+                    driver, warnings, ..
                 }) => {
+                    // The driver being replaced goes away only now that
+                    // its replacement exists.
+                    drop(pending.previous);
                     adopt(app, &runtime.plane, driver.as_ref()).await?;
                     app.show_draft_warnings(&warnings);
                     *idle_agent = Some(driver);
                     scan_changes(runtime, app.sidebar.generation);
-                    if let Some(prompt) = prompt {
+                    if let Some(prompt) = pending.prompt {
                         // The transcript entry was pushed on submit and the
                         // history reload cleared it; put it back with the
                         // turn that is about to run.
@@ -623,13 +752,16 @@ async fn on_message(
                 }
                 Ok(DraftOpen::Rejected { errors, .. }) => {
                     // The draft is kept: one field is wrong, not the run.
-                    if let Some(prompt) = prompt {
+                    // The session that was open stays open.
+                    *idle_agent = pending.previous;
+                    if let Some(prompt) = pending.prompt {
                         app.undo_submission(&prompt);
                     }
                     app.show_draft_errors(&errors);
                 }
                 Err(error) => {
-                    if let Some(prompt) = prompt {
+                    *idle_agent = pending.previous;
+                    if let Some(prompt) = pending.prompt {
                         app.undo_submission(&prompt);
                     }
                     app.running = false;
@@ -650,26 +782,33 @@ async fn on_message(
         UiMsg::Mcp(snapshots) => app.apply_mcp(snapshots),
         UiMsg::McpOutcome(result) => {
             app.loading = None;
+            runtime.mcp_cancel = None;
             if let Err(error) = result {
                 app.notice = Some(error.message);
             }
         }
-        UiMsg::Setup {
-            message,
-            close,
-            reload,
-        } => {
+        UiMsg::McpApproval { server, definition } => {
             app.loading = None;
-            if reload {
-                // A saved profile is only usable once the running
-                // configuration has it. Rebuilding the plane shares every
-                // handle, so nothing already open is disturbed.
-                if let Some(reloaded) = runtime.plane.reloaded() {
-                    runtime.plane = Arc::new(reloaded);
-                }
-                app.profiles = runtime.plane.profile_summaries();
+            // Only ask if nothing else owns the modal layer now.
+            if app.pending.is_none() {
+                app.request_mcp_approval(server, definition);
             }
-            app.setup_outcome(message, close);
+        }
+        UiMsg::Profiles(profiles) => {
+            app.profiles = profiles;
+            app.refresh_connection_picker();
+        }
+        UiMsg::Reloaded { plane, profiles } => {
+            // A saved profile is only usable once the running configuration
+            // has it. The rebuilt plane shares every handle, so nothing
+            // already open is disturbed.
+            runtime.plane = Arc::new(*plane);
+            app.profiles = profiles;
+            app.refresh_connection_picker();
+        }
+        UiMsg::Setup { message, close } => {
+            app.loading = None;
+            return Ok(app.setup_outcome(message, close));
         }
     }
     Ok(Action::None)
@@ -694,9 +833,25 @@ async fn on_action(
             // A pending approval is denied by the loop on cancel; drop the
             // view and its responder so a late key cannot answer it.
             app.pending = None;
+            app.mcp_approval = None;
             *responder = None;
-            if app.loading.take().is_some() {
+            let cancelled_work = app.loading.take().is_some();
+            if cancelled_work {
                 runtime.cancel_work();
+            }
+            // A cancelled session change has no driver coming and will
+            // never produce a `Finished`, so the loop has to end the
+            // running state itself. Without this the first lazy open being
+            // cancelled leaves every later prompt and setting refused.
+            if let Some(pending) = runtime.take_pending_open() {
+                app.session_transition = false;
+                *idle_agent = pending.previous;
+                if let Some(prompt) = pending.prompt {
+                    app.undo_submission(&prompt);
+                }
+                app.running = false;
+                app.notice = Some("cancelled; your draft was kept".into());
+            } else if cancelled_work {
                 app.notice = Some("cancelled".into());
             }
         }
@@ -706,20 +861,34 @@ async fn on_action(
             }
         }
         Action::Submit(prompt) => {
-            if let Some(mut agent) = idle_agent.take() {
+            if runtime.pending_open.is_some() {
+                // A session change is in flight; the driver this would run
+                // on is about to be replaced.
+                app.running = false;
+                app.restore_draft(&prompt);
+                app.notice = Some("the session is still opening; your draft was kept".into());
+            } else if let Some(mut agent) = idle_agent.take() {
                 app.sidebar.session.activity = Some("running".into());
                 *handle = Some(agent.handle());
                 let tx = runtime.tx.clone();
+                let generation = app.sidebar.generation;
                 tokio::spawn(async move {
-                    let mut ui = ChannelUi { tx: tx.clone() };
+                    let mut ui = ChannelUi {
+                        tx: tx.clone(),
+                        generation,
+                    };
                     let result = agent.run_turn(&prompt, &mut ui).await;
-                    let _ = tx.send(UiMsg::Finished { agent, result });
+                    let _ = tx.send(UiMsg::Finished {
+                        generation,
+                        agent,
+                        result,
+                    });
                 });
             } else if app.running && app.session_id.is_none() {
                 // The lazy path: no session exists yet, so the first
                 // prompt is what creates one from the draft.
                 app.loading = Some("opening the session".into());
-                open_draft(app, runtime, Some(prompt));
+                open_draft(app, runtime, Some(prompt), None);
             } else {
                 app.running = false;
                 // The draft survives a submission that could not be sent.
@@ -753,20 +922,72 @@ async fn on_action(
             });
         }
         Action::Resume(id) => {
+            if handle.is_some() || runtime.pending_open.is_some() {
+                app.notice = Some("finish or cancel the work in flight first".into());
+                return Ok(());
+            }
             // Resuming keeps the stored profile, model, and effort: the
-            // draft only names the session.
+            // request only names the session.
             app.loading = Some("resuming".into());
-            let draft = SessionDraft::default();
+            app.session_transition = true;
             let named = id.0.clone();
             let plane = Arc::clone(&runtime.plane);
             let tx = runtime.tx.clone();
             let generation = app.sidebar.generation;
+            let operation = runtime.next_operation();
+            // The driver being replaced is held by the transition, so a
+            // prompt cannot start a turn on the session being left.
+            runtime.pending_open = Some(PendingOpen {
+                operation,
+                prompt: None,
+                previous: idle_agent.take(),
+            });
             runtime.spawn(async move {
-                let result = resume_by_id(&plane, &named, draft).await;
+                let result = resume_by_id(&plane, &named).await;
                 let _ = tx.send(UiMsg::Opened {
+                    operation,
                     generation,
                     result,
-                    prompt: None,
+                });
+            });
+        }
+        Action::SelectConnector(id) => {
+            if handle.is_some() || runtime.pending_open.is_some() {
+                app.notice = Some("finish or cancel the work in flight first".into());
+                return Ok(());
+            }
+            app.loading = Some(format!("starting {}", id.as_str()));
+            app.session_transition = true;
+            let plane = Arc::clone(&runtime.plane);
+            let tx = runtime.tx.clone();
+            let generation = app.sidebar.generation;
+            let operation = runtime.next_operation();
+            runtime.pending_open = Some(PendingOpen {
+                operation,
+                prompt: None,
+                previous: idle_agent.take(),
+            });
+            runtime.spawn(async move {
+                // An external agent owns its own model and effort, so this
+                // is the general control-plane operation, not a draft.
+                let result = plane
+                    .open(
+                        crate::agent::SessionSelector::New { name: None },
+                        Some(id),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map(|driver| DraftOpen::Opened {
+                        driver,
+                        catalog: crate::draft::CatalogState::Skipped,
+                        warnings: Vec::new(),
+                    });
+                let _ = tx.send(UiMsg::Opened {
+                    operation,
+                    generation,
+                    result,
                 });
             });
         }
@@ -808,21 +1029,43 @@ async fn on_action(
                 return Ok(());
             };
             app.loading = Some("saving the profile".into());
-            let setup = Arc::clone(runtime.plane.setup());
+            let plane = Arc::clone(&runtime.plane);
             let tx = runtime.tx.clone();
-            // Config and keychain writes are blocking file and system
-            // calls; they never run on the loop.
+            // The write, the configuration reload, and the credential
+            // resolution behind the summaries are all blocking file and
+            // system calls. `keyring::Entry::get_password()` in particular
+            // can block for as long as the operating system wants, so none
+            // of it runs on the loop.
             runtime.spawn(async move {
-                let message = tokio::task::spawn_blocking(move || {
-                    crate::setup::apply_setup(setup.as_ref(), submission)
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let (message, ok) =
+                        crate::setup::apply_setup(plane.setup().as_ref(), submission);
+                    if !ok {
+                        return (message, false, None);
+                    }
+                    let reloaded = plane.reloaded();
+                    let profiles = match &reloaded {
+                        Some(plane) => plane.profile_summaries(),
+                        None => plane.profile_summaries(),
+                    };
+                    (message, true, Some((reloaded, profiles)))
                 })
-                .await
-                .unwrap_or_else(|_| ("the setup task did not finish".to_owned(), false));
-                let _ = tx.send(UiMsg::Setup {
-                    message: message.0,
-                    close: message.1,
-                    reload: message.1,
-                });
+                .await;
+                let (message, close, reloaded) = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(_) => ("the setup task did not finish".to_owned(), false, None),
+                };
+                if let Some((plane, profiles)) = reloaded {
+                    if let Some(plane) = plane {
+                        let _ = tx.send(UiMsg::Reloaded {
+                            plane: Box::new(plane),
+                            profiles,
+                        });
+                    } else {
+                        let _ = tx.send(UiMsg::Profiles(profiles));
+                    }
+                }
+                let _ = tx.send(UiMsg::Setup { message, close });
             });
         }
         Action::NewSession => {
@@ -840,11 +1083,30 @@ async fn on_action(
                 app.notice = Some("no MCP runtime is configured for this workspace".into());
                 return Ok(());
             };
-            app.loading = Some("applying the MCP change".into());
             let tx = runtime.tx.clone();
-            runtime.spawn(async move {
-                let cancel = crate::CancellationToken::new();
+            if let McpRequest::RequestApproval { server } = request {
+                // Fetching the definition changes nothing; it only asks
+                // what approving would run.
+                app.loading = Some("reading the server definition".into());
+                runtime.spawn(async move {
+                    let definition = mcp
+                        .definition_summary(&server)
+                        .await
+                        .unwrap_or_else(|| "this entry cannot run as configured".to_owned());
+                    let _ = tx.send(UiMsg::McpApproval { server, definition });
+                });
+                return Ok(());
+            }
+            app.loading = Some("applying the MCP change".into());
+            // The token is kept by the loop. Cancelling signals it and
+            // lets the operation's own cleanup shut the child down and
+            // release its launch slot; aborting the future would drop both
+            // and leave the process alive until the application exits.
+            let cancel = crate::CancellationToken::new();
+            runtime.mcp_cancel = Some(cancel.clone());
+            runtime.spawn_detached(async move {
                 let result = match request {
+                    McpRequest::RequestApproval { .. } => Ok(()),
                     McpRequest::Decide { server, decision } => {
                         match mcp.decide(&server, decision).await {
                             // Approving records the decision; the launch
@@ -897,36 +1159,458 @@ async fn on_action(
 }
 
 /// Opens the draft on screen, carrying the prompt that triggered it.
-fn open_draft(app: &mut App, runtime: &mut Runtime, prompt: Option<String>) {
+///
+/// The transition is reserved before the request goes out, so a prompt
+/// submitted while it is in flight is refused rather than run on the
+/// driver that is about to be replaced.
+fn open_draft(
+    app: &mut App,
+    runtime: &mut Runtime,
+    prompt: Option<String>,
+    previous: Option<Box<dyn Driver>>,
+) {
     let draft = app.draft.clone();
     let plane = Arc::clone(&runtime.plane);
     let tx = runtime.tx.clone();
     let generation = app.sidebar.generation;
+    let operation = runtime.next_operation();
+    app.session_transition = true;
+    runtime.pending_open = Some(PendingOpen {
+        operation,
+        prompt,
+        previous,
+    });
     runtime.spawn(async move {
         let result = plane.open_draft(draft).await;
         let _ = tx.send(UiMsg::Opened {
+            operation,
             generation,
             result,
-            prompt,
         });
     });
 }
 
-/// Resumes by session id through the same draft operation, so a resumed
-/// session gets the same pinning and effort rules as any other.
-async fn resume_by_id(
-    plane: &ControlPlane,
-    id: &str,
-    mut draft: SessionDraft,
-) -> Result<DraftOpen> {
-    let session = plane
-        .builder
-        .store
-        .get(&gritt_core::session::SessionId(id.to_owned()))
-        .await?;
-    let Some(session) = session else {
-        return Err(Error::storage(format!("session `{id}` is gone")));
+/// Resumes by session id.
+///
+/// A native session goes through the draft operation, so it gets the same
+/// pinning and effort rules as any other. A connector session cannot:
+/// draft validation rejects it by design, because an external agent owns
+/// its own model and effort. That one goes through the general
+/// control-plane operation, which is what the eager path always used.
+async fn resume_by_id(plane: &ControlPlane, id: &str) -> Result<DraftOpen> {
+    let id = gritt_core::session::SessionId(id.to_owned());
+    let Some(session) = plane.builder.store.get(&id).await? else {
+        return Err(Error::storage(format!("session `{}` is gone", id.0)));
     };
-    draft.name = Some(session.name);
-    plane.open_draft(draft).await
+    if matches!(
+        session.kind,
+        gritt_core::session::SessionKind::Connector { .. }
+    ) {
+        let driver = plane
+            .open(
+                crate::agent::SessionSelector::Id(id),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        return Ok(DraftOpen::Opened {
+            driver,
+            catalog: crate::draft::CatalogState::Skipped,
+            warnings: Vec::new(),
+        });
+    }
+    plane
+        .open_draft(SessionDraft::default().with_name(session.name))
+        .await
+}
+
+#[cfg(test)]
+mod tests {
+    //! The loop's two handlers, driven directly.
+    //!
+    //! Session transitions and turn completion are the places where two
+    //! asynchronous results can overwrite each other, and neither is
+    //! reachable from a reducer test: the reducer never holds a driver.
+    //! These build the real `Runtime` and call the real handlers.
+
+    use super::*;
+    use crate::agent::ApprovalMode;
+    use crate::store::{DatabaseLocation, Store};
+    use crate::telemetry::Telemetry;
+    use crate::tools::{ProcessRegistry, Workspace};
+    use gritt_core::config::Config;
+    use gritt_core::provider::{Protocol, ProviderProfile};
+    use gritt_core::secret::{Secret, SecretRef};
+    use gritt_core::session::{Phase, Session, SessionId, SessionKind};
+    use gritt_provider::models::ModelCatalog;
+    use gritt_provider::{FixtureTransport, StaticKey};
+
+    /// A driver that answers questions and never runs anything. Enough to
+    /// prove which driver the loop would have used.
+    struct StubDriver {
+        session: Session,
+        turns: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Driver for StubDriver {
+        fn session(&self) -> &Session {
+            &self.session
+        }
+        fn phase(&self) -> Phase {
+            self.session.phase
+        }
+        fn set_phase(&mut self, _phase: Phase) -> gritt_core::session::BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn handle(&self) -> CancelHandle {
+            CancelHandle::new(crate::CancellationToken::new(), ProcessRegistry::new())
+        }
+        fn run_turn<'a>(
+            &'a mut self,
+            _prompt: &'a str,
+            _ui: &'a mut dyn crate::agent::Ui,
+        ) -> gritt_core::session::BoxFuture<'a, Result<TurnOutcome>> {
+            self.turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(TurnOutcome {
+                    status: crate::agent::TurnStatus::Completed,
+                    text: String::new(),
+                    usage: Default::default(),
+                    tool_calls: 0,
+                    error: None,
+                })
+            })
+        }
+        fn info(&self) -> crate::driver::DriverInfo {
+            crate::driver::DriverInfo {
+                backend: "openrouter".into(),
+                detail: "openai/gpt-5-nano".into(),
+            }
+        }
+        fn effort(&self) -> Option<gritt_core::provider::ReasoningEffort> {
+            Some(Default::default())
+        }
+        fn set_effort(
+            &mut self,
+            _effort: gritt_core::provider::ReasoningEffort,
+        ) -> gritt_core::session::BoxFuture<'_, Result<crate::driver::EffortOutcome>> {
+            Box::pin(async {
+                Ok(crate::driver::EffortOutcome::Applied {
+                    effort: Default::default(),
+                })
+            })
+        }
+    }
+
+    fn session(name: &str) -> Session {
+        let now = chrono::Utc::now();
+        Session {
+            name: name.into(),
+            id: SessionId(format!("id-{name}")),
+            kind: SessionKind::Native {
+                provider_profile: "openrouter".into(),
+                model: "openai/gpt-5-nano".into(),
+                effort: Default::default(),
+            },
+            phase: Phase::Coding,
+            workspace: std::path::PathBuf::from("/tmp"),
+            created_at: now,
+            updated_at: now,
+            parent_id: None,
+        }
+    }
+
+    struct Harness {
+        _dir: tempfile::TempDir,
+        app: App,
+        runtime: Runtime,
+        idle: Option<Box<dyn Driver>>,
+        handle: Option<CancelHandle>,
+        responder: Option<oneshot::Sender<ApprovalDecision>>,
+        rx: mpsc::UnboundedReceiver<UiMsg>,
+    }
+
+    async fn harness() -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            Store::open(DatabaseLocation::Explicit(dir.path().join("gritt.db")))
+                .await
+                .unwrap(),
+        );
+        let mut config = Config::default();
+        config.profiles.insert(
+            "openrouter".into(),
+            ProviderProfile {
+                name: "openrouter".into(),
+                protocol: Protocol::ChatCompletions,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                key: SecretRef::for_profile("openrouter", "OPENROUTER_API_KEY"),
+                aliases: Default::default(),
+            },
+        );
+        config.default_profile = Some("openrouter".into());
+        config.default_model = Some("openai/gpt-5-nano".into());
+        let telemetry = Arc::new(Telemetry::new(Arc::clone(&store), config.logging.clone()));
+        let builder = crate::agent::AgentBuilder {
+            config,
+            store,
+            telemetry,
+            keys: Arc::new(StaticKey(Secret::new("k"))),
+            transport: Arc::new(FixtureTransport::new(Vec::new(), 17)),
+            catalog: ModelCatalog::new(),
+            cache: None,
+            workspace: Workspace::open(dir.path()).unwrap(),
+            approval: ApprovalMode::DenyAll,
+            mcp: None,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let plane = ControlPlane::native(Arc::new(builder));
+        let runtime = Runtime {
+            plane: Arc::new(plane),
+            changes: Arc::new(WorkspaceChanges::new(dir.path())),
+            tx,
+            work: None,
+            operations: 0,
+            pending_open: None,
+            mcp_cancel: None,
+        };
+        Harness {
+            _dir: dir,
+            app: App::new(StatusBar::default(), Theme::default()),
+            runtime,
+            idle: None,
+            handle: None,
+            responder: None,
+            rx,
+        }
+    }
+
+    impl Harness {
+        async fn act(&mut self, action: Action) {
+            on_action(
+                &mut self.app,
+                &mut self.runtime,
+                &mut self.idle,
+                &mut self.handle,
+                &mut self.responder,
+                action,
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn message(&mut self, msg: UiMsg) -> Action {
+            on_message(
+                &mut self.app,
+                &mut self.runtime,
+                &mut self.idle,
+                &mut self.handle,
+                &mut self.responder,
+                msg,
+            )
+            .await
+            .unwrap()
+        }
+    }
+
+    /// Finding 1: a resume reserves the transition, so a prompt submitted
+    /// while it is in flight cannot start a turn on the session being
+    /// left, and the driver that arrives cannot be undone by the old one.
+    #[tokio::test]
+    async fn a_prompt_during_a_resume_cannot_run_on_the_session_being_left() {
+        let mut h = harness().await;
+        let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        h.idle = Some(Box::new(StubDriver {
+            session: session("old"),
+            turns: Arc::clone(&turns),
+        }));
+        h.app.set_session(&session("old"));
+
+        h.act(Action::Resume(SessionId("id-new".into()))).await;
+        assert!(h.runtime.pending_open.is_some(), "no transition reserved");
+        assert!(h.app.session_transition);
+        assert!(
+            h.idle.is_none(),
+            "the driver being replaced was left available to a turn"
+        );
+
+        // A prompt submitted now must not reach the old driver.
+        h.app.running = true;
+        h.act(Action::Submit("do a thing".into())).await;
+        assert_eq!(
+            turns.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a turn ran on the session being left"
+        );
+        assert_eq!(h.app.composer.text(), "do a thing", "the draft was lost");
+        assert!(!h.app.running);
+    }
+
+    /// Finding 1: a result for a transition that is no longer wanted is
+    /// dropped, and untagged turn output cannot populate the new session.
+    #[tokio::test]
+    async fn a_superseded_open_and_a_stale_turn_are_both_refused() {
+        let mut h = harness().await;
+        h.act(Action::Resume(SessionId("id-a".into()))).await;
+        let stale_operation = h.runtime.pending_open.as_ref().unwrap().operation;
+        // The user asks for a different session before the first answers.
+        h.runtime.pending_open = None;
+        h.app.session_transition = false;
+        h.act(Action::Resume(SessionId("id-b".into()))).await;
+        let current = h.runtime.pending_open.as_ref().unwrap().operation;
+        assert_ne!(stale_operation, current);
+
+        // The first one answers. It must not be adopted.
+        let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        h.message(UiMsg::Opened {
+            operation: stale_operation,
+            generation: h.app.sidebar.generation,
+            result: Ok(DraftOpen::Opened {
+                driver: Box::new(StubDriver {
+                    session: session("stale"),
+                    turns: Arc::clone(&turns),
+                }),
+                catalog: crate::draft::CatalogState::Skipped,
+                warnings: Vec::new(),
+            }),
+        })
+        .await;
+        assert!(h.idle.is_none(), "a superseded driver was adopted");
+        assert!(
+            h.runtime.pending_open.is_some(),
+            "the transition still wanted was cancelled by a stale answer"
+        );
+
+        // Output from a session that is gone cannot populate the one on
+        // screen, and its driver is not restored as the idle one.
+        let stale_generation = h.app.sidebar.generation;
+        h.app.sidebar.reset();
+        h.message(UiMsg::Event {
+            generation: stale_generation,
+            event: gritt_core::event::Event {
+                session_id: SessionId("id-a".into()),
+                sequence: 1,
+                timestamp: chrono::Utc::now(),
+                source: gritt_core::event::EventSource::Native,
+                kind: gritt_core::event::EventKind::TextDelta {
+                    text: "from the old session".into(),
+                },
+                diagnostic: None,
+            },
+        })
+        .await;
+        assert!(
+            h.app.entries.is_empty(),
+            "output from a session that was left reached the transcript"
+        );
+        h.message(UiMsg::Finished {
+            generation: stale_generation,
+            agent: Box::new(StubDriver {
+                session: session("stale"),
+                turns,
+            }),
+            result: Ok(TurnOutcome {
+                status: crate::agent::TurnStatus::Completed,
+                text: String::new(),
+                usage: Default::default(),
+                tool_calls: 0,
+                error: None,
+            }),
+        })
+        .await;
+        assert!(h.idle.is_none(), "the previous driver was restored");
+    }
+
+    /// Finding 2: cancelling the first lazy open gives the prompt back and
+    /// leaves the interface usable, and the result it was waiting for can
+    /// no longer land.
+    #[tokio::test]
+    async fn cancelling_the_first_session_open_does_not_strand_the_interface() {
+        let mut h = harness().await;
+        // What `Action::Submit` does with no session: the reducer has
+        // already pushed the entry and set `running`.
+        h.app.push(EntryKind::User, "first prompt");
+        h.app.running = true;
+        h.act(Action::Submit("first prompt".into())).await;
+        let operation = h.runtime.pending_open.as_ref().unwrap().operation;
+        assert!(h.app.session_transition);
+
+        h.act(Action::Cancel).await;
+        assert!(!h.app.running, "the interface stayed in a running state");
+        assert!(!h.app.session_transition);
+        assert!(h.runtime.pending_open.is_none());
+        assert_eq!(h.app.composer.text(), "first prompt", "the prompt was lost");
+        assert!(
+            h.app.entries.is_empty(),
+            "the cancelled prompt stayed in the transcript"
+        );
+        // Settings and prompts work again.
+        assert!(h.app.settings_are_editable());
+
+        // A result queued before the cancellation cannot open a session.
+        let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        h.message(UiMsg::Opened {
+            operation,
+            generation: h.app.sidebar.generation,
+            result: Ok(DraftOpen::Opened {
+                driver: Box::new(StubDriver {
+                    session: session("late"),
+                    turns,
+                }),
+                catalog: crate::draft::CatalogState::Skipped,
+                warnings: Vec::new(),
+            }),
+        })
+        .await;
+        assert!(h.idle.is_none(), "a cancelled open still adopted a driver");
+        assert!(h.app.session_id.is_none());
+    }
+
+    /// A refused draft restores the driver that was open, so a failed
+    /// switch does not cost the session the user already had.
+    #[tokio::test]
+    async fn a_refused_transition_puts_the_previous_session_back() {
+        let mut h = harness().await;
+        let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        h.idle = Some(Box::new(StubDriver {
+            session: session("old"),
+            turns,
+        }));
+        h.act(Action::Resume(SessionId("id-new".into()))).await;
+        assert!(h.idle.is_none());
+        let operation = h.runtime.pending_open.as_ref().unwrap().operation;
+        h.message(UiMsg::Opened {
+            operation,
+            generation: h.app.sidebar.generation,
+            result: Ok(DraftOpen::Rejected {
+                errors: vec![crate::draft::DraftError::MissingModel],
+                catalog: None,
+            }),
+        })
+        .await;
+        assert!(
+            h.idle.is_some(),
+            "a refused switch left the interface with no session"
+        );
+        assert!(!h.app.session_transition);
+    }
+
+    /// Finding 3: cancelling MCP work signals its token instead of
+    /// dropping the future that owns the child process.
+    #[tokio::test]
+    async fn cancelling_mcp_work_signals_it_rather_than_aborting_it() {
+        let mut h = harness().await;
+        let token = crate::CancellationToken::new();
+        h.runtime.mcp_cancel = Some(token.clone());
+        h.app.loading = Some("applying the MCP change".into());
+        h.act(Action::Cancel).await;
+        assert!(
+            token.is_cancelled(),
+            "the MCP operation was dropped without being told to stop"
+        );
+        assert!(h.runtime.mcp_cancel.is_none());
+        let _ = h.rx.try_recv();
+    }
 }

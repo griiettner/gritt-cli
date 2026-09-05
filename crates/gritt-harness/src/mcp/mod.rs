@@ -871,6 +871,53 @@ impl McpRuntime {
         }
     }
 
+    /// A redacted one-line summary of what approving this entry would run
+    /// or connect to, for a first-use approval prompt.
+    ///
+    /// Reading a workspace file does not authorize executing what it
+    /// names, so an interface has to be able to show the command before
+    /// the user grants it. Two rules keep this safe. Only the *shape* of
+    /// the definition leaves: a command and its arguments, an endpoint
+    /// with its query string removed, and environment or header **names**
+    /// without their values. And the result is redacted against the
+    /// credentials this entry's own interpolation produced, so a value
+    /// that reached an argument through `${TOKEN}` cannot be echoed here.
+    ///
+    /// `None` for an entry that cannot run; its state already carries the
+    /// reason.
+    pub async fn definition_summary(&self, server: &str) -> Option<String> {
+        let state = self.state.lock().await;
+        let config = state.servers.get(server)?.config.clone()?;
+        drop(state);
+        let secrets = entry_secrets(&config);
+        let summary = match &config.transport {
+            McpTransport::Stdio { command, args, env } => {
+                let mut text = format!("run: {command}");
+                for argument in args {
+                    text.push(' ');
+                    text.push_str(argument);
+                }
+                if !env.is_empty() {
+                    let names: Vec<&str> = env.keys().map(String::as_str).collect();
+                    text.push_str(&format!("\nenvironment: {}", names.join(", ")));
+                }
+                text
+            }
+            McpTransport::Http { url, headers } => {
+                // The query string can carry a token in a URL that no
+                // header rule would have caught.
+                let endpoint = url.split_once('?').map(|(head, _)| head).unwrap_or(url);
+                let mut text = format!("connect: {endpoint}");
+                if !headers.is_empty() {
+                    let names: Vec<&str> = headers.keys().map(String::as_str).collect();
+                    text.push_str(&format!("\nheaders: {}", names.join(", ")));
+                }
+                text
+            }
+        };
+        Some(redact_text(&summary, &secrets))
+    }
+
     /// Every configured entry with its state, tool count, and safe reason.
     /// Nothing here holds an environment value, a header value, or a URL.
     pub async fn snapshots(&self) -> Vec<McpServerSnapshot> {
