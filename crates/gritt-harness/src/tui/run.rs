@@ -324,18 +324,6 @@ impl Runtime {
         self.operations
     }
 
-    /// Abandons the session change in flight, if any, and returns it. A
-    /// result already queued for it can no longer match.
-    ///
-    /// The task is dropped with it, so nothing keeps working towards a
-    /// session the loop has stopped waiting for.
-    fn take_pending_open(&mut self) -> Option<PendingOpen> {
-        if let Some(work) = self.open_work.take() {
-            work.abort();
-        }
-        self.pending_open.take()
-    }
-
     /// Replaces the session-change task. Only a caller that has already
     /// installed the matching reservation uses this.
     fn spawn_open(&mut self, future: impl std::future::Future<Output = ()> + Send + 'static) {
@@ -346,6 +334,36 @@ impl Runtime {
     }
 
     /// Replaces the background request, aborting whatever it superseded.
+    /// Records that ordinary work of this kind has finished.
+    ///
+    /// Ending the label and retiring the slot's ownership are one step, so
+    /// a completed request cannot leave its kind installed as the owner.
+    /// A stale owner is what let a later request end the label of an MCP
+    /// launch that was still running.
+    fn finish_work(&mut self, app: &mut App, kind: Work) {
+        app.end_work(kind);
+        if self.work_kind == Some(kind) {
+            self.work_kind = None;
+            self.work = None;
+        }
+    }
+
+    /// Gives up the session change in flight and clears everything that
+    /// says one is happening.
+    ///
+    /// The reservation, its task, the transition flag, and the label are
+    /// released together. Releasing them separately is what left
+    /// "Opening…" on screen after a cancelled open, masking every later
+    /// request behind a label for work that had stopped.
+    fn release_pending_open(&mut self, app: &mut App) -> Option<PendingOpen> {
+        if let Some(work) = self.open_work.take() {
+            work.abort();
+        }
+        app.end_work(Work::Open);
+        app.session_transition = false;
+        self.pending_open.take()
+    }
+
     /// Replaces the ordinary background request.
     ///
     /// Only this slot is touched: a session change lives in `open_work`
@@ -792,7 +810,7 @@ async fn on_message(
             profile,
             result,
         } => {
-            app.end_work(Work::Catalog);
+            runtime.finish_work(app, Work::Catalog);
             match result {
                 Ok(catalog) => {
                     app.apply_catalog(selection, &profile, catalog.models, catalog.state);
@@ -803,7 +821,7 @@ async fn on_message(
             }
         }
         UiMsg::Sessions(sessions) => {
-            app.end_work(Work::Sessions);
+            runtime.finish_work(app, Work::Sessions);
             app.load_sessions(sessions);
         }
         UiMsg::Agents(agents) => {
@@ -829,11 +847,18 @@ async fn on_message(
                 if let Ok(DraftOpen::Opened { driver, .. }) = result {
                     drop(driver);
                 }
+                if matches {
+                    // The reservation is still installed but its session
+                    // is gone, so nothing else will ever release it. It
+                    // goes now, with its label and its driver.
+                    if let Some(pending) = runtime.release_pending_open(app) {
+                        *idle_agent = pending.previous;
+                    }
+                    app.running = false;
+                }
                 return Ok(Action::None);
             }
-            let pending = runtime.take_pending_open().expect("checked above");
-            app.end_work(Work::Open);
-            app.session_transition = false;
+            let pending = runtime.release_pending_open(app).expect("checked above");
             match result {
                 Ok(DraftOpen::Opened {
                     driver, warnings, ..
@@ -880,7 +905,7 @@ async fn on_message(
             app.apply_changes(generation, changes);
         }
         UiMsg::Diff(diff) => {
-            app.end_work(Work::Diff);
+            runtime.finish_work(app, Work::Diff);
             app.show_file_diff(diff);
         }
         UiMsg::Mcp(snapshots) => app.apply_mcp(snapshots),
@@ -902,7 +927,7 @@ async fn on_message(
             }
         }
         UiMsg::McpApproval { server, definition } => {
-            app.end_work(Work::Mcp);
+            runtime.finish_work(app, Work::McpDefinition);
             // The definition was asked for when nothing was running. If a
             // turn or another approval started while it was being read,
             // showing it now would let the answer authorize a launch
@@ -931,7 +956,7 @@ async fn on_message(
             app.refresh_connection_picker();
         }
         UiMsg::Setup { message, close } => {
-            app.end_work(Work::Setup);
+            runtime.finish_work(app, Work::Setup);
             return Ok(app.setup_outcome(message, close));
         }
     }
@@ -967,8 +992,7 @@ async fn on_action(
             // never produce a `Finished`, so the loop has to end the
             // running state itself. Without this the first lazy open being
             // cancelled leaves every later prompt and setting refused.
-            if let Some(pending) = runtime.take_pending_open() {
-                app.session_transition = false;
+            if let Some(pending) = runtime.release_pending_open(app) {
                 *idle_agent = pending.previous;
                 if let Some(prompt) = pending.prompt {
                     app.undo_submission(&prompt);
@@ -1197,10 +1221,7 @@ async fn on_action(
             *handle = None;
             *responder = None;
             runtime.cancel_work(app);
-            if let Some(pending) = runtime.take_pending_open() {
-                drop(pending);
-                app.end_work(Work::Open);
-            }
+            drop(runtime.release_pending_open(app));
             scan_changes(runtime, app.sidebar.generation);
         }
         Action::Mcp(request) => {
@@ -1214,7 +1235,7 @@ async fn on_action(
                 // what approving would run.
                 runtime.spawn(
                     app,
-                    Work::Mcp,
+                    Work::McpDefinition,
                     "reading the server definition",
                     async move {
                         let definition = mcp
@@ -1680,6 +1701,11 @@ mod tests {
         assert!(!h.app.running, "the interface stayed in a running state");
         assert!(!h.app.session_transition);
         assert!(h.runtime.pending_open.is_none());
+        assert!(
+            !h.app.is_working_on(Work::Open),
+            "the cancelled open left its label behind"
+        );
+        assert!(h.app.loading().is_none());
         assert_eq!(h.app.composer.text(), "first prompt", "the prompt was lost");
         assert!(
             h.app.entries.is_empty(),
@@ -1806,6 +1832,14 @@ mod tests {
             "cancelling the transition did not give the session back"
         );
         assert!(h.app.settings_are_editable());
+        // The label goes with the reservation. Leaving it behind would
+        // keep "resuming…" on screen and mask every later request, since
+        // it is the highest-priority kind.
+        assert!(
+            !h.app.is_working_on(Work::Open),
+            "the cancelled resume left its label behind"
+        );
+        assert!(h.app.loading().is_none());
     }
 
     /// Round 2, finding 4: overlapping MCP actions each own their token,
@@ -2006,6 +2040,73 @@ mod tests {
             token.is_cancelled(),
             "the MCP operation was never told to stop"
         );
+        assert!(h.runtime.mcp.is_none());
+        assert!(!h.app.is_busy());
+    }
+    /// Round 4, finding 1: approving a server must stay cancellable after
+    /// an unrelated request has come and gone.
+    ///
+    /// The full sequence the review named, definition read included: read
+    /// the definition, approve, start the launch, open `/models`, let the
+    /// catalog finish, then Escape. The launch is detached and still
+    /// running throughout; nothing in that sequence may end its label.
+    #[tokio::test]
+    async fn an_approved_launch_stays_cancellable_across_a_catalog_request() {
+        let mut h = harness().await;
+        // The definition read is ordinary work and owns the shared slot.
+        h.app
+            .begin_work(Work::McpDefinition, "reading the server definition");
+        h.runtime.work_kind = Some(Work::McpDefinition);
+        // It answers, which must retire its ownership as well as its label.
+        h.message(UiMsg::McpApproval {
+            server: "probe".into(),
+            definition: "run: /usr/bin/probe".into(),
+        })
+        .await;
+        assert!(!h.app.is_working_on(Work::McpDefinition));
+        assert!(
+            h.runtime.work_kind.is_none(),
+            "a finished request stayed installed as the owner of the slot"
+        );
+        assert!(h.app.pending.is_some(), "no approval overlay was shown");
+
+        // Approving starts the launch: detached, with its own token.
+        let action = h.app.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('y'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(matches!(action, Action::Mcp(McpRequest::Decide { .. })));
+        let (_id, token) = h.runtime.begin_mcp();
+        h.app.begin_work(Work::Mcp, "applying the MCP change");
+
+        // An unrelated request starts and finishes while it runs.
+        h.act(Action::LoadCatalog {
+            profile: "openrouter".into(),
+            selection: h.app.selection,
+        })
+        .await;
+        h.message(UiMsg::Catalog {
+            selection: h.app.selection,
+            profile: "openrouter".into(),
+            result: Err(gritt_core::Error::config("no")),
+        })
+        .await;
+        assert!(
+            h.app.is_working_on(Work::Mcp),
+            "the catalog request ended the live launch's label"
+        );
+
+        // Escape still reaches the launch.
+        assert_eq!(
+            h.app.on_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE
+            )),
+            Action::Cancel,
+            "Escape had nothing to cancel while a launch was running"
+        );
+        h.act(Action::Cancel).await;
+        assert!(token.is_cancelled(), "the launch was never told to stop");
         assert!(h.runtime.mcp.is_none());
         assert!(!h.app.is_busy());
     }

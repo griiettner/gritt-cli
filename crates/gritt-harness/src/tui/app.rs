@@ -218,8 +218,16 @@ pub struct ModelCatalogView {
 pub enum Work {
     /// Opening, resuming, or replacing the session.
     Open,
-    /// An MCP lifecycle action or a definition read.
+    /// An MCP lifecycle action: a trust decision, a restart, a stop, or a
+    /// reload. Detached, with its own cancellation token.
     Mcp,
+    /// Reading a server's definition for a launch approval.
+    ///
+    /// A separate kind from the lifecycle action deliberately. The read is
+    /// an ordinary cancellable request and the action that follows it is
+    /// not, and sharing one kind let the request's bookkeeping end the
+    /// label of a launch that was really running.
+    McpDefinition,
     /// Writing a provider profile and re-reading the configuration.
     Setup,
     /// Loading a profile's model list.
