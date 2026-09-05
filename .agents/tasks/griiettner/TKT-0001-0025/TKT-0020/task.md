@@ -3,10 +3,10 @@ id: TKT-0020
 namespace: griiettner
 title: Complete documentation, performance benchmarks, and integrated TUI hardening
 artifact: task
-status: planning
+status: done
 owner: griiettner
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-05
 chain_role: worker
 chain_parent: TKT-0015
 dependencies:
