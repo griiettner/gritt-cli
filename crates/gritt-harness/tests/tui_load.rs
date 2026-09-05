@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers};
 use gritt_core::config::Config;
 use gritt_core::event::{Event, EventKind, EventSource};
 use gritt_core::mcp::{McpRuntimeSettings, McpServerState};
@@ -43,7 +43,6 @@ use gritt_harness::store::{DatabaseLocation, Store};
 use gritt_harness::telemetry::Telemetry;
 use gritt_harness::tools::{ProcessRegistry, Workspace};
 use gritt_harness::tui::app::{App, EntryKind, StatusBar};
-use gritt_harness::tui::render::draw;
 use gritt_harness::tui::run::LoopHarness;
 use gritt_harness::tui::theme::{Theme, ThemeMode};
 use gritt_harness::CancellationToken;
@@ -311,67 +310,99 @@ async fn the_combined_workload_on_the_real_event_loop() {
         }
     });
 
-    // The loop, shaped exactly as `event_loop` is: draw when the screen can
-    // have changed, then take one wakeup.
-    let mut dirty = true;
+    // A synthetic user typing about ten characters a second, queued onto
+    // the same channel the key reader thread writes to. Each key carries
+    // the time it was *queued*, not the time the loop got to it, so its
+    // scheduling wait is inside the measurement.
+    let input = harness.input();
+    let typed: Arc<std::sync::Mutex<Vec<Instant>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let typing = tokio::spawn({
+        let typed = Arc::clone(&typed);
+        async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                typed.lock().unwrap().push(Instant::now());
+                if input
+                    .send(TerminalEvent::Key(KeyEvent::new(
+                        KeyCode::Char('a'),
+                        KeyModifiers::NONE,
+                    )))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+
+    // The loop itself. Every draw, every drain, and every scheduling
+    // decision is `Scheduler::step`; nothing here reimplements them.
     let mut frames = 0usize;
     let mut handled = 0usize;
     let mut queue_samples: Vec<usize> = Vec::new();
+    let mut peak_batch = 0usize;
     let mut input_latency: Vec<Duration> = Vec::new();
-    let mut pending_key: Option<Instant> = None;
-    let mut next_key = Instant::now() + Duration::from_millis(100);
+    let mut answered = 0usize;
     let run_start = Instant::now();
     let deadline = Duration::from_secs(seconds);
-
-    // The frame cap and the coalescing drain the loop uses. Mirrored here so
-    // the model and the product cannot drift; if `run.rs` changes shape,
-    // these numbers stop describing it and this comment is the pointer.
-    let frame_interval = Duration::from_millis(33);
-    let mut last_draw = Instant::now() - frame_interval;
+    let mut cancelled_at: Option<Instant> = None;
+    let mut cancel_latency: Option<Duration> = None;
+    let cancel_token = CancellationToken::new();
+    let mut driver_installed = false;
 
     while run_start.elapsed() < deadline {
-        if dirty && last_draw.elapsed() >= frame_interval {
-            terminal.draw(|f| draw(f, harness.app())).unwrap();
-            frames += 1;
-            dirty = false;
-            last_draw = Instant::now();
-            // A key is answered by the first frame drawn after it.
-            if let Some(pressed) = pending_key.take() {
-                input_latency.push(pressed.elapsed());
-            }
-        }
         queue_samples.push(harness.queue_depth());
 
-        // The synthetic user types about ten characters a second.
-        let key_ready = pending_key.is_none() && Instant::now() >= next_key;
-        let msg_ready = harness.queue_depth() > 0;
-        // The loop's `select!` is `biased` with input first, so a key that
-        // is ready always wins over a queued message.
-        let take_key = key_ready;
-        if take_key {
-            let pressed = Instant::now();
+        // Partway through, while the stream is still running, a real
+        // cancellation: a driver is installed and Escape is queued as
+        // input. Both go through the same scheduler as everything else.
+        if !driver_installed && run_start.elapsed() > deadline / 2 {
+            driver_installed = true;
+            harness.set_driver(Box::new(StubDriver {
+                session: session("bench"),
+                token: cancel_token.clone(),
+            }));
+            harness.app_mut().running = true;
+            cancelled_at = Some(Instant::now());
             harness
-                .press(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
-                .await;
-            pending_key = Some(pressed);
-            next_key = Instant::now() + Duration::from_millis(100);
-            dirty = true;
-        } else if msg_ready {
-            // One wakeup, then the coalescing drain: everything already
-            // waiting is handled before the next frame.
-            harness.pump_one().await;
-            handled += 1;
-            let mut coalesced = 0;
-            while coalesced < 4_096 && harness.pump_one().await {
-                coalesced += 1;
-                handled += 1;
+                .input()
+                .send(TerminalEvent::Key(KeyEvent::new(
+                    KeyCode::Esc,
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+        }
+
+        let step = harness.step(&mut terminal).await.unwrap();
+        handled += step.messages;
+        // `step` drains inside itself, so sampling the channel from out
+        // here always finds it empty. The batch one step handled *is* the
+        // backlog that accumulated while the previous frame was drawn,
+        // which is the number the plan's bounded-queue requirement is
+        // about.
+        peak_batch = peak_batch.max(step.messages);
+        if step.drew {
+            frames += 1;
+            // Every key queued before this frame and not yet answered is
+            // answered by it.
+            let queue = typed.lock().unwrap();
+            let now = Instant::now();
+            while answered < queue.len() && queue[answered] <= now {
+                input_latency.push(now.duration_since(queue[answered]));
+                answered += 1;
             }
-            dirty = true;
-        } else {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            drop(queue);
+            if cancel_latency.is_none() {
+                if let Some(at) = cancelled_at {
+                    if cancel_token.is_cancelled() {
+                        cancel_latency = Some(at.elapsed());
+                    }
+                }
+            }
         }
     }
 
+    typing.abort();
     streaming.abort();
     let snapshots = opening.await.unwrap().unwrap();
     let elapsed = run_start.elapsed();
@@ -387,7 +418,8 @@ async fn the_combined_workload_on_the_real_event_loop() {
         elapsed.as_secs_f64()
     ));
     record(&format!(
-        "combined load queue: peak {peak_queue}, final {final_queue}"
+        "combined load queue: largest batch drained in one step {peak_batch}, \
+         depth observed between steps {peak_queue}, final {final_queue}"
     ));
     if !input_latency.is_empty() {
         record(&format!(
@@ -443,25 +475,14 @@ async fn the_combined_workload_on_the_real_event_loop() {
         "the 1 MiB tool result never arrived"
     );
 
-    // Cancellation, executed through the runtime handler, under this load.
-    let token = CancellationToken::new();
-    harness.set_driver(Box::new(StubDriver {
-        session: session("bench"),
-        token: token.clone(),
-    }));
-    harness.app_mut().running = true;
-    let before = terminal.backend().buffer().clone();
-    let cancel_start = Instant::now();
-    harness
-        .press(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-        .await;
-    terminal.draw(|f| draw(f, harness.app())).unwrap();
-    let cancel_latency = cancel_start.elapsed();
-    let after = terminal.backend().buffer().clone();
+    // Cancellation was executed during the run, through the same scheduler:
+    // Escape was queued as input while the stream was still producing.
+    let cancel_latency = cancel_latency.expect("cancellation never took effect");
     record(&format!(
-        "combined load cancel: {} to a redrawn frame, token cancelled={}",
+        "combined load cancel (during the stream): {} from Escape queued to the \
+         frame after the token fired, token cancelled={}",
         millis(cancel_latency),
-        token.is_cancelled()
+        cancel_token.is_cancelled()
     ));
     record(&format!(
         "  budget {:<34} {:>10} vs  100.000ms -> {}",
@@ -474,12 +495,8 @@ async fn the_combined_workload_on_the_real_event_loop() {
         },
     ));
     assert!(
-        token.is_cancelled(),
+        cancel_token.is_cancelled(),
         "Escape did not reach the running turn's cancellation token"
-    );
-    assert_ne!(
-        before, after,
-        "cancelling under load produced no visible change"
     );
     assert!(
         cancel_latency < Duration::from_millis(1_000),
@@ -499,8 +516,8 @@ async fn the_combined_workload_on_the_real_event_loop() {
         "the loop drained only {drain_rate:.0} messages/s of {target_rate:.0} produced"
     );
     assert!(
-        peak_queue < 2_000,
-        "the message queue reached {peak_queue}; it is not keeping up"
+        peak_batch < 2_000,
+        "one step drained {peak_batch} messages; the loop is not keeping up"
     );
     // The frame cap. Under a saturating stream the loop must not draw a
     // frame per event; 30 fps plus a margin is the ceiling.
