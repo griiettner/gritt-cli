@@ -230,12 +230,12 @@ pub fn launch(
                 command = commands.recv() => {
                     let Some(command) = command else { break };
                     match command {
-                        Command::Request { id, method, params, reply } => {
+                        Command::Request { id, method, params, reply, cancelled } => {
                             // Checked here, immediately before the write, so
                             // a caller that gave up while this sat in the
                             // queue is honoured no matter what order the
                             // commands arrived in.
-                            if task_flags.take_abandoned(id) {
+                            if cancelled.load(Ordering::SeqCst) {
                                 let _ = reply.send(Err(Error::cancelled()));
                                 continue;
                             }

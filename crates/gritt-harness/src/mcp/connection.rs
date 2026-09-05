@@ -10,7 +10,6 @@
 //! shutdown, so every queue operation has a deadline and shutdown is
 //! signalled out of band rather than through the queue alone.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,11 +36,6 @@ pub const HARD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 /// bookkeeping that follows it.
 const GIVE_UP_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// How many abandoned request ids are remembered. They only need to outlive
-/// the gap between a caller giving up and the transport reaching that
-/// request, so a small ring is enough.
-const MAX_ABANDONED_IDS: usize = 1024;
-
 /// What the handle asks the transport task to do.
 pub(super) enum Command {
     Request {
@@ -49,6 +43,14 @@ pub(super) enum Command {
         method: String,
         params: Value,
         reply: oneshot::Sender<Result<Value>>,
+        /// Raised by the caller when it stops waiting.
+        ///
+        /// The flag travels with the request rather than living in a shared
+        /// table, so it cannot be evicted by unrelated traffic and it is
+        /// released when the command is. A writer checks it immediately
+        /// before sending, which is what makes the outcome independent of
+        /// where the abort sits in the queue.
+        cancelled: Arc<AtomicBool>,
     },
     Notify {
         method: String,
@@ -85,14 +87,6 @@ pub struct ConnectionFlags {
     pub done: AtomicBool,
     /// Wakes whoever is waiting for that.
     pub finished: Notify,
-    /// Requests whose caller has given up.
-    ///
-    /// Marked here rather than through the queue because the abort would
-    /// otherwise sit *behind* the request it cancels: a writer that resumes
-    /// after being blocked would send the request first and only then read
-    /// the cancellation. The transport consults this immediately before
-    /// writing, so queue order cannot matter.
-    pub abandoned: std::sync::Mutex<VecDeque<u64>>,
 }
 
 impl ConnectionFlags {
@@ -107,28 +101,6 @@ impl ConnectionFlags {
             return;
         }
         self.stop.notified().await;
-    }
-
-    /// Records that nobody is waiting for `id` any more.
-    pub fn abandon(&self, id: u64) {
-        let mut abandoned = self.abandoned.lock().expect("mcp abandoned");
-        abandoned.push_back(id);
-        while abandoned.len() > MAX_ABANDONED_IDS {
-            abandoned.pop_front();
-        }
-    }
-
-    /// True when the caller for `id` has already given up. Consumed, because
-    /// one request is only written once.
-    pub fn take_abandoned(&self, id: u64) -> bool {
-        let mut abandoned = self.abandoned.lock().expect("mcp abandoned");
-        match abandoned.iter().position(|known| *known == id) {
-            Some(index) => {
-                abandoned.remove(index);
-                true
-            }
-            None => false,
-        }
     }
 
     /// Marks the transport's resources released and wakes the waiters.
@@ -242,6 +214,7 @@ impl Connection {
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
         let (reply, rx) = oneshot::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
         // Waiting for queue capacity is itself cancellable. Without this a
         // cancelled request could sit in the admission wait and then still be
         // written to the server.
@@ -250,14 +223,15 @@ impl Connection {
             method: method.to_owned(),
             params,
             reply,
+            cancelled: Arc::clone(&cancelled),
         });
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                // The command may or may not have reached the queue. The
-                // abort covers both: an id that never arrived is recorded as
-                // abandoned, and one that did is dropped before it is sent.
-                self.give_up(id, "the user cancelled the turn", announce).await;
+                // The command may or may not have reached the queue. The flag
+                // covers both: it is raised before the abort is sent, and a
+                // command still waiting for capacity carries it along.
+                self.give_up(&cancelled, id, "the user cancelled the turn", announce).await;
                 return Err(Error::cancelled());
             }
             outcome = admitted => outcome?,
@@ -265,11 +239,11 @@ impl Connection {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                self.give_up(id, "the user cancelled the turn", announce).await;
+                self.give_up(&cancelled, id, "the user cancelled the turn", announce).await;
                 Err(Error::cancelled())
             }
             _ = tokio::time::sleep(deadline) => {
-                self.give_up(id, "the client deadline expired", announce).await;
+                self.give_up(&cancelled, id, "the client deadline expired", announce).await;
                 Err(Error::new(
                     ErrorKind::Config,
                     format!("`{method}` did not answer within {}", human(deadline)),
@@ -338,11 +312,11 @@ impl Connection {
 
     /// Stops waiting for `id`: optionally tells the server, and always tells
     /// the local transport to release the work.
-    async fn give_up(&self, id: u64, reason: &str, announce: bool) {
-        // Marked before anything is queued. The abort command that follows
+    async fn give_up(&self, cancelled: &Arc<AtomicBool>, id: u64, reason: &str, announce: bool) {
+        // Raised before anything is queued. The abort command that follows
         // can only arrive behind the request it cancels, so the flag, not the
         // queue, is what stops the write.
-        self.flags.abandon(id);
+        cancelled.store(true, Ordering::SeqCst);
         let _ = self
             .enqueue_within(Command::Abort { id }, GIVE_UP_TIMEOUT)
             .await;
