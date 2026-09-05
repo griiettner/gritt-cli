@@ -14,7 +14,7 @@
 //! wait only: a remote server may still complete a side effect, which is why
 //! a call is never replayed.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -57,9 +57,9 @@ const DELETE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound on delivering a notification the caller is waiting for.
 const NOTIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How many abandoned request ids are remembered, so a request whose abort
-/// overtook it is dropped rather than sent.
-const MAX_ABANDONED_IDS: usize = 1024;
+/// Bound on one of Gritt's own POSTs. An endpoint that accepts a
+/// notification and never answers must not hold a permit for ever.
+const AUXILIARY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Shared endpoint state. The session id is assigned by the server on the
 /// response that carries `InitializeResult` and must travel on every later
@@ -82,12 +82,27 @@ struct Endpoint {
 impl Endpoint {
     /// Spawns one of Gritt's own POSTs and keeps its handle.
     fn spawn_auxiliary(self: &Arc<Self>, frame: Value) {
-        let endpoint = Arc::clone(self);
-        let handle = tokio::spawn(async move {
-            let _ = post_with(&endpoint, frame, None, &endpoint.auxiliary).await;
-        });
         let mut tasks = self.aux_tasks.lock().expect("mcp aux tasks");
         tasks.retain(|task| !task.is_finished());
+        // Admission is bounded, not only execution. Spawning first and
+        // acquiring a permit inside would let an endpoint that never answers
+        // accumulate waiting tasks and their payloads without limit; the
+        // permits would all be held by the stalled POSTs ahead of them.
+        // Dropping the excess is safe: these are best-effort messages, and a
+        // server request Gritt cannot answer times out on the server's side.
+        if tasks.len() >= MAX_AUXILIARY_POSTS {
+            return;
+        }
+        let endpoint = Arc::clone(self);
+        let handle = tokio::spawn(async move {
+            // A deadline so a stalled POST releases its permit and its slot
+            // rather than holding both until shutdown.
+            let _ = tokio::time::timeout(
+                AUXILIARY_TIMEOUT,
+                post_with(&endpoint, frame, None, &endpoint.auxiliary),
+            )
+            .await;
+        });
         tasks.push(handle);
     }
 
@@ -157,20 +172,16 @@ pub fn connect(
         // caller, by a reload, or by shutdown, and awaited before shutdown
         // reports that it is done.
         let mut inflight: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
-        // Ids whose caller gave up before the request was admitted here.
-        let mut abandoned: VecDeque<u64> = VecDeque::new();
         loop {
             tokio::select! {
                 command = commands.recv() => {
                     let Some(command) = command else { break };
                     match command {
                         Command::Request { id, method, params, reply } => {
-                            // The caller stopped waiting before this was
-                            // admitted, so it must never be sent.
-                            if let Some(index) =
-                                abandoned.iter().position(|known| *known == id)
-                            {
-                                abandoned.remove(index);
+                            // Checked immediately before the POST is spawned,
+                            // independently of the order the commands arrived
+                            // in.
+                            if task.flags.take_abandoned(id) {
                                 let _ = reply.send(Err(Error::cancelled()));
                                 continue;
                             }
@@ -210,19 +221,13 @@ pub fn connect(
                                 None => task.spawn_auxiliary(frame),
                             }
                         }
-                        Command::Abort { id } => match inflight.remove(&id) {
-                            Some(handle) => {
+                        Command::Abort { id } => {
+                            if let Some(handle) = inflight.remove(&id) {
                                 // Stops Gritt reading the body. The server may
                                 // still finish; nothing is retried.
                                 handle.abort();
                             }
-                            None => {
-                                abandoned.push_back(id);
-                                while abandoned.len() > MAX_ABANDONED_IDS {
-                                    abandoned.pop_front();
-                                }
-                            }
-                        },
+                        }
                         Command::Shutdown { .. } => break,
                     }
                 }
@@ -403,8 +408,15 @@ fn route(endpoint: &Arc<Endpoint>, value: Value, expect: u64) -> Option<Result<V
 /// Kept apart from the read loop so the limits can be exercised directly at
 /// sizes a test can produce.
 struct SseBudget {
+    /// Bytes since the last event terminator: what the parser is still
+    /// holding for an event that has not ended.
     pending: usize,
     total: usize,
+    /// Consecutive line terminators seen so far, carried across chunk
+    /// boundaries. Without this a `\n\n` split between two chunks would
+    /// never be recognized and `pending` would grow for ever on a perfectly
+    /// valid stream.
+    newlines: usize,
     max_event: usize,
     max_stream: usize,
 }
@@ -414,6 +426,7 @@ impl SseBudget {
         Self {
             pending: 0,
             total: 0,
+            newlines: 0,
             max_event,
             max_stream,
         }
@@ -421,42 +434,41 @@ impl SseBudget {
 
     /// Accounts for one chunk before it is parsed, refusing it when either
     /// bound would be crossed.
+    ///
+    /// Framing is tracked byte by byte and across chunks, the way the parser
+    /// itself sees the stream, so a chunk carrying many complete events
+    /// leaves only its trailing fragment outstanding rather than counting as
+    /// one enormous event.
     fn admit(&mut self, chunk: &[u8]) -> Result<()> {
         self.total += chunk.len();
         if self.total > self.max_stream {
             return Err(Error::config("the MCP stream exceeded its size limit"));
         }
-        if self.pending + chunk.len() > self.max_event {
-            return Err(Error::config("the MCP stream sent an oversized event"));
+        for byte in chunk {
+            match byte {
+                // Transparent to the run, so `\r\n\r\n` ends an event just
+                // as `\n\n` does.
+                b'\r' => self.pending += 1,
+                b'\n' => {
+                    self.newlines += 1;
+                    if self.newlines >= 2 {
+                        // A blank line ends the event; nothing is outstanding.
+                        self.pending = 0;
+                        self.newlines = 0;
+                    } else {
+                        self.pending += 1;
+                    }
+                }
+                _ => {
+                    self.newlines = 0;
+                    self.pending += 1;
+                }
+            }
+            if self.pending > self.max_event {
+                return Err(Error::config("the MCP stream sent an oversized event"));
+            }
         }
-        // What the parser still holds is whatever followed the last
-        // terminator in this chunk. Resetting to zero because some event
-        // completed would forget a trailing fragment and let it grow
-        // unbounded.
-        self.pending = trailing_bytes(chunk, self.pending);
         Ok(())
-    }
-}
-
-/// Bytes after the last SSE event terminator in `chunk`, carrying `pending`
-/// forward when the chunk contains no terminator at all.
-///
-/// An event ends at a blank line, so the terminator is `\n\n` or `\r\n\r\n`.
-/// Everything after the last one is still being accumulated by the parser.
-fn trailing_bytes(chunk: &[u8], pending: usize) -> usize {
-    let mut boundary: Option<usize> = None;
-    for index in 0..chunk.len() {
-        let after_lf = index + 2 <= chunk.len() && &chunk[index..index + 2] == b"\n\n";
-        let after_crlf = index + 4 <= chunk.len() && &chunk[index..index + 4] == b"\r\n\r\n";
-        if after_crlf {
-            boundary = Some(index + 4);
-        } else if after_lf {
-            boundary = Some(index + 2);
-        }
-    }
-    match boundary {
-        Some(end) => chunk.len() - end,
-        None => pending + chunk.len(),
     }
 }
 
@@ -476,17 +488,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trailing_bytes_tracks_what_the_parser_still_holds() {
-        // No terminator: everything accumulates on top of what came before.
-        assert_eq!(trailing_bytes(b"data: abc", 10), 19);
-        // A terminator resets to whatever followed it, not to zero.
-        assert_eq!(trailing_bytes(b"data: a\n\ndata: b", 100), 7);
-        // CRLF framing is the same rule.
-        assert_eq!(trailing_bytes(b"data: a\r\n\r\nxy", 100), 2);
-        // A chunk that ends exactly on a boundary leaves nothing pending.
-        assert_eq!(trailing_bytes(b"data: a\n\n", 100), 0);
-        // The last terminator wins, not the first.
-        assert_eq!(trailing_bytes(b"a\n\nbb\n\nccc", 0), 3);
+    fn a_delimiter_split_across_chunks_still_ends_the_event() {
+        // The blank line arrives in two pieces, which is what a socket does.
+        let mut budget = SseBudget::new(16, 1024);
+        budget.admit(b"data: a\n").unwrap();
+        budget.admit(b"\ndata: b").unwrap();
+        // Only `data: b` is outstanding; the first event was closed across
+        // the boundary.
+        assert_eq!(budget.pending, 7);
+        // CRLF framing split the same way.
+        let mut budget = SseBudget::new(16, 1024);
+        budget.admit(b"data: a\r\n").unwrap();
+        budget.admit(b"\r\nxy").unwrap();
+        assert_eq!(budget.pending, 2);
+    }
+
+    #[test]
+    fn many_small_events_are_fine_however_they_are_chunked() {
+        // Far more bytes in total than one event may hold, all of it valid,
+        // arriving as one chunk and then byte by byte.
+        let mut budget = SseBudget::new(16, 1024 * 1024);
+        let burst: Vec<u8> = std::iter::repeat_n(b"data: a\n\n".as_slice(), 50)
+            .flatten()
+            .copied()
+            .collect();
+        budget.admit(&burst).unwrap();
+        assert_eq!(budget.pending, 0);
+        for byte in &burst {
+            budget.admit(&[*byte]).unwrap();
+        }
+        assert_eq!(budget.pending, 0);
     }
 
     #[test]

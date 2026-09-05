@@ -15,7 +15,7 @@
 //! newline must not be able to exhaust Gritt and take the healthy servers
 //! down with it.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
@@ -45,11 +45,6 @@ const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
 /// Most requests that may be outstanding at once. A server that never
 /// answers cannot make the pending map grow without limit.
 const MAX_PENDING_REQUESTS: usize = 256;
-
-/// How many abandoned request ids are remembered, so a request whose abort
-/// overtook it is dropped rather than written. Bounded because the ids only
-/// need to survive the gap between the two commands.
-const MAX_ABANDONED_IDS: usize = 1024;
 
 /// How long one write may take before the connection is treated as wedged.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -229,8 +224,6 @@ pub fn launch(
     let task_stderr = Arc::clone(&stderr);
     tokio::spawn(async move {
         let mut pending: HashMap<u64, oneshot::Sender<Result<Value>>> = HashMap::new();
-        // Ids whose caller gave up before the request reached this task.
-        let mut abandoned: VecDeque<u64> = VecDeque::new();
         let mut stop: Option<oneshot::Sender<()>> = None;
         loop {
             tokio::select! {
@@ -238,12 +231,11 @@ pub fn launch(
                     let Some(command) = command else { break };
                     match command {
                         Command::Request { id, method, params, reply } => {
-                            // The caller stopped waiting before this was
-                            // admitted, so it must never reach the server.
-                            if let Some(index) =
-                                abandoned.iter().position(|known| *known == id)
-                            {
-                                abandoned.remove(index);
+                            // Checked here, immediately before the write, so
+                            // a caller that gave up while this sat in the
+                            // queue is honoured no matter what order the
+                            // commands arrived in.
+                            if task_flags.take_abandoned(id) {
                                 let _ = reply.send(Err(Error::cancelled()));
                                 continue;
                             }
@@ -277,16 +269,11 @@ pub fn launch(
                         }
                         // The caller stopped waiting. Dropping the entry is
                         // what keeps the map bounded; a late response then
-                        // has nowhere to go and is discarded. An abort that
-                        // overtakes its own request is remembered, so the
-                        // request is dropped when it arrives.
+                        // has nowhere to go and is discarded. A request that
+                        // has not been written yet is stopped by the flag the
+                        // caller set, checked above.
                         Command::Abort { id } => {
-                            if pending.remove(&id).is_none() {
-                                abandoned.push_back(id);
-                                while abandoned.len() > MAX_ABANDONED_IDS {
-                                    abandoned.pop_front();
-                                }
-                            }
+                            pending.remove(&id);
                         }
                         Command::Shutdown { reply } => { stop = Some(reply); break; }
                     }

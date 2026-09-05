@@ -10,6 +10,7 @@
 //! shutdown, so every queue operation has a deadline and shutdown is
 //! signalled out of band rather than through the queue alone.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +36,11 @@ pub const HARD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 /// rather than the full queue one: cancellation should not be delayed by the
 /// bookkeeping that follows it.
 const GIVE_UP_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// How many abandoned request ids are remembered. They only need to outlive
+/// the gap between a caller giving up and the transport reaching that
+/// request, so a small ring is enough.
+const MAX_ABANDONED_IDS: usize = 1024;
 
 /// What the handle asks the transport task to do.
 pub(super) enum Command {
@@ -79,6 +85,14 @@ pub struct ConnectionFlags {
     pub done: AtomicBool,
     /// Wakes whoever is waiting for that.
     pub finished: Notify,
+    /// Requests whose caller has given up.
+    ///
+    /// Marked here rather than through the queue because the abort would
+    /// otherwise sit *behind* the request it cancels: a writer that resumes
+    /// after being blocked would send the request first and only then read
+    /// the cancellation. The transport consults this immediately before
+    /// writing, so queue order cannot matter.
+    pub abandoned: std::sync::Mutex<VecDeque<u64>>,
 }
 
 impl ConnectionFlags {
@@ -93,6 +107,28 @@ impl ConnectionFlags {
             return;
         }
         self.stop.notified().await;
+    }
+
+    /// Records that nobody is waiting for `id` any more.
+    pub fn abandon(&self, id: u64) {
+        let mut abandoned = self.abandoned.lock().expect("mcp abandoned");
+        abandoned.push_back(id);
+        while abandoned.len() > MAX_ABANDONED_IDS {
+            abandoned.pop_front();
+        }
+    }
+
+    /// True when the caller for `id` has already given up. Consumed, because
+    /// one request is only written once.
+    pub fn take_abandoned(&self, id: u64) -> bool {
+        let mut abandoned = self.abandoned.lock().expect("mcp abandoned");
+        match abandoned.iter().position(|known| *known == id) {
+            Some(index) => {
+                abandoned.remove(index);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Marks the transport's resources released and wakes the waiters.
@@ -236,7 +272,7 @@ impl Connection {
                 self.give_up(id, "the client deadline expired", announce).await;
                 Err(Error::new(
                     ErrorKind::Config,
-                    format!("`{method}` did not answer within {}s", deadline.as_secs()),
+                    format!("`{method}` did not answer within {}", human(deadline)),
                 ))
             }
             reply = rx => reply.unwrap_or_else(|_| Err(closed())),
@@ -303,9 +339,10 @@ impl Connection {
     /// Stops waiting for `id`: optionally tells the server, and always tells
     /// the local transport to release the work.
     async fn give_up(&self, id: u64, reason: &str, announce: bool) {
-        // The abort goes first: stopping the local work matters more than
-        // telling the server, and it is what keeps an abandoned request from
-        // being written after the caller has gone.
+        // Marked before anything is queued. The abort command that follows
+        // can only arrive behind the request it cancels, so the flag, not the
+        // queue, is what stops the write.
+        self.flags.abandon(id);
         let _ = self
             .enqueue_within(Command::Abort { id }, GIVE_UP_TIMEOUT)
             .await;
@@ -344,6 +381,17 @@ impl Connection {
         let (reply, _rx) = oneshot::channel();
         let _ = self.commands.try_send(Command::Shutdown { reply });
         let _ = tokio::time::timeout(HARD_SHUTDOWN_TIMEOUT, self.flags.wait_finished()).await;
+    }
+}
+
+/// A deadline as a person would write it. `Duration::as_secs` renders
+/// anything under a second as `0s`, which reads like a bug in an error
+/// message.
+pub(super) fn human(deadline: Duration) -> String {
+    if deadline < Duration::from_secs(1) {
+        format!("{}ms", deadline.as_millis())
+    } else {
+        format!("{}s", deadline.as_secs())
     }
 }
 
