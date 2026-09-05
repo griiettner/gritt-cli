@@ -3,10 +3,10 @@ id: TKT-0019
 namespace: griiettner
 title: Integrate conversation sidebar, sessions, MCP status, and responsive runtime
 artifact: task
-status: planning
+status: done
 owner: griiettner
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-05
 chain_role: worker
 chain_parent: TKT-0015
 dependencies:
