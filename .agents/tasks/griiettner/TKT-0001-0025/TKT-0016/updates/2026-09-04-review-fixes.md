@@ -76,6 +76,38 @@ limited to the two regression tests through `fixture_plane_with`.
   `ticket chain-check --ticket TKT-0016 --base main`: see the commit
   message and PR thread for the run on the final tree
 
+## Second round: deprecation regression
+
+Trigger: the re-review found that `resolve_under_profile` returned a
+deprecated catalog id unchanged when the provider declared no
+replacement, skipping the configured-alias-or-reject step that
+`alias::resolve` applied. A draft could persist and send a deprecated id.
+
+Change: the deprecation policy moved out of `alias::resolve` into a
+public `alias::apply_deprecation(config, catalog, profile, model)` in
+`crates/gritt-provider/src/alias.rs`; `resolve` calls it after name
+resolution and `resolve_under_profile` calls it on an exact catalog hit.
+Catalog-id-before-alias precedence is unchanged. A deprecated id remaps
+to the provider-declared replacement, then to a configured profile alias
+or global alias into the same profile, and is otherwise rejected as
+`DraftError::ModelResolution` with the resolver's message. On resume, a
+deprecated name whose replacement is the stored model resumes; one with
+no replacement cannot match the pin and is `SessionPinned`.
+
+Tests: `deprecated_catalog_ids_are_remapped_or_rejected_on_creation_and_resume`
+(provider replacement, configured alias replacement, no replacement
+rejected with nothing created, stored session carries the replacement,
+resume with a remapped name, resume with an unreplaceable name) and the
+optional `resume_resolves_against_the_catalog_it_just_warmed` (cold
+in-memory catalog, fresh disk cache holding the deprecation, resume
+remaps through the list that `validate_resume` warmed).
+
+Validation on the final tree: `cargo fmt --all --check` pass,
+`cargo clippy --workspace --all-targets -- -D warnings` pass,
+`cargo test --workspace` pass with `session_draft` at 12 and every other
+count unchanged; `ticket sync`, `ticket validate`, and `ticket
+chain-check --ticket TKT-0016 --base main` pass with no warnings.
+
 ## Remaining follow-up
 
 None new. The report's follow-up list still stands (ADR-007 update,

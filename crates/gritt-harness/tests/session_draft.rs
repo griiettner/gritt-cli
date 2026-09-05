@@ -123,6 +123,19 @@ async fn fixture_plane_with(
     }
 }
 
+fn model_info(id: &str, reasoning: Option<bool>) -> ModelInfo {
+    ModelInfo {
+        id: id.into(),
+        display_name: None,
+        capabilities: ModelCapabilities {
+            reasoning,
+            ..Default::default()
+        },
+        replaced_by: None,
+        deprecated: false,
+    }
+}
+
 /// Puts a fresh list for `profile` in the catalog with one reasoning
 /// model.
 fn seed_catalog(plane: &ControlPlane, profile: &str, model: &str, reasoning: Option<bool>) {
@@ -131,17 +144,53 @@ fn seed_catalog(plane: &ControlPlane, profile: &str, model: &str, reasoning: Opt
         status: ModelListStatus::Fresh {
             fetched_at: Utc::now(),
         },
-        models: vec![ModelInfo {
-            id: model.into(),
-            display_name: None,
-            capabilities: ModelCapabilities {
-                reasoning,
-                ..Default::default()
-            },
-            replaced_by: None,
-            deprecated: false,
-        }],
+        models: vec![model_info(model, reasoning)],
     });
+}
+
+/// A catalog with a current model, a deprecated one the provider
+/// replaces, one only a configured alias replaces, and one nobody does.
+fn deprecation_models() -> Vec<ModelInfo> {
+    vec![
+        model_info("openai/gpt-5-nano", Some(true)),
+        ModelInfo {
+            deprecated: true,
+            replaced_by: Some("openai/gpt-5-nano".into()),
+            ..model_info("openai/gpt-4-nano", None)
+        },
+        ModelInfo {
+            deprecated: true,
+            ..model_info("openai/gpt-3-nano", None)
+        },
+        ModelInfo {
+            deprecated: true,
+            ..model_info("openai/gpt-2-nano", None)
+        },
+    ]
+}
+
+fn native_session(
+    id: &str,
+    name: &str,
+    profile: &str,
+    model: &str,
+    workspace: &std::path::Path,
+) -> Session {
+    let now = Utc::now();
+    Session {
+        id: SessionId(id.into()),
+        name: name.into(),
+        kind: SessionKind::Native {
+            provider_profile: profile.into(),
+            model: model.into(),
+            effort: ReasoningEffort::Auto,
+        },
+        phase: Phase::Planning,
+        workspace: workspace.to_path_buf(),
+        created_at: now,
+        updated_at: now,
+        parent_id: None,
+    }
 }
 
 #[derive(Default)]
@@ -822,4 +871,151 @@ async fn a_removed_profile_rejects_resume_without_touching_the_session() {
         .unwrap()
         .is_empty());
     assert_eq!(fx.plane.builder.store.list().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn deprecated_catalog_ids_are_remapped_or_rejected_on_creation_and_resume() {
+    let mut config = config_with_openai_profile();
+    config
+        .profiles
+        .get_mut("openrouter")
+        .unwrap()
+        .aliases
+        .insert("openai/gpt-3-nano".into(), "openai/gpt-5-nano".into());
+    let fx = fixture_plane_with(config, vec![], None).await;
+    fx.plane.builder.catalog.insert(ModelList {
+        profile: "openrouter".into(),
+        status: ModelListStatus::Fresh {
+            fetched_at: Utc::now(),
+        },
+        models: deprecation_models(),
+    });
+    let draft = |model: &str| {
+        SessionDraft::default()
+            .with_profile("openrouter")
+            .with_model(model)
+    };
+
+    // Creation: provider-declared replacement, then configured alias.
+    for old in ["openai/gpt-4-nano", "openai/gpt-3-nano"] {
+        let (resolved, _, warnings) = ready(fx.plane.validate_draft(&draft(old)).await.unwrap());
+        assert_eq!(resolved.profile, "openrouter");
+        assert_eq!(resolved.model, "openai/gpt-5-nano", "{old}");
+        assert_eq!(
+            warnings,
+            vec![DraftWarning::DeprecatedModelRemapped {
+                from: old.into(),
+                to: "openai/gpt-5-nano".into(),
+            }]
+        );
+    }
+    // Creation: no replacement anywhere is a typed rejection, and nothing
+    // is created.
+    let outcome = fx
+        .plane
+        .validate_draft(&draft("openai/gpt-2-nano"))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome.errors(),
+            [DraftError::ModelResolution { model, message }]
+                if model == "openai/gpt-2-nano" && message.contains("deprecated")
+        ),
+        "{outcome:?}"
+    );
+    assert!(matches!(
+        fx.plane
+            .open_draft(draft("openai/gpt-2-nano").with_name("dead"))
+            .await
+            .unwrap(),
+        DraftOpen::Rejected { .. }
+    ));
+    assert!(fx.plane.builder.store.list().await.unwrap().is_empty());
+    // The stored session carries the replacement, never the deprecated id.
+    let DraftOpen::Opened { driver, .. } = fx
+        .plane
+        .open_draft(draft("openai/gpt-4-nano").with_name("remapped"))
+        .await
+        .unwrap()
+    else {
+        panic!("expected open");
+    };
+    assert!(matches!(
+        &driver.session().kind,
+        SessionKind::Native { model, .. } if model == "openai/gpt-5-nano"
+    ));
+    let id = driver.session().id.clone();
+    drop(driver);
+
+    // Resume: a deprecated name whose replacement is the stored model
+    // resumes; one with no replacement cannot match the pin.
+    let (resolved, _, _) = ready(
+        fx.plane
+            .validate_draft(&draft("openai/gpt-4-nano").with_name("remapped"))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(resolved.resume, Some(id.clone()));
+    assert_eq!(resolved.model, "openai/gpt-5-nano");
+    let outcome = fx
+        .plane
+        .validate_draft(&draft("openai/gpt-2-nano").with_name("remapped"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome.errors(),
+        [DraftError::SessionPinned { .. }]
+    ));
+    let stored = fx.plane.builder.store.get(&id).await.unwrap().unwrap();
+    assert!(matches!(
+        &stored.kind,
+        SessionKind::Native { model, .. } if model == "openai/gpt-5-nano"
+    ));
+}
+
+#[tokio::test]
+async fn resume_resolves_against_the_catalog_it_just_warmed() {
+    // Nothing is in the in-memory catalog; only the disk cache knows the
+    // deprecation, and it is fresh so no refresh is attempted.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ModelCache::new(dir.path().join("models"));
+    cache
+        .write(
+            "openrouter",
+            &CachedModelList {
+                fetched_at: Some(Utc::now()),
+                last_attempt_at: Some(Utc::now()),
+                models: deprecation_models(),
+            },
+        )
+        .unwrap();
+    let fx = fixture_plane_with(config_with_openai_profile(), vec![], Some(cache)).await;
+    assert!(fx.plane.builder.catalog.list("openrouter").is_none());
+    fx.plane
+        .builder
+        .store
+        .create(native_session(
+            "r1",
+            "cold",
+            "openrouter",
+            "openai/gpt-5-nano",
+            fx.dir.path(),
+        ))
+        .await
+        .unwrap();
+    let (resolved, catalog, _) = ready(
+        fx.plane
+            .validate_draft(
+                &SessionDraft::default()
+                    .with_name("cold")
+                    .with_model("openai/gpt-4-nano"),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(resolved.resume, Some(SessionId("r1".into())));
+    assert_eq!(resolved.model, "openai/gpt-5-nano");
+    assert!(matches!(catalog, CatalogState::Fresh { .. }));
+    assert!(fx.plane.builder.catalog.list("openrouter").is_some());
 }

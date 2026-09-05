@@ -81,6 +81,22 @@ pub fn resolve(
     profile_hint: Option<&str>,
 ) -> Result<ModelRef> {
     let (profile, model) = resolve_name(config, name, profile_hint)?;
+    apply_deprecation(config, catalog, profile, model)
+}
+
+/// Applies the deprecation policy to an already resolved profile and
+/// model id: a model the catalog does not list or does not deprecate is
+/// returned as is; a deprecated one remaps to the provider-declared
+/// replacement, then to a configured alias on the profile or a global
+/// alias into the same profile, else it is refused. Callers that take a
+/// catalog id ahead of alias resolution use this so a deprecated id can
+/// never be stored or sent unchanged.
+pub fn apply_deprecation(
+    config: &Config,
+    catalog: &ModelCatalog,
+    profile: String,
+    model: String,
+) -> Result<ModelRef> {
     let Some(info) = catalog.model(&profile, &model) else {
         return Ok(ModelRef {
             profile,

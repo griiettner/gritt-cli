@@ -332,29 +332,17 @@ impl ControlPlane {
     /// profile's catalog lists is taken as that model before any alias or
     /// `profile/model` reading, because catalog ids such as OpenRouter's
     /// `openai/gpt-5-nano` share the qualified-name shape whenever a
-    /// profile of the same name is configured. Anything else goes through
-    /// alias and deprecation resolution with the profile as the hint.
+    /// profile of the same name is configured. The deprecation policy
+    /// still applies to it: a declared or configured replacement is used
+    /// and a deprecated id with neither is refused. Anything else goes
+    /// through alias resolution with the profile as the hint.
     fn resolve_under_profile(&self, profile: &str, name: &str) -> Result<alias::ModelRef> {
-        if let Some(info) = self.builder.catalog.model(profile, name) {
-            return Ok(match (info.deprecated, info.replaced_by) {
-                (true, Some(replacement)) => alias::ModelRef {
-                    profile: profile.to_owned(),
-                    model: replacement,
-                    remapped_from: Some(name.to_owned()),
-                },
-                _ => alias::ModelRef {
-                    profile: profile.to_owned(),
-                    model: name.to_owned(),
-                    remapped_from: None,
-                },
-            });
+        let config = &self.builder.config;
+        let catalog = &self.builder.catalog;
+        if catalog.model(profile, name).is_some() {
+            return alias::apply_deprecation(config, catalog, profile.to_owned(), name.to_owned());
         }
-        alias::resolve(
-            &self.builder.config,
-            &self.builder.catalog,
-            name,
-            Some(profile),
-        )
+        alias::resolve(config, catalog, name, Some(profile))
     }
 
     /// The same rule the adapter applies before a request.

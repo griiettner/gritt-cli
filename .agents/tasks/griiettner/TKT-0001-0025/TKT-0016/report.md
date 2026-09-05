@@ -281,4 +281,6 @@ user directory outcomes, failing keychain outcome without the value.
 - [2026-09-04 review fixes](updates/2026-09-04-review-fixes.md): catalog
   ids with a profile-name prefix stay in the selected profile, a removed
   stored profile is a typed rejection, resume warms the catalog before
-  resolution, and old-continuation tests cover every protocol.
+  resolution, old-continuation tests cover every protocol, and (second
+  round) deprecated catalog ids are remapped or rejected through the
+  shared `alias::apply_deprecation`.
