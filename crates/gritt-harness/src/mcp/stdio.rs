@@ -15,7 +15,7 @@
 //! newline must not be able to exhaust Gritt and take the healthy servers
 //! down with it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
@@ -45,6 +45,11 @@ const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
 /// Most requests that may be outstanding at once. A server that never
 /// answers cannot make the pending map grow without limit.
 const MAX_PENDING_REQUESTS: usize = 256;
+
+/// How many abandoned request ids are remembered, so a request whose abort
+/// overtook it is dropped rather than written. Bounded because the ids only
+/// need to survive the gap between the two commands.
+const MAX_ABANDONED_IDS: usize = 1024;
 
 /// How long one write may take before the connection is treated as wedged.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -224,6 +229,8 @@ pub fn launch(
     let task_stderr = Arc::clone(&stderr);
     tokio::spawn(async move {
         let mut pending: HashMap<u64, oneshot::Sender<Result<Value>>> = HashMap::new();
+        // Ids whose caller gave up before the request reached this task.
+        let mut abandoned: VecDeque<u64> = VecDeque::new();
         let mut stop: Option<oneshot::Sender<()>> = None;
         loop {
             tokio::select! {
@@ -231,6 +238,15 @@ pub fn launch(
                     let Some(command) = command else { break };
                     match command {
                         Command::Request { id, method, params, reply } => {
+                            // The caller stopped waiting before this was
+                            // admitted, so it must never reach the server.
+                            if let Some(index) =
+                                abandoned.iter().position(|known| *known == id)
+                            {
+                                abandoned.remove(index);
+                                let _ = reply.send(Err(Error::cancelled()));
+                                continue;
+                            }
                             if pending.len() >= MAX_PENDING_REQUESTS {
                                 let _ = reply.send(Err(Error::config(
                                     "too many MCP requests are already waiting for this server",
@@ -261,8 +277,17 @@ pub fn launch(
                         }
                         // The caller stopped waiting. Dropping the entry is
                         // what keeps the map bounded; a late response then
-                        // has nowhere to go and is discarded.
-                        Command::Abort { id } => { pending.remove(&id); }
+                        // has nowhere to go and is discarded. An abort that
+                        // overtakes its own request is remembered, so the
+                        // request is dropped when it arrives.
+                        Command::Abort { id } => {
+                            if pending.remove(&id).is_none() {
+                                abandoned.push_back(id);
+                                while abandoned.len() > MAX_ABANDONED_IDS {
+                                    abandoned.pop_front();
+                                }
+                            }
+                        }
                         Command::Shutdown { reply } => { stop = Some(reply); break; }
                     }
                 }
@@ -342,6 +367,14 @@ async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
             Some(end) => {
                 raw.extend_from_slice(&available[..=end]);
                 reader.consume(end + 1);
+                // The terminating chunk counts too. Without this check a
+                // line could exceed the limit as long as its last chunk
+                // happened to carry the newline.
+                if raw.len() > limit {
+                    raw.truncate(limit);
+                    *out = String::from_utf8_lossy(&raw).into_owned();
+                    return ReadOutcome::TooLong;
+                }
                 *out = String::from_utf8_lossy(&raw).into_owned();
                 return ReadOutcome::Line;
             }
@@ -567,6 +600,35 @@ mod tests {
         ));
         // Only the bounded prefix was ever held.
         assert!(line.len() <= 1024, "{}", line.len());
+    }
+
+    #[tokio::test]
+    async fn a_line_that_crosses_the_limit_in_its_final_chunk_is_refused() {
+        // The newline arrives in the same chunk that pushes the line past the
+        // limit, which is the case a check placed only on the no-newline
+        // branch would wave through.
+        let mut flood = "y".repeat(2048);
+        flood.push('\n');
+        let mut reader = BufReader::new(flood.as_bytes());
+        let mut line = String::new();
+        assert!(matches!(
+            read_line_bounded(&mut reader, &mut line, 1024).await,
+            ReadOutcome::TooLong
+        ));
+        assert!(line.len() <= 1024, "{}", line.len());
+    }
+
+    #[tokio::test]
+    async fn a_line_exactly_at_the_limit_is_still_a_line() {
+        let mut exact = "z".repeat(1023);
+        exact.push('\n');
+        let mut reader = BufReader::new(exact.as_bytes());
+        let mut line = String::new();
+        assert!(matches!(
+            read_line_bounded(&mut reader, &mut line, 1024).await,
+            ReadOutcome::Line
+        ));
+        assert_eq!(line.len(), 1024);
     }
 
     #[tokio::test]

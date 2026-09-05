@@ -30,6 +30,12 @@ pub const QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 /// resources. Only a panicked task should ever reach it.
 pub const HARD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Giving up on a request must itself be prompt. Telling the server and
+/// telling the transport are both best effort, so they get a short deadline
+/// rather than the full queue one: cancellation should not be delayed by the
+/// bookkeeping that follows it.
+const GIVE_UP_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// What the handle asks the transport task to do.
 pub(super) enum Command {
     Request {
@@ -194,7 +200,32 @@ impl Connection {
         cancel: &CancellationToken,
         announce: bool,
     ) -> Result<Value> {
-        let (id, rx) = self.dispatch(method, params).await?;
+        // Already cancelled: nothing is sent at all.
+        if cancel.is_cancelled() {
+            return Err(Error::cancelled());
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
+        let (reply, rx) = oneshot::channel();
+        // Waiting for queue capacity is itself cancellable. Without this a
+        // cancelled request could sit in the admission wait and then still be
+        // written to the server.
+        let admitted = self.enqueue(Command::Request {
+            id,
+            method: method.to_owned(),
+            params,
+            reply,
+        });
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                // The command may or may not have reached the queue. The
+                // abort covers both: an id that never arrived is recorded as
+                // abandoned, and one that did is dropped before it is sent.
+                self.give_up(id, "the user cancelled the turn", announce).await;
+                return Err(Error::cancelled());
+            }
+            outcome = admitted => outcome?,
+        }
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -212,27 +243,14 @@ impl Connection {
         }
     }
 
-    async fn dispatch(
-        &self,
-        method: &str,
-        params: Value,
-    ) -> Result<(u64, oneshot::Receiver<Result<Value>>)> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
-        let (reply, rx) = oneshot::channel();
-        self.enqueue(Command::Request {
-            id,
-            method: method.to_owned(),
-            params,
-            reply,
-        })
-        .await?;
-        Ok((id, rx))
-    }
-
     /// Hands one command to the transport task without waiting forever. A
     /// full queue past the deadline means the task cannot make progress.
     async fn enqueue(&self, command: Command) -> Result<()> {
-        match self.commands.send_timeout(command, QUEUE_TIMEOUT).await {
+        self.enqueue_within(command, QUEUE_TIMEOUT).await
+    }
+
+    async fn enqueue_within(&self, command: Command, deadline: Duration) -> Result<()> {
+        match self.commands.send_timeout(command, deadline).await {
             Ok(()) => Ok(()),
             Err(mpsc::error::SendTimeoutError::Timeout(_)) => Err(Error::new(
                 ErrorKind::Config,
@@ -285,13 +303,27 @@ impl Connection {
     /// Stops waiting for `id`: optionally tells the server, and always tells
     /// the local transport to release the work.
     async fn give_up(&self, id: u64, reason: &str, announce: bool) {
+        // The abort goes first: stopping the local work matters more than
+        // telling the server, and it is what keeps an abandoned request from
+        // being written after the caller has gone.
+        let _ = self
+            .enqueue_within(Command::Abort { id }, GIVE_UP_TIMEOUT)
+            .await;
         if announce {
             let params = jsonrpc::cancellation_params(id, reason);
             // Best effort: a server that already answered ignores it, and a
             // connection that has gone needs nothing.
-            let _ = self.notify(jsonrpc::method::CANCELLED, params).await;
+            let _ = self
+                .enqueue_within(
+                    Command::Notify {
+                        method: jsonrpc::method::CANCELLED.to_owned(),
+                        params,
+                        ack: None,
+                    },
+                    GIVE_UP_TIMEOUT,
+                )
+                .await;
         }
-        let _ = self.enqueue(Command::Abort { id }).await;
     }
 
     /// Ends the connection and waits for the transport task to finish
