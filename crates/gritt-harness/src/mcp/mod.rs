@@ -30,6 +30,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use gritt_core::mcp::{
@@ -54,6 +55,11 @@ pub use self::registry::{dispatch_name, is_dispatch_name, RegisteredTool};
 
 /// The file every workspace is read from. Gritt never writes it.
 pub const CONFIG_FILE: &str = ".mcp.json";
+
+/// How long shutdown waits for in-flight initializations to release their
+/// connections after they have been closed. Only a future that never returns
+/// should reach it.
+const LAUNCH_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One tool exactly as a turn was authorized to call it.
 ///
@@ -109,6 +115,14 @@ struct ServerRuntime {
     /// carries the value it started with and is refused if it no longer
     /// matches.
     generation: u64,
+    /// The credentials this entry's *running* connection was launched with.
+    ///
+    /// Not the ones the current file names. A reload that only rotates
+    /// `${TOKEN}` leaves the raw definition, and therefore the fingerprint,
+    /// unchanged, so the process keeps running with the old value; redacting
+    /// against the new one would let the old one through. These retire with
+    /// the connection.
+    secrets: Vec<Secret>,
 }
 
 impl ServerRuntime {
@@ -121,9 +135,14 @@ impl ServerRuntime {
 struct RuntimeState {
     servers: BTreeMap<String, ServerRuntime>,
     registry: ToolRegistry,
-    /// Every credential value the configured servers were given, redacted
-    /// out of anything a server produces.
-    secrets: Vec<Secret>,
+    /// Connections that exist but are not installed against an entry yet,
+    /// because their handshake is still running. Shutdown has to see these:
+    /// a child launched by an in-flight initialization is just as real as an
+    /// installed one.
+    launching: HashMap<u64, Arc<Connection>>,
+    /// Set once shutdown has begun, so a launch that starts afterwards is
+    /// closed instead of installed.
+    closing: bool,
 }
 
 pub struct McpRuntime {
@@ -133,6 +152,7 @@ pub struct McpRuntime {
     trust: Arc<dyn TrustStore>,
     state: Mutex<RuntimeState>,
     generations: AtomicU64,
+    launches: AtomicU64,
 }
 
 impl McpRuntime {
@@ -146,6 +166,7 @@ impl McpRuntime {
             trust: MemoryTrustStore::new(),
             state: Mutex::new(RuntimeState::default()),
             generations: AtomicU64::new(1),
+            launches: AtomicU64::new(1),
         }
     }
 
@@ -223,9 +244,6 @@ impl McpRuntime {
         let mut retired = Vec::new();
         {
             let mut state = self.state.lock().await;
-            // Every credential the current file hands to any server, so a
-            // server echoing its own token is redacted wherever it lands.
-            state.secrets = configured_secrets(config);
             let mut next: BTreeMap<String, ServerRuntime> = BTreeMap::new();
             for entry in &config.entries {
                 let name = entry.name().to_owned();
@@ -257,6 +275,7 @@ impl McpRuntime {
                                 protocol_version: None,
                                 server_version: None,
                                 generation: self.next_generation(),
+                                secrets: Vec::new(),
                             },
                         );
                     }
@@ -294,6 +313,11 @@ impl McpRuntime {
                                 protocol_version: None,
                                 server_version: None,
                                 generation: self.next_generation(),
+                                // A connection is only installed with the
+                                // credentials it was launched with; this is
+                                // the value for the launch that has not
+                                // happened yet.
+                                secrets: entry_secrets(server),
                             },
                         );
                     }
@@ -326,7 +350,7 @@ impl McpRuntime {
     /// connection is closed, so a denial revokes live access rather than only
     /// preventing the next launch.
     pub async fn decide(&self, server: &str, decision: TrustDecision) -> Result<()> {
-        let fingerprint = {
+        let (fingerprint, observed) = {
             let state = self.state.lock().await;
             let entry = state.servers.get(server).ok_or_else(|| {
                 Error::config(format!("`{server}` is not a configured MCP server"))
@@ -337,7 +361,7 @@ impl McpRuntime {
                     entry.state.reason()
                 )));
             }
-            entry.fingerprint.clone()
+            (entry.fingerprint.clone(), entry.generation)
         };
         self.trust
             .record(TrustRecord {
@@ -355,8 +379,10 @@ impl McpRuntime {
             };
             // The definition may have been replaced while the decision was
             // being persisted. Applying it to a different definition would
-            // approve something the user never saw.
-            if entry.fingerprint != fingerprint {
+            // approve something the user never saw. The generation covers
+            // what the fingerprint cannot: a concurrent denial, stop, or
+            // restart keeps the same raw definition.
+            if entry.fingerprint != fingerprint || entry.generation != observed {
                 return Err(Error::config(format!(
                     "`{server}` changed while the decision was recorded; review it again"
                 )));
@@ -431,12 +457,15 @@ impl McpRuntime {
                     }
                     continue;
                 }
-                let secrets = state.secrets.clone();
                 let Some(entry) = state.servers.get_mut(&name) else {
                     continue;
                 };
+                // The credentials this launch actually used, which stay with
+                // the connection until it retires.
+                let secrets = established_secrets(entry);
                 match outcome {
                     Ok(established) => {
+                        entry.secrets = secrets.clone();
                         entry.state = McpServerState::Ready;
                         entry.connection = Some(established.connection);
                         entry.pid = established.pid;
@@ -476,7 +505,7 @@ impl McpRuntime {
     /// be trusted, so an entry that is awaiting approval or denied is put back
     /// into that state instead of being launched.
     pub async fn restart(&self, server: &str, cancel: &CancellationToken) -> Result<()> {
-        let fingerprint = {
+        let (fingerprint, observed) = {
             let state = self.state.lock().await;
             let entry = state.servers.get(server).ok_or_else(|| {
                 Error::config(format!("`{server}` is not a configured MCP server"))
@@ -487,8 +516,11 @@ impl McpRuntime {
                     entry.state.reason()
                 )));
             }
-            entry.fingerprint.clone()
+            (entry.fingerprint.clone(), entry.generation)
         };
+        // Reading the decision can take as long as the store needs. A denial
+        // or a stop that lands while it is in flight keeps the fingerprint,
+        // so only the generation can tell that this answer is stale.
         let decision = self
             .trust
             .decision(&self.workspace_key(), server, &fingerprint)
@@ -499,7 +531,7 @@ impl McpRuntime {
             let Some(entry) = state.servers.get_mut(server) else {
                 return Ok(());
             };
-            if entry.fingerprint != fingerprint {
+            if entry.fingerprint != fingerprint || entry.generation != observed {
                 return Err(Error::config(format!(
                     "`{server}` changed while it was being restarted; review it again"
                 )));
@@ -555,6 +587,9 @@ impl McpRuntime {
     pub async fn shutdown(&self) {
         let connections: Vec<Arc<Connection>> = {
             let mut state = self.state.lock().await;
+            // No launch started after this point is installed; it is closed
+            // by whoever started it.
+            state.closing = true;
             let mut connections = Vec::new();
             let mut generations = Vec::new();
             for entry in state.servers.values_mut() {
@@ -575,31 +610,63 @@ impl McpRuntime {
                     entry.generation = generation;
                 }
             }
+            // Children whose handshake never finished. Closing these is what
+            // stops a stalled initialization from outliving the runtime, and
+            // it also unblocks the future waiting on that handshake.
+            connections.extend(state.launching.values().cloned());
             state.registry = ToolRegistry::new();
             connections
         };
         close_all(connections).await;
+        // The launches release themselves once their handshake fails, which
+        // closing the connection above guarantees. Waiting for that is what
+        // makes shutdown mean "every child is gone", not "every installed
+        // child is gone".
+        let deadline = std::time::Instant::now() + LAUNCH_DRAIN_TIMEOUT;
+        loop {
+            let remaining: Vec<Arc<Connection>> = {
+                let state = self.state.lock().await;
+                state.launching.values().cloned().collect()
+            };
+            if remaining.is_empty() || std::time::Instant::now() >= deadline {
+                // Anything still here has already been closed above; the
+                // bound only guards against a future that never returns.
+                break;
+            }
+            close_all(remaining).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Lets a runtime be used again after a shutdown, which the tests need
+    /// and a future reconnect action would too.
+    pub async fn reopen(&self) {
+        self.state.lock().await.closing = false;
     }
 
     /// Applies pending `tools/list_changed` notifications and notices
     /// connections that died. Called between turns, never during one, so the
     /// tool set a model was shown stays stable for that turn.
     pub async fn refresh(&self, cancel: &CancellationToken) -> Vec<McpServerSnapshot> {
-        let candidates: Vec<(String, u64, Arc<Connection>)> = {
+        let candidates: Vec<(String, u64, Arc<Connection>, Vec<Secret>)> = {
             let state = self.state.lock().await;
             state
                 .servers
                 .values()
                 .filter(|entry| entry.state.is_ready())
                 .filter_map(|entry| {
-                    entry
-                        .connection
-                        .clone()
-                        .map(|connection| (entry.name.clone(), entry.generation, connection))
+                    entry.connection.clone().map(|connection| {
+                        (
+                            entry.name.clone(),
+                            entry.generation,
+                            connection,
+                            entry.secrets.clone(),
+                        )
+                    })
                 })
                 .collect()
         };
-        for (name, generation, connection) in candidates {
+        for (name, generation, connection, secrets) in candidates {
             if connection.is_closed() {
                 self.mark_lost(&name, generation, "the server closed the connection")
                     .await;
@@ -608,7 +675,7 @@ impl McpRuntime {
             if !connection.take_tools_changed() {
                 continue;
             }
-            match self.discover(&connection, None, cancel).await {
+            match self.discover(&connection, None, &secrets, cancel).await {
                 Ok(tools) => {
                     let mut state = self.state.lock().await;
                     if state.servers.get(&name).map(|entry| entry.generation) != Some(generation) {
@@ -633,8 +700,8 @@ impl McpRuntime {
         if state.servers.get(server).map(|entry| entry.generation) != Some(generation) {
             return;
         }
-        let secrets = state.secrets.clone();
         if let Some(entry) = state.servers.get_mut(server) {
+            let secrets = entry.secrets.clone();
             entry.connection = None;
             entry.pid = None;
             entry.state = McpServerState::Failed {
@@ -767,7 +834,7 @@ impl McpRuntime {
                     tool.reference.server
                 ))
             })?;
-            (connection, entry.generation, state.secrets.clone())
+            (connection, entry.generation, entry.secrets.clone())
         };
         let params = json!({
             "name": tool.reference.tool,
@@ -861,18 +928,20 @@ impl McpRuntime {
             }
             None => reason,
         };
-        let handshake = match self.handshake(&connection, cancel).await {
+        // From here the connection exists, and with it a child process. It is
+        // registered before the handshake so shutdown can reach it: a
+        // connection that only lives inside this future is just as real as an
+        // installed one, and a stalled handshake would otherwise keep a child
+        // alive past shutdown.
+        let launch = self.launches.fetch_add(1, Ordering::SeqCst);
+        if !self.register_launch(launch, &connection).await {
+            connection.shutdown().await;
+            return Err("the runtime is shutting down".to_owned());
+        }
+        let outcome = self.negotiate(&connection, config, cancel).await;
+        self.finish_launch(launch).await;
+        let handshake = match outcome {
             Ok(handshake) => handshake,
-            Err(error) => {
-                connection.shutdown().await;
-                return Err(tail(error.message));
-            }
-        };
-        let tools = match self
-            .discover(&connection, Some(&handshake.capabilities), cancel)
-            .await
-        {
-            Ok(tools) => tools,
             Err(error) => {
                 connection.shutdown().await;
                 return Err(tail(error.message));
@@ -883,8 +952,50 @@ impl McpRuntime {
             pid,
             protocol_version: handshake.protocol_version,
             server_version: handshake.server_version,
+            tools: handshake.tools,
+        })
+    }
+
+    /// The handshake and the first discovery, as one unit, so the caller can
+    /// bracket them with the launch registration.
+    async fn negotiate(
+        &self,
+        connection: &Connection,
+        config: &McpServerConfig,
+        cancel: &CancellationToken,
+    ) -> Result<Negotiated> {
+        let handshake = self.handshake(connection, cancel).await?;
+        let tools = self
+            .discover(
+                connection,
+                Some(&handshake.capabilities),
+                &entry_secrets(config),
+                cancel,
+            )
+            .await?;
+        Ok(Negotiated {
+            protocol_version: handshake.protocol_version,
+            server_version: handshake.server_version,
             tools,
         })
+    }
+
+    /// Records a connection that exists but is not installed yet. Returns
+    /// false when shutdown has already begun, in which case the caller closes
+    /// it instead.
+    async fn register_launch(&self, launch: u64, connection: &Arc<Connection>) -> bool {
+        let mut state = self.state.lock().await;
+        if state.closing {
+            return false;
+        }
+        state.launching.insert(launch, Arc::clone(connection));
+        true
+    }
+
+    /// Releases a launch. The connection is either installed by `start` or
+    /// closed by the caller from here on.
+    async fn finish_launch(&self, launch: u64) {
+        self.state.lock().await.launching.remove(&launch);
     }
 
     /// `initialize`, version and capability negotiation, then
@@ -959,6 +1070,7 @@ impl McpRuntime {
         &self,
         connection: &Connection,
         capabilities: Option<&Value>,
+        secrets: &[Secret],
         cancel: &CancellationToken,
     ) -> Result<Vec<Value>> {
         if let Some(capabilities) = capabilities {
@@ -966,7 +1078,6 @@ impl McpRuntime {
                 return Ok(Vec::new());
             }
         }
-        let secrets = { self.state.lock().await.secrets.clone() };
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
         let mut seen: Vec<String> = Vec::new();
@@ -983,13 +1094,9 @@ impl McpRuntime {
                     cancel,
                 )
                 .await
-                .map_err(|error| redact_error(error, &secrets))?;
+                .map_err(|error| redact_error(error, secrets))?;
             if let Some(items) = page.get("tools").and_then(Value::as_array) {
-                tools.extend(
-                    items
-                        .iter()
-                        .map(|tool| redact_value(tool.clone(), &secrets)),
-                );
+                tools.extend(items.iter().map(|tool| redact_value(tool.clone(), secrets)));
             }
             let next = page
                 .get("nextCursor")
@@ -1014,38 +1121,38 @@ impl McpRuntime {
     }
 }
 
-/// Every credential value the configured servers are given.
+/// The credential values one server definition is given.
 ///
 /// A server can echo its own token back in an error, its metadata, a schema,
-/// or a tool result, so the runtime has to recognize those values wherever
-/// they surface. The set covers the whole workspace rather than one server:
-/// the cost is a string scan, and the alternative is deciding, per value,
-/// which server it came from.
-fn configured_secrets(config: &McpConfig) -> Vec<Secret> {
-    let mut secrets = Vec::new();
-    for entry in &config.entries {
-        let McpEntry::Server(server) = entry else {
-            continue;
-        };
-        let values: Vec<(&String, &String)> = match &server.transport {
-            McpTransport::Stdio { env, .. } => env.iter().collect(),
-            McpTransport::Http { headers, .. } => headers.iter().collect(),
-        };
-        for (name, value) in values {
-            if value.is_empty() {
-                continue;
-            }
-            let credential = is_secret_env_name(name, &[])
-                || matches!(
-                    name.to_ascii_lowercase().as_str(),
-                    "authorization" | "proxy-authorization" | "cookie" | "x-auth-token"
-                );
-            if credential {
-                secrets.push(Secret::new(value.clone()));
-            }
-        }
-    }
-    secrets
+/// or a tool result, so the runtime has to recognize the values it handed
+/// that server. Keeping this per definition rather than per file is what
+/// makes a rotation safe: the running process still holds the old value.
+fn entry_secrets(server: &McpServerConfig) -> Vec<Secret> {
+    let values: Vec<(&String, &String)> = match &server.transport {
+        McpTransport::Stdio { env, .. } => env.iter().collect(),
+        McpTransport::Http { headers, .. } => headers.iter().collect(),
+    };
+    values
+        .into_iter()
+        .filter(|(name, value)| {
+            !value.is_empty()
+                && (is_secret_env_name(name, &[])
+                    || matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "authorization" | "proxy-authorization" | "cookie" | "x-auth-token"
+                    ))
+        })
+        .map(|(_, value)| Secret::new(value.clone()))
+        .collect()
+}
+
+/// The credentials a freshly installed connection should carry.
+///
+/// `load` already put the current definition's values on the entry, and the
+/// launch used exactly that definition, so this is that value. It exists as
+/// its own function so the rule has one place to live.
+fn established_secrets(entry: &ServerRuntime) -> Vec<Secret> {
+    entry.config.as_ref().map(entry_secrets).unwrap_or_default()
 }
 
 /// Redacts an error's message and diagnostic. Server text reaches errors
@@ -1071,6 +1178,13 @@ struct Handshake {
     protocol_version: String,
     server_version: Option<String>,
     capabilities: Value,
+}
+
+/// A completed handshake plus the first tool listing.
+struct Negotiated {
+    protocol_version: String,
+    server_version: Option<String>,
+    tools: Vec<Value>,
 }
 
 struct Established {
