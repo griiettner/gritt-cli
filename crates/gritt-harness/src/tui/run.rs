@@ -220,23 +220,33 @@ async fn fixture_loop(
     let stop = Arc::new(AtomicBool::new(false));
     let mut keys = spawn_key_reader(Arc::clone(&stop));
     let mut tick = tokio::time::interval(Duration::from_millis(50));
+    let mut dirty = true;
     loop {
-        terminal
-            .draw(|frame| draw(frame, &app))
-            .map_err(|error| Error::config(format!("draw failed: {error}")))?;
+        // Only a wakeup that could have changed the screen draws one. The
+        // tick is not one: nothing in the interface is drawn from a clock,
+        // so a tick with no input behind it would redraw the same frame.
+        if dirty {
+            terminal
+                .draw(|frame| draw(frame, &app))
+                .map_err(|error| Error::config(format!("draw failed: {error}")))?;
+            dirty = false;
+        }
         let action = tokio::select! {
-            Some(event) = keys.recv() => match event {
-                TerminalEvent::Key(key) if key.kind != KeyEventKind::Release => app.on_key(key),
-                TerminalEvent::Paste(text) => {
-                    app.on_paste(&text);
-                    Action::None
+            Some(event) = keys.recv() => {
+                dirty = true;
+                match event {
+                    TerminalEvent::Key(key) if key.kind != KeyEventKind::Release => app.on_key(key),
+                    TerminalEvent::Paste(text) => {
+                        app.on_paste(&text);
+                        Action::None
+                    }
+                    TerminalEvent::Resize(columns, rows) => {
+                        app.on_resize(columns, rows);
+                        Action::None
+                    }
+                    _ => Action::None,
                 }
-                TerminalEvent::Resize(columns, rows) => {
-                    app.on_resize(columns, rows);
-                    Action::None
-                }
-                _ => Action::None,
-            },
+            }
             _ = tick.tick() => Action::None,
         };
         match action {
@@ -606,15 +616,26 @@ async fn event_loop(
     let stop = Arc::new(AtomicBool::new(false));
     let mut keys = spawn_key_reader(Arc::clone(&stop));
     let mut tick = tokio::time::interval(Duration::from_millis(50));
+    // Whether the screen can differ from the last frame drawn. Every wakeup
+    // that carries input or a message from the harness sets it; the tick
+    // does not, because nothing in the interface is drawn from a clock. An
+    // idle session therefore draws nothing at all, which is what the plan's
+    // idle budget asks for (TKT-0020).
+    let mut dirty = true;
     loop {
-        terminal
-            .draw(|frame| draw(frame, &app))
-            .map_err(|error| Error::config(format!("draw failed: {error}")))?;
+        if dirty {
+            terminal
+                .draw(|frame| draw(frame, &app))
+                .map_err(|error| Error::config(format!("draw failed: {error}")))?;
+            dirty = false;
+        }
         let action = tokio::select! {
             Some(msg) = ui_rx.recv() => {
+                dirty = true;
                 on_message(&mut app, &mut runtime, &mut idle_agent, &mut handle, &mut responder, msg).await?
             }
             Some(event) = keys.recv() => {
+                dirty = true;
                 match event {
                     TerminalEvent::Key(key) if key.kind != KeyEventKind::Release => app.on_key(key),
                     TerminalEvent::Paste(text) => {
