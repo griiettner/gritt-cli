@@ -249,6 +249,12 @@ pub const PRESETS: [ProviderPreset; 4] = [
     },
 ];
 
+/// The environment variable Gritt looks for when a profile does not name
+/// one: the profile name, upper-cased, with `_API_KEY` appended.
+pub fn default_env_var(name: &str) -> String {
+    format!("{}_API_KEY", name.to_ascii_uppercase().replace('-', "_"))
+}
+
 /// The protocol a preset of this name speaks, defaulting to the widely
 /// compatible one for a custom endpoint.
 fn preset_protocol(name: &str) -> Protocol {
@@ -322,12 +328,18 @@ impl SetupForm {
         Self {
             name: Composer::from_text(name),
             base_url: Composer::new(),
-            env_var: Composer::from_text(format!(
-                "{}_API_KEY",
-                name.to_ascii_uppercase().replace('-', "_")
-            )),
+            env_var: Composer::from_text(if name.is_empty() {
+                // A custom endpoint has no name yet, so there is no
+                // variable to suggest; `profile_spec` derives one from
+                // whatever name is typed.
+                String::new()
+            } else {
+                default_env_var(name)
+            }),
             secret: Composer::new(),
-            field_index: 1,
+            // A named preset needs only its endpoint and key; a custom
+            // endpoint starts at the name.
+            field_index: usize::from(!name.is_empty()),
             destination: ConfigDestination::User,
             protocol: preset_protocol(name),
             outcome: None,
@@ -385,10 +397,12 @@ impl SetupForm {
         if base_url.is_empty() {
             return Err(SetupField::BaseUrl);
         }
-        let env_var = self.env_var.text().trim().to_owned();
-        if env_var.is_empty() {
-            return Err(SetupField::EnvVar);
-        }
+        // A blank variable is filled in from the name rather than
+        // refused: `LOCAL_API_KEY` is what the user would have typed.
+        let env_var = match self.env_var.text().trim() {
+            "" => default_env_var(&name),
+            typed => typed.to_owned(),
+        };
         Ok(ProviderProfile {
             name: name.clone(),
             protocol: self.protocol,

@@ -351,6 +351,10 @@ async fn event_loop(
     app.status.workspace = plane.builder.workspace_root().display().to_string();
     app.sidebar.session.workspace = Some(app.status.workspace.clone());
     app.profiles = plane.profile_summaries();
+    // The flags above the configured defaults are the selection the home
+    // screen shows before a session exists. It is a choice, not an open
+    // connection, which is why nothing here opens anything.
+    seed_draft(&mut app, &plane);
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
     let mut runtime = Runtime {
         plane: Arc::new(plane),
@@ -422,6 +426,39 @@ async fn event_loop(
         handle.cancel();
     }
     Ok(())
+}
+
+/// Fills the draft's empty fields from the configured defaults and shows
+/// the result. With nothing configured the fields stay empty and the home
+/// screen keeps saying `/connect` is where to start.
+fn seed_draft(app: &mut App, plane: &ControlPlane) {
+    let config = &plane.builder.config;
+    if app.draft.profile.is_none() {
+        app.draft.profile = config.default_profile.clone();
+    }
+    if app.draft.model.is_none() {
+        app.draft.model = config.default_model.clone();
+    }
+    app.status.profile = app.draft.profile.clone().unwrap_or_default();
+    app.status.model = app.draft.model.clone().unwrap_or_default();
+    app.status.effort = app.draft.effort.unwrap_or_default();
+    app.status.phase = match app
+        .draft
+        .phase
+        .unwrap_or(gritt_core::session::Phase::Planning)
+    {
+        gritt_core::session::Phase::Planning => "planning".into(),
+        gritt_core::session::Phase::Coding => "coding".into(),
+    };
+    if let Some(profile) = &app.draft.profile {
+        app.sidebar.model.backend = Some(profile.clone());
+    }
+    app.sidebar.model.model = app.draft.model.clone();
+    app.sidebar.session.phase = Some(app.status.phase.clone());
+    if let (Some(profile), Some(model)) = (&app.draft.profile, &app.draft.model) {
+        let info = plane.builder.catalog.model(profile, model);
+        app.set_model_facts(info.as_ref());
+    }
 }
 
 /// Rescans the workspace under the current sidebar generation.

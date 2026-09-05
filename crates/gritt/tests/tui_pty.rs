@@ -636,3 +636,267 @@ fn the_fixture_conversation_shows_the_sidebar_only_above_110_columns() {
         quit(&mut child, &rx, &mut seen, &mut writer);
     }
 }
+
+// -- TKT-0019: the live paths in a real terminal -----------------------
+
+/// Spawns `gritt tui` against a workspace with the given arguments.
+fn spawn_tui(dir: &Path, args: &[&str], cols: u16, rows: u16, env: &[(&str, &str)]) -> Fixture {
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_gritt"));
+    command.args([
+        "--workspace",
+        &dir.to_string_lossy(),
+        "--database",
+        &dir.join("gritt.db").to_string_lossy(),
+        "tui",
+    ]);
+    command.args(args);
+    command.env("TERM", "xterm-256color");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let input = pair.master.take_writer().unwrap();
+    Fixture {
+        master: pair.master,
+        child,
+        output: rx,
+        input,
+    }
+}
+
+fn send(writer: &mut Writer, bytes: &[u8]) {
+    writer.write_all(bytes).unwrap();
+    writer.flush().unwrap();
+}
+
+/// Escape must land on its own: a byte written straight after it is read
+/// as part of an escape sequence rather than as a keypress.
+fn escape(writer: &mut Writer) {
+    send(writer, &[0x1b]);
+    thread::sleep(Duration::from_millis(250));
+}
+
+/// First run: no configuration at all. `/connect` still opens, the custom
+/// endpoint form writes a project profile, and the profile is usable in
+/// the same run without a restart.
+///
+/// The key field is left blank on purpose. A PTY test must not write to
+/// the developer's login keychain, and leaving it blank is a real path:
+/// the profile is saved and the variable is named as what to export.
+#[test]
+fn a_first_run_with_no_configuration_can_set_up_a_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!dir.path().join("config.toml").exists());
+    let Fixture {
+        master: _master,
+        mut child,
+        output: rx,
+        input: mut writer,
+    } = spawn_tui(dir.path(), &["--no-models"], 120, 40, &[]);
+    let mut seen = String::new();
+    wait_for(&rx, &mut seen, ALT_SCREEN_ON, Duration::from_secs(20));
+    // Nothing is configured, so the home screen says where to start.
+    wait_for(
+        &rx,
+        &mut seen,
+        "Use /connect to get started.",
+        Duration::from_secs(20),
+    );
+
+    send(&mut writer, b"/connect\r");
+    wait_for(&rx, &mut seen, "Add a provider", Duration::from_secs(20));
+    wait_for(&rx, &mut seen, "Custom endpoint", Duration::from_secs(20));
+    send(&mut writer, b"Custom\r");
+    wait_for(&rx, &mut seen, "Provider setup", Duration::from_secs(20));
+    // The key is described as masked and keychain-only before it is typed.
+    wait_for(&rx, &mut seen, "never echoed", Duration::from_secs(20));
+
+    // name, endpoint, then the variable Gritt derives from the name.
+    send(&mut writer, b"ptylocal\r");
+    send(&mut writer, b"http://127.0.0.1:9/v1\r");
+    send(&mut writer, b"\r");
+    // Ctrl-D writes to this workspace instead of the user configuration.
+    send(&mut writer, &[0x04]);
+    wait_for(&rx, &mut seen, "config.toml", Duration::from_secs(20));
+    // Enter on the key field saves with no key typed.
+    send(&mut writer, b"\r");
+    wait_for(&rx, &mut seen, "saved to", Duration::from_secs(20));
+
+    // The variable Gritt derived from the name is what the profile names,
+    // and no key value was written anywhere.
+    let written = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(written.contains("ptylocal"), "{written}");
+    assert!(written.contains("127.0.0.1:9"), "{written}");
+    assert!(written.contains("PTYLOCAL_API_KEY"), "{written}");
+
+    // The reloaded configuration makes it selectable in the same run.
+    send(&mut writer, b"/connect\r");
+    wait_for(&rx, &mut seen, "AI providers", Duration::from_secs(20));
+    wait_for(&rx, &mut seen, "ptylocal", Duration::from_secs(20));
+    wait_for(&rx, &mut seen, "no key; set", Duration::from_secs(20));
+    escape(&mut writer);
+
+    quit(&mut child, &rx, &mut seen, &mut writer);
+    assert!(
+        !plain(&seen).contains("Managed by agent · Managed"),
+        "the dialog duplicated a row"
+    );
+}
+
+/// The lazy path: `gritt tui` with no named session opens on a draft and
+/// creates the session when the first prompt is submitted. `/new` then
+/// returns to a fresh draft without deleting it, and `/sessions` still
+/// lists it.
+#[test]
+fn the_first_prompt_creates_the_session_and_new_keeps_it() {
+    let port = serve(vec![text_sse("First answer."), text_sse("Second answer.")]);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "default_profile = \"local\"\ndefault_model = \"openai/gpt-5-nano\"\n\
+             [profiles.local]\nname = \"local\"\nprotocol = \"chat_completions\"\n\
+             base_url = \"http://127.0.0.1:{port}/v1\"\n\
+             [profiles.local.key]\nkeychain_service_entry = \"gritt-e2e-no-such-entry/local\"\n\
+             env_var_name = \"GRITT_E2E_KEY\"\n"
+        ),
+    )
+    .unwrap();
+    let Fixture {
+        master: _master,
+        mut child,
+        output: rx,
+        input: mut writer,
+    } = spawn_tui(
+        dir.path(),
+        &["--no-models"],
+        120,
+        40,
+        &[("GRITT_E2E_KEY", "pty-key")],
+    );
+    let mut seen = String::new();
+    wait_for(&rx, &mut seen, ALT_SCREEN_ON, Duration::from_secs(20));
+    // Home, with the configured selection already drafted and no session.
+    wait_for(&rx, &mut seen, "local", Duration::from_secs(20));
+
+    // The first prompt is what opens the session.
+    send(&mut writer, b"hello\r");
+    wait_for(&rx, &mut seen, "First answer.", Duration::from_secs(30));
+    // The sidebar is a column at this width and names the live session.
+    wait_for(&rx, &mut seen, "Changed files", Duration::from_secs(20));
+    wait_for(&rx, &mut seen, "openai/gpt-5-nano", Duration::from_secs(20));
+
+    // `/new` clears the view and keeps the session.
+    send(&mut writer, b"/new\r");
+    wait_for(
+        &rx,
+        &mut seen,
+        "the previous session is still listed",
+        Duration::from_secs(20),
+    );
+    send(&mut writer, &[0x13]);
+    wait_for(&rx, &mut seen, "Enter resumes", Duration::from_secs(20));
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    wait_for(&rx, &mut seen, &today, Duration::from_secs(20));
+    // Resuming reloads the history the first session produced.
+    send(&mut writer, b"\r");
+    wait_for(&rx, &mut seen, "First answer.", Duration::from_secs(30));
+
+    quit(&mut child, &rx, &mut seen, &mut writer);
+    assert!(!seen.contains("pty-key"), "the key must never be drawn");
+}
+
+/// A connector session shows the connector's identity and refuses the
+/// native pickers. Skipped honestly when no connector executable is
+/// available on this machine.
+#[test]
+fn a_connector_session_shows_its_identity_and_refuses_the_native_pickers() {
+    // A connector Gritt can actually start is required; a stub would
+    // prove nothing about the connector path.
+    let Some(executable) = ["codex", "claude", "cursor-agent"]
+        .into_iter()
+        .find_map(|name| which(name))
+    else {
+        eprintln!(
+            "skipped: no connector executable (codex, claude, cursor-agent) is installed here"
+        );
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    write_config(dir.path());
+    let connector = match executable.file_name().unwrap().to_string_lossy().as_ref() {
+        "codex" => "codex",
+        "claude" => "claude-code",
+        _ => "cursor",
+    };
+    let Fixture {
+        master: _master,
+        mut child,
+        output: rx,
+        input: mut writer,
+    } = spawn_tui(
+        dir.path(),
+        &[
+            "--no-models",
+            "--session",
+            "connector-pty",
+            "--connector",
+            connector,
+        ],
+        120,
+        40,
+        &[("GRITT_E2E_KEY", "pty-key")],
+    );
+    let mut seen = String::new();
+    wait_for(&rx, &mut seen, ALT_SCREEN_ON, Duration::from_secs(30));
+    wait_for(&rx, &mut seen, "connector-pty", Duration::from_secs(30));
+    // The native pickers do not apply to a connector session, and the
+    // refusal names the agent that owns the setting.
+    send(&mut writer, b"/models\r");
+    wait_for(
+        &rx,
+        &mut seen,
+        &format!("runs on {connector}"),
+        Duration::from_secs(30),
+    );
+    wait_for(
+        &rx,
+        &mut seen,
+        "managed by the agent",
+        Duration::from_secs(20),
+    );
+    quit(&mut child, &rx, &mut seen, &mut writer);
+}
+
+/// The first executable of that name on `PATH`, or `None`.
+fn which(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}

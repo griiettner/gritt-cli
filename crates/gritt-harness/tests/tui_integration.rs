@@ -544,21 +544,22 @@ async fn an_mcp_tool_call_approved_in_the_reducer_reaches_the_server() {
 
         // Either way the transcript carries the compact tool rows the
         // shared event model produces, with the result expandable.
-        let app = shared.lock().unwrap();
-        let tool_rows: Vec<_> = app
-            .entries
-            .iter()
-            .filter(|entry| entry.kind == gritt_harness::tui::EntryKind::Tool)
-            .collect();
-        assert_eq!(tool_rows.len(), 2, "expected a call row and a result row");
-        assert!(tool_rows[0].text.starts_with("->"));
-        assert!(tool_rows[1].text.starts_with("<-"));
-        assert!(
-            tool_rows[1].detail.is_some(),
-            "the result row has nothing to expand"
-        );
-        assert!(app.pending.is_none(), "the approval overlay stayed open");
-        drop(app);
+        {
+            let app = shared.lock().unwrap();
+            let tool_rows: Vec<_> = app
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == gritt_harness::tui::EntryKind::Tool)
+                .collect();
+            assert_eq!(tool_rows.len(), 2, "expected a call row and a result row");
+            assert!(tool_rows[0].text.starts_with("->"));
+            assert!(tool_rows[1].text.starts_with("<-"));
+            assert!(
+                tool_rows[1].detail.is_some(),
+                "the result row has nothing to expand"
+            );
+            assert!(app.pending.is_none(), "the approval overlay stayed open");
+        }
         fixture.mcp.shutdown().await;
     }
 }
@@ -707,17 +708,18 @@ async fn usage_events_from_a_real_turn_fill_the_sidebar() {
         asked: Arc::new(Mutex::new(Vec::new())),
     };
     driver.run_turn("use the tool", &mut ui).await.unwrap();
-    let app = shared.lock().unwrap();
-    let had_usage = app
-        .entries
-        .iter()
-        .any(|entry| entry.kind == gritt_harness::tui::EntryKind::Tool);
-    assert!(had_usage, "the turn produced no tool rows");
-    // Without a catalog there is no context limit and no price, so both
-    // stay unavailable rather than being invented.
-    assert_eq!(app.sidebar.usage.context_limit, None);
-    assert_eq!(app.sidebar.cost.estimate_usd, None);
-    drop(app);
+    {
+        let app = shared.lock().unwrap();
+        let had_usage = app
+            .entries
+            .iter()
+            .any(|entry| entry.kind == gritt_harness::tui::EntryKind::Tool);
+        assert!(had_usage, "the turn produced no tool rows");
+        // Without a catalog there is no context limit and no price, so
+        // both stay unavailable rather than being invented.
+        assert_eq!(app.sidebar.usage.context_limit, None);
+        assert_eq!(app.sidebar.cost.estimate_usd, None);
+    }
     fixture.mcp.shutdown().await;
 }
 
