@@ -74,6 +74,37 @@ Gritt speaks MCP revisions 2025-06-18 (offered), 2025-03-26, and 2024-11-05.
 A server that answers with anything else is disconnected with a stated
 reason. Planning turns carry no tools at all, MCP included.
 
+### Timeouts, limits, and cancellation
+
+One slow or hostile server must not hold the rest. Every server runs under
+the same bounds:
+
+| Bound | Default | Applies to |
+| --- | --- | --- |
+| Initialization | 30 s | Launch, `initialize`, and the first `tools/list` together |
+| One call | 120 s | A single `tools/call` |
+| Shutdown grace | 5 s | How long a stdio child may take to exit after its stdin closes, before termination escalates |
+| Concurrent starts | 4 | How many servers initialize at once; the rest queue. There is no cap on how many entries a file may declare |
+| Result size | 64 KiB | The largest tool result text handed back to the model |
+| List pages | 100 | A guard against a server that never stops paginating |
+
+A server that misses its initialization deadline is marked failed with that
+reason and the others carry on; a failed server is not restarted
+automatically and a call is not retried after a disconnect. A single line of
+server output above 8 MiB is treated as a protocol violation.
+
+These values are not yet settable in `config.toml`. The one case where the
+default bites in practice is a server that does substantial work before
+answering `initialize`, such as building an index on its first run in a fresh
+checkout; it fails the first start and succeeds afterwards.
+
+Cancelling a turn cancels its MCP calls. A call that has already been sent is
+withdrawn with `notifications/cancelled` so the server can stop work, and a
+call still waiting to be sent is never sent at all. Cleanup does not block
+the interface. Stdio children are started in their own process group and are
+terminated through the group, so a server that spawns its own helpers does
+not leave them behind when Gritt quits or is interrupted.
+
 ## The policy engine
 
 Every native tool execution passes the policy engine first, every time.

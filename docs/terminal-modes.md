@@ -63,6 +63,59 @@ covered. It shows Session, Model, Usage, Cost, Changed files, and
 Integrations. A value Gritt does not know reads `unavailable`, never `0`,
 and an integration with no runtime is absent rather than shown as empty.
 Cumulative token usage is not context occupancy and is never shown as one.
+Cost is an estimate from the model list's prices, never a billed amount,
+and it is withheld entirely when either token count or either price is
+missing.
+
+Tab moves focus to the sidebar where it is drawn. With the sidebar focused,
+the arrow keys and PageUp/PageDown scroll it and Enter opens the changed
+files as a searchable picker; choosing one opens a read-only diff. Sidebar
+lines are truncated at the column width rather than wrapped, so a long path
+or a long failure reason is cut.
+
+### Connecting and provider setup
+
+`/connect` lists configured provider profiles and installed agents in one
+picker. Choosing a provider that has no key opens a setup form: the profile
+name, the endpoint, the key variable, and the key itself. In that form Tab
+and the arrow keys move between fields, Ctrl-T cycles the protocol through
+`chat_completions`, `responses`, and `messages`, Ctrl-D toggles whether the
+profile is saved to the user config or the project config, Enter on the last
+field saves, and Escape returns without writing. The profile is written to
+the configuration first and the key to the operating system keychain second,
+so a refused keychain still leaves a usable profile. The key value is never
+written to the config file and never drawn.
+
+Choosing an installed agent instead opens a confirmation that states what
+Gritt does and does not control. An agent runs its own harness: Gritt
+supervises it and relays its approvals, but its model, effort, and
+permissions are the agent's. On a connector session `/connect`, `/models`,
+and `/effort` are refused with a notice naming the agent, while `/plan`,
+`/code`, `/new`, `/sessions`, `/details`, `/sidebar`, `/mcp`, and `/help`
+still work, because those are Gritt's. The sidebar reads `Managed by agent`
+in place of the model and effort rows, and the agent's own MCP servers are
+reported as not reported rather than being confused with Gritt's.
+
+Selecting a provider clears the model, because a model belongs to one
+provider's catalog. An effort the newly selected model cannot take returns
+to the model default, with a notice saying so.
+
+### Sessions are pinned to a provider and model
+
+A session that has stored history is pinned to the provider, model, and
+effort it was opened with. Gritt cannot move a stored transcript and its
+continuation state to a different model, so it does not pretend to: choosing
+another provider or model on a pinned session opens a notice saying that
+changing this needs a new session. `/new` is that path. It clears the
+transcript view, the session identity, and the usage totals while keeping
+your composer draft and the provider and model you just chose, so the next
+prompt opens a fresh session on the new selection. The previous session is
+not deleted and stays in `/sessions`.
+
+The same rule is enforced twice on purpose: once in the interface, for an
+immediate answer, and once in the control plane, which refuses the draft
+outright. Resuming a session restores its pinned provider, model, effort,
+phase, transcript, and continuation state.
 
 ### Commands
 
@@ -104,10 +157,28 @@ and delete to the line start. Ctrl-C cancels a running turn or quits when
 idle; Ctrl-Q quits. In the approval view `y` approves, `n` or Esc denies,
 and `d` shows the diff.
 
+Shift-Enter and Alt-Enter work only where the terminal reports the modifier
+distinctly; Ctrl-J always works and is the one the key hints name. Escape
+also cancels background work such as a catalog load, an MCP action, or a
+session that is still opening, before it reaches a running turn.
+
+In a picker, typing filters the list, so `j` and `k` are ordinary filter
+characters rather than movement. Arrow keys, Tab, PageUp/PageDown, and
+Ctrl-N/Ctrl-P move the highlight, Enter chooses, and Escape closes.
+Choosing a row that is unavailable does nothing except show that row's own
+reason. In the sidebar drawer and the help and diff overlays, `j` and `k`
+or the arrow keys scroll and Escape closes. The diff overlay does not wrap:
+a long line is clipped at the panel edge, and there is no horizontal
+scrolling.
+
 Streaming follows the bottom only while you are already there. Scrolling up
 holds the viewport and shows a new-output indicator; Ctrl-G is the explicit
 way back. Escape sequences in tool or model output are drawn as text, never
 executed.
+
+An idle session draws nothing at all. Nothing in the interface is animated
+from a clock, so the terminal receives no bytes until input arrives or the
+harness reports something.
 
 The mode honors terminal resize, `NO_COLOR`, and `GRITT_THEME=light|dark`,
 uses the alternate screen with bracketed paste, and restores the terminal on
@@ -115,6 +186,25 @@ exit and on panic. On a narrow terminal it reduces margins and drops
 secondary status before it takes space from the input or the transcript. It
 needs a terminal on both stdin and stdout; otherwise it exits with an error
 and print mode remains available.
+
+### MCP servers
+
+`/mcp` lists every entry in the workspace `.mcp.json` with its state and its
+tool count, and choosing one offers the actions that apply to it. Reading the
+file does not authorize running it: an entry stays in `awaiting approval`
+until you approve that exact definition for that exact workspace. Approving
+shows the redacted definition first, which is the command and its arguments
+or the endpoint without its query, plus the names of the environment
+variables and headers it declares but never their values. Approving records
+the decision and then starts the server, the same decision `gritt mcp trust`
+records from the command line.
+
+Every entry is accounted for. A server on an unsupported transport, one that
+answers with a protocol revision Gritt does not speak, or one that fails to
+start keeps a visible reason rather than disappearing from the list. MCP
+servers are started only on the native path; a connector session does not
+open the runtime. [Tools and permissions](tools-and-permissions.md) covers
+the trust record, the permission default, and the timeouts.
 
 ### Fixture mode
 
