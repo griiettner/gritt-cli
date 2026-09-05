@@ -4,8 +4,16 @@
 //! The child is launched with the workspace as its working directory, its
 //! argument array verbatim, and a minimal environment plus the variables the
 //! entry declares. Nothing goes through a shell, so an argument or a command
-//! cannot expand into something else. Shutdown follows the transport
-//! specification: close stdin, wait, terminate, then kill.
+//! cannot expand into something else.
+//!
+//! Shutdown follows the transport specification: close stdin, wait,
+//! terminate, then kill. Gritt owns the whole process group it started, so
+//! cleanup continues after the direct child is reaped: a server may exit
+//! while a descendant it spawned is still running.
+//!
+//! Input is bounded while it is read, not after. A server that never sends a
+//! newline must not be able to exhaust Gritt and take the healthy servers
+//! down with it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -19,16 +27,27 @@ use gritt_core::{Error, Result};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use super::connection::{closed, Command, Connection, ConnectionFlags};
 use super::jsonrpc::{self, Incoming};
 
-/// Longest single line accepted from a server. A line past it is a protocol
-/// violation, not a message worth buffering.
+/// Longest single line accepted from a server. Enforced while the line is
+/// being read, so an unterminated stream is stopped at the limit instead of
+/// after it has already been buffered.
 const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 
-/// How much of a server's stderr is kept for the failure summary.
+/// How much of a server's stderr is kept for the failure summary, and the
+/// most that is read before a line is cut.
 const STDERR_TAIL_BYTES: usize = 4 * 1024;
+const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
+
+/// Most requests that may be outstanding at once. A server that never
+/// answers cannot make the pending map grow without limit.
+const MAX_PENDING_REQUESTS: usize = 256;
+
+/// How long one write may take before the connection is treated as wedged.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Environment names a child may inherit. Everything else is dropped, so a
 /// provider key configured for Gritt never reaches an MCP server; the entry's
@@ -136,19 +155,22 @@ pub fn launch(
     let flags = Arc::new(ConnectionFlags::default());
     let stderr = Arc::new(Mutex::new(String::new()));
     let (tx, mut commands) = mpsc::channel::<Command>(64);
+    let mut readers: Vec<JoinHandle<()>> = Vec::new();
 
     // Stderr drains on its own task: a server that logs heavily must not
-    // block on a full pipe while the handshake is waiting.
+    // block on a full pipe while the handshake is waiting. Each line is
+    // capped as it is read, and the tail is capped after.
     if let Some(pipe) = stderr_pipe {
         let sink = Arc::clone(&stderr);
-        tokio::spawn(async move {
+        readers.push(tokio::spawn(async move {
             let mut reader = BufReader::new(pipe);
-            let mut line = String::new();
             loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
+                let mut line = String::new();
+                match read_line_bounded(&mut reader, &mut line, MAX_STDERR_LINE_BYTES).await {
+                    ReadOutcome::Eof | ReadOutcome::Failed(_) => break,
+                    // An over-long log line is truncated; logging is not a
+                    // protocol stream, so this is not fatal.
+                    ReadOutcome::Line | ReadOutcome::TooLong => {
                         let mut tail = sink.lock().expect("mcp stderr");
                         tail.push_str(&line);
                         if tail.len() > STDERR_TAIL_BYTES {
@@ -161,39 +183,42 @@ pub fn launch(
                     }
                 }
             }
-        });
+        }));
     }
 
     // Reader task: one line in, one decoded value out. Keeping it separate
     // means a server that never answers still cannot block the writer.
     let (line_tx, mut lines) = mpsc::channel::<std::result::Result<Value, String>>(64);
-    tokio::spawn(async move {
+    readers.push(tokio::spawn(async move {
         let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
         loop {
-            line.clear();
-            let read = reader.read_line(&mut line).await;
-            let message = match read {
-                Ok(0) => break,
-                Ok(_) if line.len() > MAX_LINE_BYTES => {
+            let mut line = String::new();
+            let message = match read_line_bounded(&mut reader, &mut line, MAX_LINE_BYTES).await {
+                ReadOutcome::Eof => break,
+                ReadOutcome::TooLong => {
                     let _ = line_tx
                         .send(Err("the server sent an oversized message".into()))
                         .await;
                     break;
                 }
-                Ok(_) => match serde_json::from_str::<Value>(line.trim()) {
+                ReadOutcome::Failed(error) => {
+                    let _ = line_tx
+                        .send(Err(format!("cannot read from the server: {error}")))
+                        .await;
+                    break;
+                }
+                ReadOutcome::Line => match serde_json::from_str::<Value>(line.trim()) {
                     Ok(value) => Ok(value),
                     // A blank keep-alive line is not an error.
                     Err(_) if line.trim().is_empty() => continue,
                     Err(_) => Err("the server sent output that is not JSON-RPC".to_owned()),
                 },
-                Err(error) => Err(format!("cannot read from the server: {error}")),
             };
             if line_tx.send(message).await.is_err() {
                 break;
             }
         }
-    });
+    }));
 
     let task_flags = Arc::clone(&flags);
     let task_stderr = Arc::clone(&stderr);
@@ -206,16 +231,38 @@ pub fn launch(
                     let Some(command) = command else { break };
                     match command {
                         Command::Request { id, method, params, reply } => {
+                            if pending.len() >= MAX_PENDING_REQUESTS {
+                                let _ = reply.send(Err(Error::config(
+                                    "too many MCP requests are already waiting for this server",
+                                )));
+                                continue;
+                            }
                             let frame = jsonrpc::request(id, &method, params);
-                            match write_frame(&mut stdin, &frame).await {
+                            match write_frame(&mut stdin, &frame, &task_flags).await {
                                 Ok(()) => { pending.insert(id, reply); }
-                                Err(error) => { let _ = reply.send(Err(error)); }
+                                Err(error) => {
+                                    let _ = reply.send(Err(error));
+                                    task_flags.closed.store(true, Ordering::SeqCst);
+                                    break;
+                                }
                             }
                         }
-                        Command::Notify { method, params } => {
+                        Command::Notify { method, params, ack } => {
                             let frame = jsonrpc::notification(&method, params);
-                            let _ = write_frame(&mut stdin, &frame).await;
+                            let outcome = write_frame(&mut stdin, &frame, &task_flags).await;
+                            let failed = outcome.is_err();
+                            if let Some(ack) = ack {
+                                let _ = ack.send(outcome);
+                            }
+                            if failed {
+                                task_flags.closed.store(true, Ordering::SeqCst);
+                                break;
+                            }
                         }
+                        // The caller stopped waiting. Dropping the entry is
+                        // what keeps the map bounded; a late response then
+                        // has nowhere to go and is discarded.
+                        Command::Abort { id } => { pending.remove(&id); }
                         Command::Shutdown { reply } => { stop = Some(reply); break; }
                     }
                 }
@@ -224,7 +271,10 @@ pub fn launch(
                     match message {
                         Ok(value) => {
                             if let Some(frame) = route(value, &mut pending, &task_flags) {
-                                let _ = write_frame(&mut stdin, &frame).await;
+                                if write_frame(&mut stdin, &frame, &task_flags).await.is_err() {
+                                    task_flags.closed.store(true, Ordering::SeqCst);
+                                    break;
+                                }
                             }
                         }
                         Err(reason) => {
@@ -234,6 +284,9 @@ pub fn launch(
                         }
                     }
                 }
+                // Shutdown can also arrive out of band, so a task that was
+                // parked on a write does not need the command queue at all.
+                _ = task_flags.stopped() => break,
             }
         }
         task_flags.closed.store(true, Ordering::SeqCst);
@@ -242,10 +295,11 @@ pub fn launch(
         // Specified shutdown: close stdin first and give the server a chance
         // to exit on its own.
         drop(stdin);
-        terminate(child, pid, grace).await;
-        if let Some(reply) = stop {
-            let _ = reply.send(());
-        }
+        terminate(child, pid, grace, readers).await;
+        drop(stop);
+        // Everything this connection owned is released; `shutdown` returns
+        // only after this point.
+        task_flags.finish();
     });
 
     Ok(StdioLaunch {
@@ -253,6 +307,57 @@ pub fn launch(
         pid,
         stderr,
     })
+}
+
+/// What one bounded read produced.
+enum ReadOutcome {
+    Line,
+    Eof,
+    /// The limit was reached before a newline arrived.
+    TooLong,
+    Failed(std::io::Error),
+}
+
+/// Reads one line, giving up at `limit` bytes rather than buffering an
+/// unbounded amount from a stream that may never send a delimiter.
+async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    out: &mut String,
+    limit: usize,
+) -> ReadOutcome {
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        let available = match reader.fill_buf().await {
+            Ok(buffer) => buffer,
+            Err(error) => return ReadOutcome::Failed(error),
+        };
+        if available.is_empty() {
+            if raw.is_empty() {
+                return ReadOutcome::Eof;
+            }
+            *out = String::from_utf8_lossy(&raw).into_owned();
+            return ReadOutcome::Line;
+        }
+        match available.iter().position(|byte| *byte == b'\n') {
+            Some(end) => {
+                raw.extend_from_slice(&available[..=end]);
+                reader.consume(end + 1);
+                *out = String::from_utf8_lossy(&raw).into_owned();
+                return ReadOutcome::Line;
+            }
+            None => {
+                let taken = available.len();
+                raw.extend_from_slice(available);
+                reader.consume(taken);
+                if raw.len() > limit {
+                    // Keep what fits so a truncated log line is still useful.
+                    raw.truncate(limit);
+                    *out = String::from_utf8_lossy(&raw).into_owned();
+                    return ReadOutcome::TooLong;
+                }
+            }
+        }
+    }
 }
 
 fn connection_lost(stderr_tail: &str) -> String {
@@ -305,32 +410,96 @@ fn route(
     }
 }
 
-async fn write_frame(stdin: &mut tokio::process::ChildStdin, frame: &Value) -> Result<()> {
+/// Writes one frame, giving up if the server stopped reading or shutdown was
+/// requested. Without this a full pipe would park the only task that can
+/// service the shutdown command.
+async fn write_frame(
+    stdin: &mut tokio::process::ChildStdin,
+    frame: &Value,
+    flags: &ConnectionFlags,
+) -> Result<()> {
     let line = jsonrpc::encode_line(frame)?;
-    stdin
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|_| closed())?;
-    stdin.flush().await.map_err(|_| closed())
+    let write = async {
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|_| closed())?;
+        stdin.flush().await.map_err(|_| closed())
+    };
+    tokio::select! {
+        biased;
+        _ = flags.stopped() => Err(closed()),
+        outcome = write => outcome,
+        _ = tokio::time::sleep(WRITE_TIMEOUT) => {
+            Err(Error::config("the server stopped reading its standard input"))
+        }
+    }
 }
 
-/// Waits out the grace period after stdin closed, then escalates. Gritt
-/// owns every stdio child it launched, so none may outlive the runtime.
-async fn terminate(mut child: tokio::process::Child, pid: Option<u32>, grace: Duration) {
-    if tokio::time::timeout(grace, child.wait()).await.is_ok() {
-        return;
+/// Ends the child and everything it started.
+///
+/// The direct child exiting is not the end of the job: it may have spawned a
+/// descendant that outlives it, and Gritt owns the process group it created.
+async fn terminate(
+    mut child: tokio::process::Child,
+    pid: Option<u32>,
+    grace: Duration,
+    readers: Vec<JoinHandle<()>>,
+) {
+    if tokio::time::timeout(grace, child.wait()).await.is_err() {
+        if let Some(pid) = pid {
+            signal_tree(pid, "TERM").await;
+        }
+        if tokio::time::timeout(grace, child.wait()).await.is_err() {
+            if let Some(pid) = pid {
+                crate::tools::kill_tree(pid).await;
+            }
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
     }
+    // The child is reaped. Anything still in its group is a descendant Gritt
+    // launched indirectly and still owns.
     if let Some(pid) = pid {
-        signal_tree(pid, "TERM").await;
+        if group_alive(pid) {
+            signal_tree(pid, "TERM").await;
+            let deadline = std::time::Instant::now() + grace;
+            while group_alive(pid) && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if group_alive(pid) {
+                crate::tools::kill_tree(pid).await;
+            }
+        }
     }
-    if tokio::time::timeout(grace, child.wait()).await.is_ok() {
-        return;
+    // The readers end when their pipes close, which the exit above
+    // guarantees. The bound is there so a wedged descendant holding a pipe
+    // open cannot keep a task alive forever.
+    for reader in readers {
+        let abort = reader.abort_handle();
+        if tokio::time::timeout(grace, reader).await.is_err() {
+            abort.abort();
+        }
     }
-    if let Some(pid) = pid {
-        crate::tools::kill_tree(pid).await;
-    }
-    let _ = child.start_kill();
-    let _ = child.wait().await;
+}
+
+/// True when any process remains in the group rooted at `pid`.
+#[cfg(unix)]
+fn group_alive(pid: u32) -> bool {
+    // `kill -0` on the negative pid asks about the whole group without
+    // signalling it.
+    std::process::Command::new("kill")
+        .args(["-0", &format!("-{pid}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn group_alive(_pid: u32) -> bool {
+    false
 }
 
 /// Sends a signal to the child's process group. Uses the platform tool so no
@@ -384,5 +553,41 @@ mod tests {
                 "inherited {name}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_line_without_a_delimiter_stops_at_the_limit() {
+        // 4 KiB of payload against a 1 KiB limit, and never a newline.
+        let flood = "x".repeat(4096);
+        let mut reader = BufReader::new(flood.as_bytes());
+        let mut line = String::new();
+        assert!(matches!(
+            read_line_bounded(&mut reader, &mut line, 1024).await,
+            ReadOutcome::TooLong
+        ));
+        // Only the bounded prefix was ever held.
+        assert!(line.len() <= 1024, "{}", line.len());
+    }
+
+    #[tokio::test]
+    async fn bounded_reads_still_deliver_ordinary_lines() {
+        let mut reader = BufReader::new("first\nsecond\n".as_bytes());
+        let mut line = String::new();
+        assert!(matches!(
+            read_line_bounded(&mut reader, &mut line, 1024).await,
+            ReadOutcome::Line
+        ));
+        assert_eq!(line, "first\n");
+        line.clear();
+        assert!(matches!(
+            read_line_bounded(&mut reader, &mut line, 1024).await,
+            ReadOutcome::Line
+        ));
+        assert_eq!(line, "second\n");
+        line.clear();
+        assert!(matches!(
+            read_line_bounded(&mut reader, &mut line, 1024).await,
+            ReadOutcome::Eof
+        ));
     }
 }

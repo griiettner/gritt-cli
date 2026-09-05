@@ -599,6 +599,30 @@ impl McpServerState {
     pub fn is_ready(&self) -> bool {
         matches!(self, McpServerState::Ready)
     }
+
+    /// A one-line explanation for any state, never empty.
+    ///
+    /// [`McpServerState::reason`] carries failure detail and is empty for the
+    /// states that have none. An interface still has to tell the user why a
+    /// server is not running, so every state gets a sentence here.
+    pub fn explain(&self) -> String {
+        match self {
+            McpServerState::AwaitingApproval => {
+                "waiting for approval to run this definition in this workspace".to_owned()
+            }
+            McpServerState::Denied => {
+                "approval was declined for this definition; it will not be launched".to_owned()
+            }
+            McpServerState::Starting => "connecting and negotiating the protocol".to_owned(),
+            McpServerState::Ready => "connected; its tools are available".to_owned(),
+            McpServerState::Stopped => "stopped; restart it to reconnect".to_owned(),
+            McpServerState::Failed { reason } => format!("failed: {reason}"),
+            McpServerState::Invalid { reason } => format!("the entry is not usable: {reason}"),
+            McpServerState::UnsupportedTransport { reason } => {
+                format!("gritt cannot connect to it: {reason}")
+            }
+        }
+    }
 }
 
 /// What the interface shows for one entry. Safe to log and persist: it holds
@@ -869,5 +893,34 @@ mod tests {
         let back: McpServerSnapshot = serde_json::from_value(json).unwrap();
         assert_eq!(back, snapshot);
         assert_eq!(McpServerState::AwaitingApproval.reason(), "");
+    }
+
+    #[test]
+    fn every_state_explains_itself() {
+        let states = [
+            McpServerState::AwaitingApproval,
+            McpServerState::Denied,
+            McpServerState::Starting,
+            McpServerState::Ready,
+            McpServerState::Stopped,
+            McpServerState::Failed {
+                reason: "it exited".into(),
+            },
+            McpServerState::Invalid {
+                reason: "missing `command`".into(),
+            },
+            McpServerState::UnsupportedTransport {
+                reason: "transport `sse` is not supported".into(),
+            },
+        ];
+        for state in states {
+            assert!(!state.explain().is_empty(), "{state:?} has no explanation");
+        }
+        assert!(McpServerState::Denied.explain().contains("declined"));
+        assert!(McpServerState::Failed {
+            reason: "it exited".into()
+        }
+        .explain()
+        .contains("it exited"));
     }
 }

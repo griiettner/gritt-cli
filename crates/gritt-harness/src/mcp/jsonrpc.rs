@@ -70,12 +70,9 @@ pub fn notification(method: &str, params: Value) -> Value {
     json!({"jsonrpc": "2.0", "method": method, "params": params})
 }
 
-/// The `notifications/cancelled` frame for an in-flight request.
-pub fn cancellation(id: u64, reason: &str) -> Value {
-    notification(
-        method::CANCELLED,
-        json!({"requestId": id, "reason": reason}),
-    )
+/// The `notifications/cancelled` params for an in-flight request.
+pub fn cancellation_params(id: u64, reason: &str) -> Value {
+    json!({"requestId": id, "reason": reason})
 }
 
 /// A response to a server-initiated request.

@@ -7,10 +7,17 @@
 //! request is still open. The optional server-initiated `GET` stream is not
 //! opened: Gritt advertises no client capability that needs one, and
 //! `tools/list_changed` also arrives on the POST streams.
+//!
+//! Every request task is owned rather than detached. A caller that stops
+//! waiting, a reload, or a shutdown cancels the work it started, so no HTTP
+//! body outlives the connection that asked for it. That cancels Gritt's local
+//! wait only: a remote server may still complete a side effect, which is why
+//! a call is never replayed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures::StreamExt;
 use gritt_core::mcp::McpTransportKind;
@@ -19,13 +26,31 @@ use gritt_core::{Error, Result};
 use gritt_provider::sse::SseParser;
 use gritt_provider::transport::{HttpRequest, HttpTransport};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::task::AbortHandle;
 
 use super::connection::{Command, Connection, ConnectionFlags};
 use super::jsonrpc::{self, Incoming};
 
 /// Largest non-streamed body read from an endpoint.
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Largest amount of SSE input accepted between two complete events, which
+/// bounds what the parser can accumulate from a delimiter-free stream.
+const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Largest total body accepted on one stream.
+const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+
+/// How many requests may be in flight against one endpoint at once.
+const MAX_INFLIGHT_REQUESTS: usize = 32;
+
+/// Bound on ending the session, so an unresponsive endpoint cannot hold up
+/// application exit.
+const DELETE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound on delivering a notification the caller is waiting for.
+const NOTIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Shared endpoint state. The session id is assigned by the server on the
 /// response that carries `InitializeResult` and must travel on every later
@@ -36,6 +61,8 @@ struct Endpoint {
     headers: BTreeMap<String, String>,
     session: Mutex<Option<String>>,
     flags: Arc<ConnectionFlags>,
+    /// Bounds concurrent outstanding work against one server.
+    permits: Semaphore,
 }
 
 impl Endpoint {
@@ -80,60 +107,101 @@ pub fn connect(
         headers: headers.clone(),
         session: Mutex::new(None),
         flags: Arc::clone(&flags),
+        permits: Semaphore::new(MAX_INFLIGHT_REQUESTS),
     });
     let (tx, mut commands) = mpsc::channel::<Command>(64);
     let task = Arc::clone(&endpoint);
     tokio::spawn(async move {
-        while let Some(command) = commands.recv().await {
-            match command {
-                Command::Request {
-                    id,
-                    method,
-                    params,
-                    reply,
-                } => {
-                    // Each request is its own POST, so a cancellation sent
-                    // while this one is open still goes out immediately.
-                    let endpoint = Arc::clone(&task);
-                    tokio::spawn(async move {
-                        let frame = jsonrpc::request(id, &method, params);
-                        let outcome = post(&endpoint, frame, Some(id)).await;
-                        let _ = reply.send(outcome);
-                    });
+        // Every spawned request is tracked so it can be cancelled by the
+        // caller, by a reload, or by shutdown.
+        let mut inflight: HashMap<u64, AbortHandle> = HashMap::new();
+        loop {
+            tokio::select! {
+                command = commands.recv() => {
+                    let Some(command) = command else { break };
+                    match command {
+                        Command::Request { id, method, params, reply } => {
+                            let endpoint = Arc::clone(&task);
+                            let handle = tokio::spawn(async move {
+                                let frame = jsonrpc::request(id, &method, params);
+                                let outcome = post(&endpoint, frame, Some(id)).await;
+                                let _ = reply.send(outcome);
+                            });
+                            inflight.insert(id, handle.abort_handle());
+                        }
+                        Command::Notify { method, params, ack } => {
+                            let frame = jsonrpc::notification(&method, params);
+                            match ack {
+                                // A delivery barrier: `notifications/
+                                // initialized` must reach the server before
+                                // the next POST is even started, so this one
+                                // is awaited in the loop rather than spawned.
+                                Some(ack) => {
+                                    let outcome = match tokio::time::timeout(
+                                        NOTIFY_TIMEOUT,
+                                        post(&task, frame, None),
+                                    )
+                                    .await
+                                    {
+                                        Ok(outcome) => outcome.map(|_| ()),
+                                        Err(_) => Err(Error::config(
+                                            "the endpoint did not accept the notification in time",
+                                        )),
+                                    };
+                                    let _ = ack.send(outcome);
+                                }
+                                None => {
+                                    let endpoint = Arc::clone(&task);
+                                    tokio::spawn(async move {
+                                        let _ = post(&endpoint, frame, None).await;
+                                    });
+                                }
+                            }
+                        }
+                        Command::Abort { id } => {
+                            if let Some(handle) = inflight.remove(&id) {
+                                // Stops Gritt reading the body. The server may
+                                // still finish; nothing is retried.
+                                handle.abort();
+                            }
+                        }
+                        Command::Shutdown { .. } => break,
+                    }
                 }
-                Command::Notify { method, params } => {
-                    let endpoint = Arc::clone(&task);
-                    tokio::spawn(async move {
-                        let frame = jsonrpc::notification(&method, params);
-                        let _ = post(&endpoint, frame, None).await;
-                    });
-                }
-                Command::Shutdown { reply } => {
-                    end_session(&task).await;
-                    task.flags.closed.store(true, Ordering::SeqCst);
-                    let _ = reply.send(());
-                    break;
-                }
+                _ = task.flags.stopped() => break,
             }
+            inflight.retain(|_, handle| !handle.is_finished());
         }
+        for (_, handle) in inflight.drain() {
+            handle.abort();
+        }
+        end_session(&task).await;
+        task.flags.closed.store(true, Ordering::SeqCst);
+        task.flags.finish();
     });
     Connection::new(tx, flags, McpTransportKind::Http)
 }
 
 /// Asks the server to release the session. A server that does not allow
-/// client termination answers 405, which is not a failure.
+/// client termination answers 405, which is not a failure, and an endpoint
+/// that does not answer at all must not delay exit.
 async fn end_session(endpoint: &Endpoint) {
     let has_session = endpoint.session.lock().expect("mcp session").is_some();
     if !has_session {
         return;
     }
     let request = endpoint.request(HttpRequest::delete(&endpoint.url));
-    let _ = endpoint.transport.send(request).await;
+    let _ = tokio::time::timeout(DELETE_TIMEOUT, endpoint.transport.send(request)).await;
 }
 
 /// Sends one message and, when `expect` names a request id, waits for that
 /// response on whichever body shape the server chose.
 async fn post(endpoint: &Endpoint, frame: Value, expect: Option<u64>) -> Result<Value> {
+    let _permit = endpoint
+        .permits
+        .acquire()
+        .await
+        .map_err(|_| Error::config("the MCP connection is closed"))?;
     let request = endpoint
         .request(HttpRequest::post_json(&endpoint.url, &frame))
         .header("accept", "application/json, text/event-stream");
@@ -194,9 +262,26 @@ async fn read_stream(
     expect: u64,
 ) -> Result<Value> {
     let mut parser = SseParser::new();
+    let mut total = 0usize;
+    // Bytes taken in since the last complete event, which bounds what the
+    // parser can be holding for an unterminated one.
+    let mut pending = 0usize;
     while let Some(chunk) = body.next().await {
         let chunk = chunk?;
-        for event in parser.feed(&chunk) {
+        total += chunk.len();
+        pending += chunk.len();
+        if total > MAX_STREAM_BYTES {
+            endpoint.flags.closed.store(true, Ordering::SeqCst);
+            return Err(Error::config("the MCP stream exceeded its size limit"));
+        }
+        let events = parser.feed(&chunk);
+        if !events.is_empty() {
+            pending = 0;
+        } else if pending > MAX_EVENT_BYTES {
+            endpoint.flags.closed.store(true, Ordering::SeqCst);
+            return Err(Error::config("the MCP stream sent an oversized event"));
+        }
+        for event in events {
             let Some(value) = event.json() else { continue };
             if let Some(outcome) = route(endpoint, value, expect) {
                 return outcome;
@@ -221,8 +306,28 @@ fn route(endpoint: &Endpoint, value: Value, expect: u64) -> Option<Result<Value>
             }
             None
         }
-        // Server-initiated requests need a POST back, which Gritt does not
-        // make: it advertises no capability that asks for one.
+        // A server request needs an answer even on this transport: `ping`
+        // depends on no capability, and anything else must be refused rather
+        // than left waiting.
+        Incoming::Request { id, method } => {
+            let frame = if method == jsonrpc::method::PING {
+                jsonrpc::response(id, serde_json::json!({}))
+            } else {
+                jsonrpc::error_response(
+                    id,
+                    jsonrpc::METHOD_NOT_FOUND,
+                    &format!("gritt does not implement `{method}`"),
+                )
+            };
+            // The answer is its own POST and must not block reading this
+            // stream, which is still carrying the caller's response.
+            let transport = Arc::clone(&endpoint.transport);
+            let request = endpoint.request(HttpRequest::post_json(&endpoint.url, &frame));
+            tokio::spawn(async move {
+                let _ = transport.send(request).await;
+            });
+            None
+        }
         _ => None,
     }
 }
