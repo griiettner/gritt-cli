@@ -806,7 +806,7 @@ mod http_fixture {
                 let id = message.get("id").cloned();
                 let response = match (method.as_str(), rpc.as_str()) {
                     ("DELETE", _) => {
-                        "HTTP/1.1 405 Method Not Allowed\r\ncontent-length: 0\r\n\r\n".to_owned()
+                        "HTTP/1.1 405 Method Not Allowed\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_owned()
                     }
                     (_, "initialize") => {
                         let version = if mode == Mode::EchoSecret {
@@ -825,7 +825,8 @@ mod http_fixture {
                         .to_string();
                         format!(
                             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
-                             mcp-session-id: session-abc\r\ncontent-length: {}\r\n\r\n{payload}",
+                             mcp-session-id: session-abc\r\nconnection: close\r\n\
+                             content-length: {}\r\n\r\n{payload}",
                             payload.len()
                         )
                     }
@@ -863,7 +864,7 @@ mod http_fixture {
                         calls += 1;
                         match mode {
                             Mode::SessionLost => {
-                                "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".to_owned()
+                                "HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_owned()
                             }
                             Mode::EchoSecret => sse(&[serde_json::json!({
                                 "jsonrpc": "2.0", "id": id,
@@ -879,7 +880,7 @@ mod http_fixture {
                         if rpc == "notifications/initialized" {
                             initialized = true;
                         }
-                        "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\n\r\n".to_owned()
+                        "HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_owned()
                     }
                 };
                 let _ = socket.write_all(response.as_bytes()).await;
@@ -898,7 +899,8 @@ mod http_fixture {
             body.push_str(&format!("id: {index}\ndata: {message}\n\n"));
         }
         format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{body}",
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\
+             content-length: {}\r\n\r\n{body}",
             body.len()
         )
     }
@@ -1353,8 +1355,14 @@ async fn startup_concurrency_stays_within_the_configured_limit() {
         }
     }
     assert_eq!(recorded.lines().filter(|l| l.trim() == "start").count(), 6);
-    assert!(peak <= 2, "peak concurrency was {peak}, limit was 2");
-    assert!(peak >= 2, "the limit was never reached; peak was {peak}");
+    assert!(
+        peak <= 2,
+        "peak concurrency was {peak}, limit was 2; log was:\n{recorded}"
+    );
+    assert!(
+        peak >= 2,
+        "the limit was never reached; peak was {peak}; log was:\n{recorded}"
+    );
     runtime.shutdown().await;
 }
 

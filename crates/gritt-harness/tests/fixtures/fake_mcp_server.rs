@@ -168,6 +168,15 @@ fn main() {
                 } else {
                     "0.1.0".to_owned()
                 };
+                if behavior == "slowinit" {
+                    // The handshake is held open long enough for the queue
+                    // behind the limit to be observable, and the bracket is
+                    // closed before the response goes out. Closing it after
+                    // would let a finished server still count as running
+                    // while the next one starts.
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    log_concurrency("end");
+                }
                 send(&serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -177,12 +186,6 @@ fn main() {
                         "serverInfo": {"name": "fixture", "version": server_version},
                     },
                 }));
-                if behavior == "slowinit" {
-                    // Held open long enough for the queue behind the limit to
-                    // be observable.
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                    log_concurrency("end");
-                }
                 if behavior == "strict" {
                     // A server-initiated request the client has to answer.
                     send(&serde_json::json!({
@@ -367,11 +370,16 @@ fn log_concurrency(event: &str) {
     let Ok(path) = std::env::var("FIXTURE_CONCURRENCY") else {
         return;
     };
+    // Built first and written once. `writeln!` issues one syscall per format
+    // piece, so several servers appending at the same time interleave into
+    // corrupted lines and the log undercounts.
+    let line = format!("{event}\n");
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
     {
-        let _ = writeln!(file, "{event}");
+        let _ = file.write_all(line.as_bytes());
+        let _ = file.flush();
     }
 }

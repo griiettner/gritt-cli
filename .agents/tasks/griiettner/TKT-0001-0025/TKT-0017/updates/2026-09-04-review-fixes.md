@@ -147,7 +147,29 @@ close rather than to this worker's branch.
 ## Test-timing robustness
 
 The PM saw two failures in one suite on a loaded machine that four later runs
-could not reproduce. Reviewing the MCP tests for load sensitivity:
+could not reproduce. Two genuine races were found in the new tests, both
+load-sensitive and both a plausible match for that report. Neither was a
+product defect; both were the tests measuring themselves badly.
+
+- **The HTTP fixture closed each connection without saying so.** It answers
+  one request per socket, but sent no `Connection: close`, so `reqwest`
+  pooled the socket and the next request raced the server's close. It
+  surfaced as `request failed for 127.0.0.1/mcp` in
+  `a_streamable_http_server_handshakes_lists_and_calls`, roughly one run in
+  eight. Every fixture response now carries the header.
+- **The concurrency probe lost writes.** `writeln!` issues one syscall per
+  format piece, so six servers appending `start` and `end` at once
+  interleaved into corrupted lines; the log undercounted and the computed
+  peak was wrong in both directions. Each line is now built first and written
+  with a single `write_all`. With that fixed the measurement is stable at
+  exactly the configured limit over twelve consecutive runs, which is also
+  the evidence that the runtime enforces it: the earlier "peak 4" was the
+  broken probe, not a breached limit.
+
+Both were confirmed by looping the suite: ten consecutive clean runs of
+`mcp_runtime` and three of the full workspace after the fixes.
+
+Reviewing the remaining MCP tests for load sensitivity:
 
 - The shared test `settings()` used a 10 s call deadline while a cancellation
   test asserted the wait ended in under 3 s. Under load the deadline could
