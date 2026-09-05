@@ -118,6 +118,7 @@ async fn fixture(
         cache: None,
         workspace: Workspace::open(dir.path()).unwrap(),
         approval,
+        mcp: None,
     };
     Fixture {
         dir,

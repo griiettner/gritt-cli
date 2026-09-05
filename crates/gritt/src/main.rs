@@ -4,19 +4,22 @@
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use clap::{Args, Parser, Subcommand};
 use gritt_connector::{default_connectors_with_secrets, environment_secrets, parse_connector_id};
 use gritt_core::connector::{AuthState, ConnectorId};
 use gritt_core::event::{ApprovalDecision, EventKind};
-use gritt_core::session::{Phase, SessionStore};
+use gritt_core::mcp::{McpRuntimeSettings, McpServerState, TrustDecision};
+use gritt_core::session::{Phase, SessionKind, SessionStore};
 use gritt_core::{Error, Result};
 use gritt_harness::agent::{AgentBuilder, ApprovalMode, SessionSelector, TurnStatus, Ui};
 use gritt_harness::control::ControlPlane;
+use gritt_harness::mcp::McpRuntime;
 use gritt_harness::modes::print::{PrintUi, PrintUiOptions};
 use gritt_harness::modes::repl::{line_prompter, run_repl, CancelSlot, LineInput};
-use gritt_harness::store::{resolve_location, Store};
+use gritt_harness::store::{resolve_location, Store, StoreTrustStore};
 use gritt_harness::telemetry::Telemetry;
 use gritt_harness::tools::Workspace;
 use gritt_harness::tui::run_tui;
@@ -43,6 +46,24 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// `.mcp.json` is read, never written. Approval is Gritt's own record and
+/// lives in the session database.
+#[derive(Subcommand)]
+enum McpCommand {
+    /// Show every configured server with its state and tools.
+    List,
+    /// Approve launching a server as it is defined right now. Editing the
+    /// entry afterwards asks again.
+    Trust {
+        server: String,
+        /// Record a refusal instead of an approval.
+        #[arg(long)]
+        deny: bool,
+    },
+    /// Forget every recorded decision for this workspace.
+    Forget,
 }
 
 #[derive(Subcommand)]
@@ -76,6 +97,11 @@ enum Command {
     Tui {
         #[command(flatten)]
         session: SessionArgs,
+    },
+    /// Inspect and approve the workspace's MCP servers.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
     },
     /// Manage sessions.
     Session {
@@ -189,17 +215,128 @@ async fn builder(
     } else {
         ModelCache::default_dir().map(ModelCache::new)
     };
+    let transport: Arc<dyn gritt_provider::transport::HttpTransport> =
+        Arc::new(ReqwestTransport::new()?);
+    let workspace_root = Workspace::open(workspace)?;
+    // One runtime per workspace, shared by every session the builder opens.
+    // Creating it launches nothing: a server runs only once its exact
+    // definition has been approved for this workspace.
+    let mcp = Arc::new(
+        McpRuntime::new(workspace_root.root(), McpRuntimeSettings::default())
+            .with_http_transport(Arc::clone(&transport))
+            .with_trust(StoreTrustStore::new(Arc::clone(&store))),
+    );
     Ok(AgentBuilder {
         config,
         store,
         telemetry,
         keys: Arc::new(resolver()),
-        transport: Arc::new(ReqwestTransport::new()?),
+        transport,
         catalog: ModelCatalog::new(),
         cache,
-        workspace: Workspace::open(workspace)?,
+        workspace: workspace_root,
         approval,
+        mcp: Some(mcp),
     })
+}
+
+/// Reads `.mcp.json` and starts every approved server before the first turn.
+///
+/// A malformed file is a warning, not a failed run: the rest of Gritt keeps
+/// working and the reason is visible. Entries that are not running are
+/// listed with their reason so nothing is silently skipped.
+async fn start_mcp(builder: &AgentBuilder, verbose: bool) {
+    let Some(mcp) = builder.mcp() else { return };
+    let snapshots = match mcp.open(&gritt_harness::CancellationToken::new()).await {
+        Ok(snapshots) => snapshots,
+        Err(error) => {
+            eprintln!("warning: MCP configuration: {error}");
+            return;
+        }
+    };
+    for snapshot in snapshots {
+        match &snapshot.state {
+            McpServerState::Ready => {
+                if verbose {
+                    eprintln!(
+                        "mcp: {} ready with {} tool(s)",
+                        snapshot.name, snapshot.tool_count
+                    );
+                }
+            }
+            McpServerState::AwaitingApproval => eprintln!(
+                "mcp: {} is waiting for approval; run `gritt mcp trust {}`",
+                snapshot.name, snapshot.name
+            ),
+            other => eprintln!("mcp: {} is {}", snapshot.name, describe_state(other)),
+        }
+    }
+}
+
+/// The short label `gritt mcp list` shows in its state column, with the
+/// explanation appended so a non-running entry always says why.
+fn describe_state(state: &McpServerState) -> String {
+    let label = match state {
+        McpServerState::AwaitingApproval => "awaiting approval",
+        McpServerState::Denied => "denied",
+        McpServerState::Starting => "starting",
+        McpServerState::Ready => "ready",
+        McpServerState::Failed { .. } => "failed",
+        McpServerState::Stopped => "stopped",
+        McpServerState::Invalid { .. } => "invalid",
+        McpServerState::UnsupportedTransport { .. } => "unsupported transport",
+    };
+    match state {
+        McpServerState::Ready => label.to_owned(),
+        other => format!("{label} ({})", other.explain()),
+    }
+}
+
+/// Ends every MCP connection. Owned stdio children never outlive the run,
+/// whichever path the run leaves by.
+async fn stop_mcp(mcp: &Option<Arc<McpRuntime>>) {
+    if let Some(mcp) = mcp {
+        mcp.shutdown().await;
+    }
+}
+
+/// Whether this invocation will run on the native path, which is what owns
+/// the harness MCP runtime.
+///
+/// An explicit `--connector native` and an implicit native default are the
+/// same thing here. Resuming a session that belongs to an external agent is
+/// not: that agent owns its own MCP clients (ADR-010), so Gritt must not
+/// launch servers for it. A lookup failure defers to the real error that
+/// opening the session will raise.
+async fn runs_on_native(
+    builder: &AgentBuilder,
+    selector: &SessionSelector,
+    connector: Option<ConnectorId>,
+) -> bool {
+    // The session is resolved first, whatever the flag says, because that is
+    // the order `ControlPlane::open` uses and the prediction has to agree
+    // with it. A lookup that fails is treated as a new session; the real
+    // error surfaces when the session is opened for real.
+    let existing = builder.find_session(selector, None).await.ok().flatten();
+    native_backend(connector, existing.as_ref().map(|session| &session.kind))
+}
+
+/// The backend decision itself, given the flag and the session being resumed.
+///
+/// An existing session's own kind decides, because that is what
+/// `ControlPlane::open` does: it keeps a stored native session native even
+/// when a connector flag is present, and only refuses a flag that contradicts
+/// a stored *connector* session. Predicting otherwise would disable MCP for a
+/// session that then runs natively.
+///
+/// With no stored session the flag decides, and `--connector native` is the
+/// native path just as an absent flag is.
+fn native_backend(connector: Option<ConnectorId>, existing: Option<&SessionKind>) -> bool {
+    match existing {
+        Some(SessionKind::Native { .. }) => true,
+        Some(SessionKind::Connector { .. }) => false,
+        None => matches!(connector, None | Some(ConnectorId::Native)),
+    }
 }
 
 /// Wraps the builder in the control plane with every external connector
@@ -344,7 +481,15 @@ fn print_options(
 
 /// Cancels the running turn on Ctrl-C; a Ctrl-C with nothing running
 /// exits.
-fn install_ctrl_c(slot: CancelSlot) {
+/// Ctrl-C cancels a running turn; a second one, or one with nothing running,
+/// exits.
+///
+/// The exit path releases the MCP servers first. Those children live for the
+/// whole session and sit in their own process groups, so leaving through
+/// `process::exit` without asking them to stop would strand them.
+fn install_ctrl_c(slot: CancelSlot, mcp: Option<Arc<McpRuntime>>) -> Arc<AtomicBool> {
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&interrupted);
     tokio::spawn(async move {
         loop {
             if tokio::signal::ctrl_c().await.is_err() {
@@ -356,10 +501,21 @@ fn install_ctrl_c(slot: CancelSlot) {
                     eprintln!("\ncancelling...");
                     handle.cancel();
                 }
-                _ => std::process::exit(130),
+                _ => {
+                    // Recorded before the cleanup, because releasing the
+                    // servers can let the work in progress finish and return
+                    // first. Whichever gets there first, the run reports an
+                    // interrupt rather than success.
+                    flag.store(true, Ordering::SeqCst);
+                    if let Some(mcp) = &mcp {
+                        mcp.shutdown().await;
+                    }
+                    std::process::exit(130);
+                }
             }
         }
     });
+    interrupted
 }
 
 async fn run_print(
@@ -375,6 +531,30 @@ async fn run_print(
     if connector.is_none() {
         warm_catalog(&builder, args).await;
     }
+    let mcp = builder.mcp().cloned();
+    // The slot and its signal handler exist before the first server is
+    // launched, so a Ctrl-C during startup still releases what already
+    // started. The turn's handle is dropped into the slot once it exists.
+    let slot: CancelSlot = Arc::new(Mutex::new(None));
+    let _ = install_ctrl_c(Arc::clone(&slot), mcp.clone());
+    if runs_on_native(&builder, &selector(args), connector).await {
+        start_mcp(&builder, verbose).await;
+    }
+    // Everything past this point must release the servers, including the
+    // fallible session open, so the body is its own function.
+    let result = print_turn(builder, args, prompt, verbose, connector, slot).await;
+    stop_mcp(&mcp).await;
+    result
+}
+
+async fn print_turn(
+    builder: AgentBuilder,
+    args: &SessionArgs,
+    prompt: &str,
+    verbose: bool,
+    connector: Option<ConnectorId>,
+    slot: CancelSlot,
+) -> Result<ExitCode> {
     let approval = builder.approval;
     let plane = plane(builder)?;
     let mut agent = plane
@@ -386,8 +566,7 @@ async fn run_print(
             phase_flag(args),
         )
         .await?;
-    let slot: CancelSlot = Arc::new(Mutex::new(Some(agent.handle())));
-    install_ctrl_c(Arc::clone(&slot));
+    *slot.lock().expect("cancel slot") = Some(agent.handle());
     let input = LineInput::from_reader(std::io::BufReader::new(std::io::stdin()));
     let mut ui = PrintUi::new(
         std::io::stdout(),
@@ -439,6 +618,24 @@ async fn run_repl_mode(
     if connector.is_none() {
         warm_catalog(&builder, args).await;
     }
+    let mcp = builder.mcp().cloned();
+    let slot: CancelSlot = Arc::new(Mutex::new(None));
+    let _ = install_ctrl_c(Arc::clone(&slot), mcp.clone());
+    if runs_on_native(&builder, &selector(args), connector).await {
+        start_mcp(&builder, verbose).await;
+    }
+    let result = repl_loop(builder, args, verbose, connector, slot).await;
+    stop_mcp(&mcp).await;
+    result
+}
+
+async fn repl_loop(
+    builder: AgentBuilder,
+    args: &SessionArgs,
+    verbose: bool,
+    connector: Option<ConnectorId>,
+    slot: CancelSlot,
+) -> Result<ExitCode> {
     let approval = builder.approval;
     let plane = plane(builder)?;
     let agent = plane
@@ -450,8 +647,6 @@ async fn run_repl_mode(
             phase_flag(args),
         )
         .await?;
-    let slot: CancelSlot = Arc::new(Mutex::new(None));
-    install_ctrl_c(Arc::clone(&slot));
     println!("gritt repl: {} (/help for commands)", agent.session().name);
     // One reader owns stdin: the loop takes commands from it and the
     // approval prompter takes answers from it, never both at once.
@@ -485,6 +680,25 @@ async fn run_tui_mode(
     if connector.is_none() {
         warm_catalog(&builder, args).await;
     }
+    let mcp = builder.mcp().cloned();
+    // Installed before the first launch. Raw mode is not on yet, so an
+    // interrupt here arrives as a signal, and the children sit in their own
+    // process groups: without this they would survive it.
+    let slot: CancelSlot = Arc::new(Mutex::new(None));
+    let _ = install_ctrl_c(Arc::clone(&slot), mcp.clone());
+    if runs_on_native(&builder, &selector(args), connector).await {
+        start_mcp(&builder, false).await;
+    }
+    let result = tui_session(builder, args, connector).await;
+    stop_mcp(&mcp).await;
+    result
+}
+
+async fn tui_session(
+    builder: AgentBuilder,
+    args: &SessionArgs,
+    connector: Option<ConnectorId>,
+) -> Result<ExitCode> {
     let plane = plane(builder)?;
     let agent = plane
         .open(
@@ -496,6 +710,76 @@ async fn run_tui_mode(
         )
         .await?;
     run_tui(&plane, agent).await?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn mcp_command(
+    workspace: &Path,
+    database: Option<&Path>,
+    command: McpCommand,
+) -> Result<ExitCode> {
+    let store = open_store(workspace, database).await?;
+    let root = Workspace::open(workspace)?;
+    let runtime = McpRuntime::new(root.root(), McpRuntimeSettings::default())
+        .with_http_transport(Arc::new(ReqwestTransport::new()?))
+        .with_trust(StoreTrustStore::new(Arc::clone(&store)));
+    let cancel = gritt_harness::CancellationToken::new();
+    // `trust` and `list` both launch approved servers, so they need the same
+    // cleanup on interruption as the session modes.
+    let runtime = Arc::new(runtime);
+    let slot: CancelSlot = Arc::new(Mutex::new(None));
+    let interrupted = install_ctrl_c(Arc::clone(&slot), Some(Arc::clone(&runtime)));
+    match command {
+        McpCommand::Forget => {
+            store
+                .clear_mcp_trust(&root.root().to_string_lossy())
+                .await?;
+            println!("forgot every MCP approval for {}", root.root().display());
+            return Ok(ExitCode::SUCCESS);
+        }
+        McpCommand::Trust { server, deny } => {
+            let config = runtime.read_config()?;
+            runtime.load(&config).await?;
+            let decision = if deny {
+                TrustDecision::Denied
+            } else {
+                TrustDecision::Approved
+            };
+            runtime.decide(&server, decision).await?;
+            println!(
+                "{server} is now {}",
+                if deny { "denied" } else { "approved" }
+            );
+        }
+        McpCommand::List => {}
+    }
+    let snapshots = runtime.open(&cancel).await?;
+    if interrupted.load(Ordering::SeqCst) {
+        // The servers were released by the handler; say so rather than
+        // printing a listing the interrupt already invalidated.
+        return Ok(ExitCode::from(130));
+    }
+    if snapshots.is_empty() {
+        println!(
+            "no servers configured in {}",
+            gritt_harness::mcp::CONFIG_FILE
+        );
+    }
+    for snapshot in &snapshots {
+        println!(
+            "{:<24} {:<10} {}",
+            snapshot.name,
+            snapshot
+                .transport
+                .map(|kind| kind.to_string())
+                .unwrap_or_else(|| "-".into()),
+            describe_state(&snapshot.state)
+        );
+        for tool in &snapshot.tools {
+            println!("    {tool}");
+        }
+    }
+    runtime.shutdown().await;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -753,6 +1037,7 @@ async fn main() -> ExitCode {
             run_repl_mode(&workspace, database, &session, verbose).await
         }
         Some(Command::Tui { session }) => run_tui_mode(&workspace, database, &session).await,
+        Some(Command::Mcp { command }) => mcp_command(&workspace, database, command).await,
         Some(Command::Session { command }) => session_command(&workspace, database, command).await,
         Some(Command::Connectors) => connectors_command(&workspace, database).await,
         Some(Command::Doctor) => doctor_command(&workspace, database).await,
@@ -788,6 +1073,34 @@ mod tests {
             no_models: true,
             connector: connector.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn mcp_starts_for_every_native_path_and_no_external_one() {
+        let native_session = SessionKind::Native {
+            provider_profile: "openrouter".into(),
+            model: "openai/gpt-5-nano".into(),
+            effort: gritt_core::provider::ReasoningEffort::Auto,
+        };
+        let external_session = SessionKind::Connector {
+            id: ConnectorId::Codex,
+        };
+        // An explicit native flag is still the native path.
+        assert!(native_backend(Some(ConnectorId::Native), None));
+        assert!(native_backend(None, None));
+        assert!(native_backend(None, Some(&native_session)));
+        // A flag naming an external agent, with nothing stored yet.
+        assert!(!native_backend(Some(ConnectorId::Codex), None));
+        // A stored native session stays native even under an external flag,
+        // because `ControlPlane::open` resolves it that way; predicting
+        // otherwise would leave MCP off for a session that runs natively.
+        assert!(native_backend(
+            Some(ConnectorId::ClaudeCode),
+            Some(&native_session)
+        ));
+        // Resuming an external session without a flag: that agent owns its
+        // own MCP clients, so Gritt must not launch servers for it.
+        assert!(!native_backend(None, Some(&external_session)));
     }
 
     #[test]

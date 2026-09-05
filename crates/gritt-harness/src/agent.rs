@@ -30,6 +30,7 @@ use gritt_provider::transport::HttpTransport;
 use gritt_provider::{adapter_for, AdapterContext, CancellationToken};
 
 use crate::driver::EffortOutcome;
+use crate::mcp::{is_dispatch_name, McpRuntime, McpToolSet};
 use crate::policy::{Decision, PolicyEngine};
 use crate::store::Store;
 use crate::telemetry::Telemetry;
@@ -113,6 +114,13 @@ pub struct NativeAgent {
     store: Arc<Store>,
     policy: PolicyEngine,
     tools: NativeTools,
+    /// The workspace MCP runtime, when one is configured. Shared with every
+    /// other session in the workspace: connections outlive turns.
+    mcp: Option<Arc<McpRuntime>>,
+    /// The MCP tools this turn may call, taken once when the turn starts so
+    /// a `tools/list_changed` arriving mid-turn cannot change the set the
+    /// model was shown.
+    mcp_tools: McpToolSet,
     telemetry: Arc<Telemetry>,
     cancel: CancellationToken,
     approval: ApprovalMode,
@@ -386,14 +394,42 @@ impl NativeAgent {
             model,
             messages,
             tools: match self.session.phase {
+                // Planning keeps the existing no-tools behavior, MCP
+                // included, until a separate phase-policy decision.
                 Phase::Planning => Vec::new(),
-                Phase::Coding => NativeTools::definitions(),
+                Phase::Coding => {
+                    let mut tools = NativeTools::definitions();
+                    tools.extend(self.mcp_tools.definitions().iter().cloned());
+                    tools
+                }
             },
             options: RequestOptions {
                 effort,
                 ..RequestOptions::default()
             },
         }
+    }
+
+    /// Applies any tool-list change between turns and takes this turn's
+    /// snapshot. Doing it here, before the request is built, is what keeps
+    /// the advertised tools and the callable tools identical for the turn.
+    pub async fn refresh_mcp_tools(&mut self) {
+        let Some(mcp) = self.mcp.clone() else {
+            return;
+        };
+        // A run that began on an external agent never opened the runtime,
+        // because that agent owns its own MCP clients. This turn is native,
+        // so this is the moment Gritt needs its own servers. Opening is
+        // idempotent; a configuration error leaves the entries visible in the
+        // snapshots rather than failing the turn.
+        let _ = mcp.ensure_open(&self.cancel).await;
+        mcp.refresh(&self.cancel).await;
+        self.mcp_tools = mcp.tool_set().await;
+    }
+
+    /// The MCP tools the current turn may call.
+    pub fn mcp_tools(&self) -> &McpToolSet {
+        &self.mcp_tools
     }
 
     /// The request the next turn would send for `prompt`, without sending
@@ -406,6 +442,7 @@ impl NativeAgent {
     pub async fn run_turn(&mut self, prompt: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
         let started_at = Utc::now();
         self.cancel.reset();
+        self.refresh_mcp_tools().await;
         self.telemetry
             .content(&self.session.id, "user", prompt, &self.secrets)
             .await?;
@@ -621,9 +658,71 @@ impl NativeAgent {
         Ok(result)
     }
 
+    /// The resource a call touches. An MCP dispatch name resolves through
+    /// this turn's snapshot to `mcp:<server>/<tool>`, so a policy rule can
+    /// name one server or one tool. A name the snapshot does not hold never
+    /// reaches a server.
+    fn resource_for(&self, call: &ToolCall) -> Result<crate::policy::Resource> {
+        if !is_dispatch_name(&call.name) {
+            return self.tools.resource_for(call);
+        }
+        match self.mcp_tools.lookup(&call.name) {
+            Some(frozen) => Ok(crate::policy::Resource::Other(format!(
+                "mcp:{}/{}",
+                frozen.reference.server, frozen.reference.tool
+            ))),
+            None => Err(Error::config(format!(
+                "unknown tool `{}`; it is not offered by any connected MCP server",
+                call.name
+            ))),
+        }
+    }
+
+    /// Executes an approved call on the tool's owner. The policy engine has
+    /// already run; there is no path here that skips it.
+    async fn execute_call(&mut self, call: &ToolCall) -> ToolResult {
+        if !is_dispatch_name(&call.name) {
+            return self.tools.execute(call, &self.cancel).await;
+        }
+        let Some(mcp) = self.mcp.clone() else {
+            return ToolResult {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                is_error: true,
+                output: "no MCP runtime is available for this session".into(),
+            };
+        };
+        // The turn's frozen entry, not the live registry: the call that runs
+        // is the one the permission engine approved, or none at all.
+        let Some(frozen) = self.mcp_tools.lookup(&call.name).cloned() else {
+            return ToolResult {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                is_error: true,
+                output: format!("`{}` is not offered by any connected MCP server", call.name),
+            };
+        };
+        match mcp.call(&frozen, &call.arguments, &self.cancel).await {
+            Ok(rendered) => ToolResult {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                is_error: rendered.is_error,
+                output: rendered.output,
+            },
+            // A transport failure is reported as a tool error, never
+            // retried: the server may already have done the work.
+            Err(error) => ToolResult {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                is_error: true,
+                output: error.message,
+            },
+        }
+    }
+
     /// Policy, approval, execution, and the events for one call.
     async fn handle_call(&mut self, ui: &mut dyn Ui, call: &ToolCall) -> Result<ToolResult> {
-        let resource = match self.tools.resource_for(call) {
+        let resource = match self.resource_for(call) {
             Ok(resource) => resource,
             Err(error) => {
                 // A bad argument or a path outside the workspace never
@@ -720,7 +819,7 @@ impl NativeAgent {
                 Some(serde_json::json!({ "tool": call.name })),
             );
             self.emit(ui, event).await?;
-            let mut result = self.tools.execute(call, &self.cancel).await;
+            let mut result = self.execute_call(call).await;
             // Redacted before it reaches the model, the store, or the
             // interface; the emitter above only covers adapter events.
             result.output = redact_text(&result.output, &self.secrets);
@@ -787,9 +886,24 @@ pub struct AgentBuilder {
     pub cache: Option<ModelCache>,
     pub workspace: Workspace,
     pub approval: ApprovalMode,
+    /// The workspace MCP runtime. `None` means no `.mcp.json` support for
+    /// sessions built here, which is what a caller that never opened one
+    /// gets.
+    pub mcp: Option<Arc<McpRuntime>>,
 }
 
 impl AgentBuilder {
+    /// Shares one MCP runtime with every session this builder opens. One
+    /// connection per server per workspace, not one per turn.
+    pub fn with_mcp(mut self, mcp: Arc<McpRuntime>) -> Self {
+        self.mcp = Some(mcp);
+        self
+    }
+
+    pub fn mcp(&self) -> Option<&Arc<McpRuntime>> {
+        self.mcp.as_ref()
+    }
+
     /// Loads the profile's model list into the catalog, refreshing at most
     /// daily. A missing list is reported, not fatal: capabilities then
     /// come back unreported.
@@ -1028,12 +1142,18 @@ impl AgentBuilder {
             ("profile".to_string(), provider_profile.clone()),
             ("model".to_string(), model.clone()),
         ]);
+        let mcp_tools = match &self.mcp {
+            Some(mcp) => mcp.tool_set().await,
+            None => McpToolSet::default(),
+        };
         Ok(NativeAgent {
             session,
             adapter,
             store: Arc::clone(&self.store),
             policy,
             tools,
+            mcp: self.mcp.clone(),
+            mcp_tools,
             telemetry: Arc::clone(&self.telemetry),
             cancel,
             approval: self.approval,

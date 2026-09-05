@@ -62,6 +62,16 @@ impl PolicyConfig {
                     "run a shell command",
                 ),
                 rule("network", "*", PolicyOutcome::Ask, "network access"),
+                // MCP tools run outside Gritt, in a server the workspace
+                // configured. They are gated like the shell: asked, never
+                // assumed. A server's own read-only annotation does not
+                // change this.
+                rule(
+                    crate::mcp::DISPATCH_TOOL_PATTERN,
+                    "*",
+                    PolicyOutcome::Ask,
+                    "call a tool on an MCP server",
+                ),
                 rule("*", "*", PolicyOutcome::Deny, "outside the workspace"),
             ],
             fallback: PolicyOutcome::Deny,

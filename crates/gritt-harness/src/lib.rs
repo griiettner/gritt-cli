@@ -13,6 +13,7 @@ pub mod connector_session;
 pub mod control;
 pub mod draft;
 pub mod driver;
+pub mod mcp;
 pub mod modes;
 pub mod native_connector;
 pub mod policy;

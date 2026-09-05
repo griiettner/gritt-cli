@@ -23,6 +23,15 @@ tokio = { workspace = true }
 turso = { workspace = true }
 uuid = { workspace = true }
 
+# Test-only: a scriptable MCP server the runtime tests drive as a real child
+# process. Not part of the library and not built by the default workspace
+# members.
+[[bin]]
+name = "gritt-mcp-fixture"
+path = "tests/fixtures/fake_mcp_server.rs"
+test = false
+doc = false
+
 [dev-dependencies]
 # Test-only: the fake external agent drives the control plane.
 gritt-connector = { workspace = true }

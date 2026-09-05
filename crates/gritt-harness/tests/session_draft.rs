@@ -115,6 +115,7 @@ async fn fixture_plane_with(
         cache,
         workspace: Workspace::open(dir.path()).unwrap(),
         approval: ApprovalMode::DenyAll,
+        mcp: None,
     };
     Fixture {
         dir,

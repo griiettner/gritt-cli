@@ -13,6 +13,7 @@ pub mod connector;
 pub mod embeddings;
 pub mod error;
 pub mod event;
+pub mod mcp;
 pub mod policy;
 pub mod provider;
 pub mod secret;

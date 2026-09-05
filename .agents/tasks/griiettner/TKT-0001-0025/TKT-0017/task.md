@@ -3,7 +3,7 @@ id: TKT-0017
 namespace: griiettner
 title: Implement generic .mcp.json MCP runtime and harness tool dispatch
 artifact: task
-status: planning
+status: done
 owner: griiettner
 created: 2026-09-04
 updated: 2026-09-04
