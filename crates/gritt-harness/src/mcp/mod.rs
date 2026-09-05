@@ -135,11 +135,13 @@ impl ServerRuntime {
 struct RuntimeState {
     servers: BTreeMap<String, ServerRuntime>,
     registry: ToolRegistry,
-    /// Connections that exist but are not installed against an entry yet,
-    /// because their handshake is still running. Shutdown has to see these:
-    /// a child launched by an in-flight initialization is just as real as an
-    /// installed one.
-    launching: HashMap<u64, Arc<Connection>>,
+    /// Launches that are under way but not installed against an entry yet.
+    ///
+    /// A slot is reserved before anything is spawned and released only once
+    /// the connection is installed or its cleanup has finished, so there is
+    /// no instant in which a live child belongs to nobody. The value is
+    /// `None` between reserving the slot and the process existing.
+    launching: HashMap<u64, Option<Arc<Connection>>>,
     /// Set once shutdown has begun, so a launch that starts afterwards is
     /// closed instead of installed.
     closing: bool,
@@ -472,24 +474,20 @@ impl McpRuntime {
             .buffer_unordered(limit)
             .collect()
             .await;
-        let mut stale = Vec::new();
+        let mut stale: Vec<(u64, Arc<Connection>)> = Vec::new();
         {
             let mut state = self.state.lock().await;
             for (name, generation, outcome) in outcomes {
-                // Whatever happens next, this connection stops being a
-                // pending launch and becomes either installed or closed, in
-                // this one critical section.
-                if let Ok(established) = &outcome {
-                    state.launching.remove(&established.launch);
-                }
                 let current = state.servers.get(&name).map(|entry| entry.generation);
                 if current != Some(generation) || state.closing {
                     // Reloaded, denied, stopped, or shut down while this was
                     // connecting. The result belongs to a definition that is
                     // no longer configured under this name, or to a runtime
-                    // that is going away.
+                    // that is going away. It keeps its launch slot until the
+                    // close below finishes, so shutdown cannot see an empty
+                    // map while the child is still going away.
                     if let Ok(established) = outcome {
-                        stale.push(established.connection);
+                        stale.push((established.launch, established.connection));
                     }
                     continue;
                 }
@@ -509,6 +507,10 @@ impl McpRuntime {
                         entry.server_version = established
                             .server_version
                             .map(|version| redact_text(&version, &secrets));
+                        // Installed: the entry owns the connection from here,
+                        // so the launch slot is released in the same critical
+                        // section that took ownership of it.
+                        state.launching.remove(&established.launch);
                         state.registry.remove_server(&name);
                         for tool in &established.tools {
                             state.registry.insert(&name, tool);
@@ -524,7 +526,13 @@ impl McpRuntime {
                 }
             }
         }
-        close_all(stale).await;
+        // Closed first, released second: the slot is what keeps shutdown
+        // waiting for these.
+        let (launches, connections): (Vec<u64>, Vec<Arc<Connection>>) = stale.into_iter().unzip();
+        close_all(connections).await;
+        for launch in launches {
+            self.finish_launch(launch).await;
+        }
         self.snapshots().await
     }
 
@@ -670,7 +678,7 @@ impl McpRuntime {
             // Children whose handshake never finished. Closing these is what
             // stops a stalled initialization from outliving the runtime, and
             // it also unblocks the future waiting on that handshake.
-            connections.extend(state.launching.values().cloned());
+            connections.extend(state.launching.values().flatten().cloned());
             state.registry = ToolRegistry::new();
             connections
         };
@@ -683,7 +691,7 @@ impl McpRuntime {
         loop {
             let remaining: Vec<Arc<Connection>> = {
                 let state = self.state.lock().await;
-                state.launching.values().cloned().collect()
+                state.launching.values().flatten().cloned().collect()
             };
             if remaining.is_empty() || std::time::Instant::now() >= deadline {
                 // Anything still here has already been closed above; the
@@ -930,28 +938,42 @@ impl McpRuntime {
         config: &McpServerConfig,
         cancel: &CancellationToken,
     ) -> std::result::Result<Established, String> {
-        let (connection, pid, stderr) = match &config.transport {
-            McpTransport::Stdio { command, args, env } => {
-                let launch = stdio::launch(
-                    &self.workspace,
-                    command,
-                    args,
-                    env,
-                    self.settings.shutdown_grace,
-                )
-                .map_err(|error| error.message)?;
-                let stderr = Arc::clone(&launch.stderr);
-                (Arc::new(launch.connection), launch.pid, Some(stderr))
-            }
-            McpTransport::Http { url, headers } => {
-                let Some(transport) = self.http.clone() else {
-                    return Err(
-                        "this Gritt build has no HTTP transport for MCP endpoints".to_owned()
-                    );
-                };
-                (Arc::new(http::connect(transport, url, headers)), None, None)
+        // The slot is claimed before anything is spawned. A launch that
+        // starts during shutdown is refused here, so it never becomes a child
+        // that nobody owns, and one that starts just before it is already
+        // registered by the time the process exists.
+        let Some(launch) = self.reserve_launch().await else {
+            return Err("the runtime is shutting down".to_owned());
+        };
+        let spawned = match &config.transport {
+            McpTransport::Stdio { command, args, env } => stdio::launch(
+                &self.workspace,
+                command,
+                args,
+                env,
+                self.settings.shutdown_grace,
+            )
+            .map(|started| {
+                let stderr = Arc::clone(&started.stderr);
+                (Arc::new(started.connection), started.pid, Some(stderr))
+            })
+            .map_err(|error| error.message),
+            McpTransport::Http { url, headers } => match self.http.clone() {
+                Some(transport) => {
+                    Ok((Arc::new(http::connect(transport, url, headers)), None, None))
+                }
+                None => Err("this Gritt build has no HTTP transport for MCP endpoints".to_owned()),
+            },
+        };
+        let (connection, pid, stderr) = match spawned {
+            Ok(spawned) => spawned,
+            Err(reason) => {
+                // Nothing was started, so the slot is released at once.
+                self.finish_launch(launch).await;
+                return Err(reason);
             }
         };
+        self.attach_launch(launch, &connection).await;
         let tail = |reason: String| match &stderr {
             Some(stderr) => {
                 let tail = stderr.lock().expect("mcp stderr");
@@ -964,16 +986,6 @@ impl McpRuntime {
             }
             None => reason,
         };
-        // From here the connection exists, and with it a child process. It is
-        // registered before the handshake so shutdown can reach it: a
-        // connection that only lives inside this future is just as real as an
-        // installed one, and a stalled handshake would otherwise keep a child
-        // alive past shutdown.
-        let launch = self.launches.fetch_add(1, Ordering::SeqCst);
-        if !self.register_launch(launch, &connection).await {
-            connection.shutdown().await;
-            return Err("the runtime is shutting down".to_owned());
-        }
         // The overall deadline wraps the negotiation only. Wrapping the whole
         // function would drop it while it still owned the connection, and
         // nothing would then close that child or release its registration.
@@ -1039,19 +1051,33 @@ impl McpRuntime {
     /// Records a connection that exists but is not installed yet. Returns
     /// false when shutdown has already begun, in which case the caller closes
     /// it instead.
-    async fn register_launch(&self, launch: u64, connection: &Arc<Connection>) -> bool {
+    /// Claims a launch slot before anything is spawned.
+    ///
+    /// `None` means shutdown has begun, so nothing should be started at all.
+    /// Reserving first is what keeps a rejected launch from spawning a child
+    /// that shutdown cannot see.
+    async fn reserve_launch(&self) -> Option<u64> {
         let mut state = self.state.lock().await;
         if state.closing {
-            return false;
+            return None;
         }
-        state.launching.insert(launch, Arc::clone(connection));
-        true
+        let launch = self.launches.fetch_add(1, Ordering::SeqCst);
+        state.launching.insert(launch, None);
+        Some(launch)
     }
 
-    /// Releases a launch whose connection has already been closed.
+    /// Puts the connection into its reserved slot, so shutdown can close it.
+    async fn attach_launch(&self, launch: u64, connection: &Arc<Connection>) {
+        let mut state = self.state.lock().await;
+        if let Some(slot) = state.launching.get_mut(&launch) {
+            *slot = Some(Arc::clone(connection));
+        }
+    }
+
+    /// Releases a launch slot.
     ///
-    /// A launch that succeeded keeps its registration until `start` installs
-    /// or closes it; see [`Established::launch`].
+    /// Only called once the connection is installed against an entry or its
+    /// cleanup has completed; see [`Established::launch`].
     async fn finish_launch(&self, launch: u64) {
         self.state.lock().await.launching.remove(&launch);
     }
