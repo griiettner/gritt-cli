@@ -5,6 +5,7 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1001,5 +1002,147 @@ fn the_live_walkthrough_runs_at_eighty_by_twenty_four() {
     escape(&mut writer);
 
     quit(&mut child, &rx, &mut seen, &mut writer);
+    assert!(!seen.contains("pty-key"), "the key must never be drawn");
+}
+
+/// Quitting the full-screen mode kills an MCP server that never answers.
+///
+/// The launch path and the interrupt path are already covered against
+/// `gritt mcp trust` (`e2e.rs`). This is the third exit the chain added: a
+/// server trusted for this workspace is started when the full-screen mode
+/// opens on the native path, and Ctrl-Q has to take it with it. The server
+/// never speaks MCP, so it is still inside initialization when the quit
+/// arrives, and it sits in its own process group, so only a group kill ends
+/// it (TKT-0020).
+#[cfg(unix)]
+#[test]
+fn quitting_the_full_screen_mode_leaves_no_mcp_server_running() {
+    let dir = tempfile::tempdir().unwrap();
+    write_config(dir.path());
+    let database = dir.path().join("gritt.db");
+    let pidfile = dir.path().join("server.pid");
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        serde_json::json!({"mcpServers": {"never-answers": {
+            "command": "sh",
+            "args": ["-c", format!("echo $$ > {}; sleep 300", pidfile.display())],
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+
+    // Approve the definition for this workspace. The command launches the
+    // server, waits out its initialization deadline, records the decision,
+    // and cleans up; what matters here is the record it leaves behind.
+    let trust = std::process::Command::new(env!("CARGO_BIN_EXE_gritt"))
+        .args([
+            "--workspace",
+            &dir.path().to_string_lossy(),
+            "--database",
+            &database.to_string_lossy(),
+            "mcp",
+            "trust",
+            "never-answers",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        trust.status.success(),
+        "trust failed: {}",
+        String::from_utf8_lossy(&trust.stderr)
+    );
+    let _ = std::fs::remove_file(&pidfile);
+
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_gritt"));
+    command.args([
+        "--workspace",
+        &dir.path().to_string_lossy(),
+        "--database",
+        &database.to_string_lossy(),
+        "tui",
+        "--no-models",
+        "--session",
+        "mcp-quit",
+    ]);
+    command.env("GRITT_E2E_KEY", "pty-key");
+    command.env("TERM", "xterm-256color");
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let mut writer = pair.master.take_writer().unwrap();
+    let mut seen = String::new();
+    wait_for(&rx, &mut seen, ALT_SCREEN_ON, Duration::from_secs(30));
+
+    // The server the full-screen mode started, by its own pid.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !pidfile.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the full-screen mode never started the trusted server"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let server: u32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    // Ctrl-Q, while the server is still inside its handshake.
+    writer.write_all(&[0x11]).unwrap();
+    writer.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the process did not exit on Ctrl-Q"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &server.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !alive {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "an MCP server outlived the full-screen mode"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
     assert!(!seen.contains("pty-key"), "the key must never be drawn");
 }
