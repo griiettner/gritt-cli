@@ -101,71 +101,9 @@ pub struct CostSection {
     pub scope: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChangeStatus {
-    Added,
-    Modified,
-    Deleted,
-    Renamed,
-    Untracked,
-}
-
-impl ChangeStatus {
-    pub fn label(self) -> &'static str {
-        match self {
-            ChangeStatus::Added => "added",
-            ChangeStatus::Modified => "modified",
-            ChangeStatus::Deleted => "deleted",
-            ChangeStatus::Renamed => "renamed",
-            ChangeStatus::Untracked => "new",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChangedFile {
-    pub path: String,
-    pub status: ChangeStatus,
-    /// Present in the workspace before Gritt opened it. The sidebar
-    /// reports workspace state; it does not claim authorship.
-    pub pre_existing: bool,
-}
-
-/// Where the changed-file list came from, which decides how complete it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChangeSource {
-    /// Read-only Git status against the baseline taken at open.
-    Git,
-    /// No Git repository: only files Gritt itself wrote are observable.
-    ObservedWrites,
-}
-
-impl ChangeSource {
-    pub fn caveat(self) -> Option<&'static str> {
-        match self {
-            ChangeSource::Git => None,
-            ChangeSource::ObservedWrites => Some("partial: observed writes only"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChangedFiles {
-    /// Not collected yet, or collection is not possible here.
-    Unavailable { reason: String },
-    Observed {
-        source: ChangeSource,
-        files: Vec<ChangedFile>,
-    },
-}
-
-impl Default for ChangedFiles {
-    fn default() -> Self {
-        ChangedFiles::Unavailable {
-            reason: "not collected yet".into(),
-        }
-    }
-}
+/// The changed-file types live with the harness service that produces
+/// them, so the renderer and the observer cannot drift apart.
+pub use crate::changes::{ChangeSource, ChangeStatus, ChangedFile, ChangedFiles};
 
 /// Integration sections. A section that is `None` is hidden entirely;
 /// `Some(empty)` means an inventory was checked and found empty, which is

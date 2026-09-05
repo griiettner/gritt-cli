@@ -75,6 +75,29 @@ impl ControlPlane {
         &self.setup
     }
 
+    /// Re-reads configuration through the injected setup service and
+    /// rebuilds the plane around it.
+    ///
+    /// Saving a profile writes a file; it does not change the `Config` this
+    /// plane was built with. Without this, a profile created from the setup
+    /// flow would not appear in the connection picker until the next run.
+    /// The store, telemetry, catalog, cache, workspace, and MCP runtime are
+    /// shared handles and survive the rebuild, so nothing already open is
+    /// disturbed: only the configuration-derived parts change.
+    ///
+    /// Returns whether a reload happened. A service that cannot reload
+    /// answers `false` rather than pretending.
+    pub fn reload_config(&mut self) -> bool {
+        let Some(config) = self.setup.reload_config() else {
+            return false;
+        };
+        let mut builder = (*self.builder).clone();
+        builder.config = config;
+        self.builder = Arc::new(builder);
+        self.native = Arc::new(NativeConnector::new(Arc::clone(&self.builder)));
+        true
+    }
+
     /// Every configured profile with credential availability, never a
     /// value.
     pub fn profile_summaries(&self) -> Vec<ProfileSummary> {

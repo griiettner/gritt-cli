@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use gritt_core::config::Config;
 use gritt_core::provider::{Protocol, ProviderProfile};
 use gritt_core::secret::Secret;
 use serde::{Deserialize, Serialize};
@@ -150,6 +151,18 @@ pub trait ProviderSetup: Send + Sync {
     /// Writes a key to the keychain entry the profile names. Never to a
     /// file.
     fn store_credential(&self, profile: &ProviderProfile, value: Secret) -> CredentialStoreOutcome;
+
+    /// Re-reads the configuration layers this service writes to.
+    ///
+    /// [`ProfileSaveOutcome::Saved`] says a file changed, not that the
+    /// running configuration did. An interface that just created a profile
+    /// needs it to be usable without a restart, and only the binary knows
+    /// which layers to merge (ADR-006), so the reload lives here too.
+    /// `None` means this service cannot reload, which is the default and
+    /// what a read-only harness answers.
+    fn reload_config(&self) -> Option<Config> {
+        None
+    }
 }
 
 /// The default when nothing was injected: every write is reported as
