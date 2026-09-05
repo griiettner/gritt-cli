@@ -881,7 +881,16 @@ impl McpRuntime {
     /// with its query string removed, and environment or header **names**
     /// without their values. And the result is redacted against the
     /// credentials this entry's own interpolation produced, so a value
-    /// that reached an argument through `${TOKEN}` cannot be echoed here.
+    /// that reached the environment or a header through `${TOKEN}` cannot
+    /// be echoed here.
+    ///
+    /// Arguments are shown verbatim, which is the point: the user is being
+    /// asked to approve exactly this command line. They are not
+    /// interpolated, so no `${VAR}` can resolve a credential into one, but
+    /// a literal secret written directly into `args` in `.mcp.json` would
+    /// be displayed. Credential-named `env` and `headers` fields refuse a
+    /// literal for that reason; `args` cannot, because an argument has no
+    /// name to judge (TKT-0020).
     ///
     /// `None` for an entry that cannot run; its state already carries the
     /// reason.
