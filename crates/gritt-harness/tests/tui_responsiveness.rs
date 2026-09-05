@@ -281,8 +281,7 @@ fn input_to_frame_latency_for_typing_picker_navigation_and_scrolling() {
 
     // Picker navigation. The session picker is the longest list the
     // interface builds from real data, so it is the honest case.
-    let sessions: Vec<gritt_core::session::Session> =
-        (0..samples(500)).map(session).collect();
+    let sessions: Vec<gritt_core::session::Session> = (0..samples(500)).map(session).collect();
     app.load_sessions(sessions);
     app.dispatch(gritt_harness::tui::command::Command::Sessions, None);
     let mut picker = Series::new("picker navigation");
