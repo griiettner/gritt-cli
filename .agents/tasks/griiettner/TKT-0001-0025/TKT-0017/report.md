@@ -252,7 +252,9 @@ All run from the worktree on the final tree:
 - `cargo test --workspace`: pass. Adds gritt 14 unit, 11 e2e, 4 tui_pty;
   gritt-connector 5 unit, 25 connectors, 3 live (skips).
 - `GRITT_LIVE_MCP_TESTS=1 cargo test -p gritt-harness --test mcp_live_smoke
-  -- --nocapture`: pass, with the result below.
+  -- --nocapture`: pass, with the result below. The check now fails if a
+  server whose executable is present, on a supported transport, does not
+  become ready; it previously passed when every available server failed.
 - Manual: `gritt mcp list` showed `gritt stdio awaiting approval`; `gritt mcp
   trust gritt` then showed `ready` with `mcp__gritt__search_local_memory`,
   `mcp__gritt__read_local_memory`, and `mcp__gritt__delegate_run`. No tool was
@@ -266,9 +268,10 @@ The workspace file declares exactly one entry.
 | --- | --- | --- |
 | `gritt` (stdio, `.agents/gritt-agent mcp serve`) | available | ready, protocol `2025-06-18`, 3 tools listed |
 
-No tool was called, `delegate_run` included. The memory database was not
-written by the check; the server's own first-run indexing wrote it before the
-check, and that file is gitignored.
+No tool was called, `delegate_run` included. That is the whole of what the
+check guarantees: Gritt issues no `tools/call`. It does not and cannot
+promise a server writes nothing during its own startup — this one indexes its
+memory database when it starts, as the edge case below records.
 
 New tests, one per stated behavior. Core: a missing `mcpServers` object,
 malformed JSON that does not echo its content, an inferred stdio entry with
@@ -287,13 +290,17 @@ the 4 native-session cases listed in the commit messages.
 
 ## Completion Gate
 
-- **Acceptance**: yes. Every configured entry has a state and a reason;
-  supported servers initialize and list tools; duplicate tool names stay
-  addressable; a denied call never reaches a server, proven by a marker the
-  fixture writes only when a call arrives; a failed server leaves healthy
-  ones usable; cancellation and shutdown leave no child process, proven by
-  checking the pids afterwards; and no snapshot, event, error, or log carries
-  a secret, asserted directly in two tests.
+- **Acceptance**: yes, after the review fixes recorded in the update below.
+  Every configured entry has a state and a non-empty explanation; supported
+  servers initialize and list tools; a turn calls the exact tool identity it
+  was authorized for; a denied call never reaches a server, proven by a
+  marker the fixture writes only when a call arrives, and revoking a
+  server's trust removes its tools and closes it; a failed server leaves
+  healthy ones usable; cancellation and shutdown leave no child process,
+  including descendants that outlive their parent, checked by pid on unix and
+  reported as skipped elsewhere; and a credential is redacted out of server
+  metadata, errors, schemas, and results, proven by fixtures that echo their
+  own configured credential on both transports.
 - **Scope**: yes. No Ratatui home, composer, palette, sidebar, picker, or
   benchmark UI. No hard-coded server name anywhere; every fixture uses an
   invented one. No provider wire format, event model shape, connector
@@ -353,6 +360,19 @@ the 4 native-session cases listed in the commit messages.
   by owner when connector sessions are active. Nothing here claims otherwise,
   and the runtime is only started for native sessions, but the labelling
   itself belongs to the sidebar step.
+- **Lifecycle event delivery.** There is no subscription for MCP state
+  changes, so TKT-0019 has to poll `snapshots()`. Defining that delivery is
+  the cheapest remaining improvement for the TUI step.
 - **HTTP resumability.** `Last-Event-ID` replay and the server-initiated
   `GET` stream are not implemented. Neither is needed for tool dispatch; both
   would matter for long-running server-initiated work.
+
+## Updates
+
+- [2026-09-04 review fixes](updates/2026-09-04-review-fixes.md): credential
+  redaction at the runtime boundary, trust enforced on restart and revoked on
+  denial, CLI cleanup on cancellation and startup errors, generation-checked
+  lifecycle results, frozen tool identity on dispatch, bounded writes and
+  input, process-group cleanup past the direct child, owned HTTP request
+  tasks, the HTTP initialization barrier and server-request answers, and
+  backend-driven MCP startup.

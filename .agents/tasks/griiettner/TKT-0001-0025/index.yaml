@@ -334,6 +334,7 @@ tickets:
     artifacts:
       task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0017/task.md
       report: .agents/tasks/griiettner/TKT-0001-0025/TKT-0017/report.md
+      updates: .agents/tasks/griiettner/TKT-0001-0025/TKT-0017/updates/
     dependencies:
       - TKT-0016
     areas:
