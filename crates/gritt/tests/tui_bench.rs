@@ -63,6 +63,36 @@ fn write_bare_config(dir: &Path) {
     std::fs::write(dir.join("config.toml"), "\n").unwrap();
 }
 
+/// Proves the fixture really resolves no profiles.
+///
+/// An empty project config is not enough on its own: the user layer is
+/// merged under it and extends the profile map. `doctor` prints one line
+/// per profile with its credential state, so an empty profiles section is
+/// the evidence that nothing will reach the keychain.
+fn assert_no_profiles_resolve(dir: &Path, home: &Path) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_gritt"))
+        .args([
+            "--workspace",
+            &dir.to_string_lossy(),
+            "--database",
+            &dir.join("gritt.db").to_string_lossy(),
+            "doctor",
+        ])
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        !text.contains("key available") && !text.contains("no key for profile"),
+        "a profile resolved in the fixture, so startup still reaches the keychain:\n{text}"
+    );
+    record("idle fixture: zero profiles resolve, so no keychain call is made");
+}
+
 /// A configured workspace: one profile with a key variable that resolves, so
 /// startup does the work it does for a real user rather than a short path
 /// through "nothing is configured".
@@ -117,6 +147,10 @@ fn plain(output: &str) -> String {
 /// A running binary in a pseudo-terminal, with its output collected on a
 /// thread so a read can never block the test.
 struct Session {
+    /// An empty home for the child. `dirs::config_dir()` and
+    /// `dirs::cache_dir()` are derived from it, so this is what keeps the
+    /// developer's own `config.toml` and model cache out of a measurement.
+    _home: tempfile::TempDir,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     rx: mpsc::Receiver<Vec<u8>>,
@@ -164,6 +198,25 @@ impl Session {
         command.env("GRITT_BENCH_KEY", "bench-key-never-drawn");
         command.env("TERM", "xterm-256color");
         command.env("NO_COLOR", "1");
+        // The user configuration layer is merged under the project one and
+        // extends the profile map rather than replacing it, so a developer's
+        // own profiles would otherwise reach `profile_summaries` and its
+        // keychain calls. Pointing the child's home at an empty directory
+        // removes that layer, and the model cache with it.
+        let home = tempfile::tempdir().unwrap();
+        command.env("HOME", home.path().to_string_lossy().to_string());
+        command.env(
+            "XDG_CONFIG_HOME",
+            home.path().join("config").to_string_lossy().to_string(),
+        );
+        command.env(
+            "XDG_CACHE_HOME",
+            home.path().join("cache").to_string_lossy().to_string(),
+        );
+        command.env(
+            "XDG_DATA_HOME",
+            home.path().join("data").to_string_lossy().to_string(),
+        );
         // Startup probes every installed agent, and each probe runs a real
         // executable under a 15 second deadline. An empty `PATH` means none
         // is found, so startup work finishes on a schedule this test
@@ -192,6 +245,7 @@ impl Session {
         });
         let writer = pair.master.take_writer().unwrap();
         Self {
+            _home: home,
             master: pair.master,
             child,
             rx,
@@ -237,6 +291,10 @@ impl Session {
     /// continuous redraw" means at the terminal.
     fn bytes_seen(&self) -> usize {
         self.seen.len()
+    }
+
+    fn home(&self) -> &Path {
+        self._home.path()
     }
 
     fn resize(&self, rows: u16, cols: u16) {
@@ -490,6 +548,7 @@ fn idle_cpu_and_redraw_over_thirty_seconds() {
     let mut session = Session::start_with_existing_config(dir.path(), 40, 120, &["--no-models"]);
     session.wait_for(ALT_SCREEN_ON, Duration::from_secs(30));
     session.wait_for(COMPOSER_UNCONFIGURED, Duration::from_secs(30));
+    assert_no_profiles_resolve(dir.path(), session.home());
     // Measure only once the terminal has actually gone silent.
     assert!(
         session.wait_until_quiet(Duration::from_secs(2), Duration::from_secs(60)),
@@ -552,6 +611,7 @@ fn an_idle_session_writes_nothing_to_the_terminal() {
     let mut session = Session::start_with_existing_config(dir.path(), 40, 120, &["--no-models"]);
     session.wait_for(ALT_SCREEN_ON, Duration::from_secs(30));
     session.wait_for(COMPOSER_UNCONFIGURED, Duration::from_secs(30));
+    assert_no_profiles_resolve(dir.path(), session.home());
     // Startup's background work (agent probes and the change scan; there
     // are no profiles to resolve, so nothing reaches the keychain)
     // each land as a message and legitimately redraw. Wait for real
