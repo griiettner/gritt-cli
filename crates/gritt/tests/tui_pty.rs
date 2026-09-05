@@ -840,7 +840,7 @@ fn a_connector_session_shows_its_identity_and_refuses_the_native_pickers() {
     // prove nothing about the connector path.
     let Some(executable) = ["codex", "claude", "cursor-agent"]
         .into_iter()
-        .find_map(|name| which(name))
+        .find_map(which)
     else {
         eprintln!(
             "skipped: no connector executable (codex, claude, cursor-agent) is installed here"
@@ -899,4 +899,95 @@ fn which(name: &str) -> Option<std::path::PathBuf> {
     std::env::split_paths(&path)
         .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())
+}
+
+/// The reference walkthrough against the live control plane at a narrow
+/// size: home, a prompt that opens the session, the sidebar as a drawer,
+/// `/mcp` accounting for a broken entry, `/help`, and Ctrl-J for a
+/// newline. The wide size is covered by the tests above.
+///
+/// This is the automated half of the walkthrough. What it cannot cover is
+/// recorded with it: Shift-Enter is only distinguishable on terminals that
+/// report it, and this harness writes bytes rather than key events, so
+/// Ctrl-J is the newline the test can prove.
+#[test]
+fn the_live_walkthrough_runs_at_eighty_by_twenty_four() {
+    let port = serve(vec![text_sse("Narrow answer.")]);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "default_profile = \"local\"\ndefault_model = \"openai/gpt-5-nano\"\n\
+             [profiles.local]\nname = \"local\"\nprotocol = \"chat_completions\"\n\
+             base_url = \"http://127.0.0.1:{port}/v1\"\n\
+             [profiles.local.key]\nkeychain_service_entry = \"gritt-e2e-no-such-entry/local\"\n\
+             env_var_name = \"GRITT_E2E_KEY\"\n"
+        ),
+    )
+    .unwrap();
+    // An entry that cannot run: no process is started and `/mcp` must
+    // still account for it with a reason.
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        r#"{"mcpServers": {"broken-entry": {"args": ["x"]}}}"#,
+    )
+    .unwrap();
+    let Fixture {
+        master: _master,
+        mut child,
+        output: rx,
+        input: mut writer,
+    } = spawn_tui(
+        dir.path(),
+        &["--no-models"],
+        80,
+        24,
+        &[("GRITT_E2E_KEY", "pty-key")],
+    );
+    let mut seen = String::new();
+    wait_for(&rx, &mut seen, ALT_SCREEN_ON, Duration::from_secs(20));
+    wait_for(&rx, &mut seen, "Type a prompt", Duration::from_secs(20));
+
+    // Ctrl-J inserts a newline instead of submitting: the prompt that
+    // arrives has both lines in it, which is what the transcript shows
+    // once the layout switches and the area is redrawn whole.
+    send(&mut writer, b"first line");
+    send(&mut writer, &[0x0a]);
+    send(&mut writer, b"second line");
+    thread::sleep(Duration::from_millis(300));
+    send(&mut writer, b"\r");
+    wait_for(&rx, &mut seen, "Narrow answer.", Duration::from_secs(30));
+    let transcript = plain(&seen);
+    assert!(transcript.contains("first line"), "{transcript}");
+    assert!(
+        transcript.contains("second line"),
+        "Ctrl-J submitted instead of inserting a newline:\n{transcript}"
+    );
+    // Below 110 columns the column is collapsed; `/sidebar` is the drawer.
+    let before = plain(&seen);
+    assert!(
+        !before.contains("Changed files"),
+        "the column was drawn at 80 columns"
+    );
+    send(&mut writer, b"/sidebar\r");
+    wait_for(&rx, &mut seen, "Changed files", Duration::from_secs(20));
+    escape(&mut writer);
+
+    // Every configured MCP entry is accounted for, including one that
+    // cannot run.
+    send(&mut writer, b"/mcp\r");
+    wait_for(&rx, &mut seen, "broken-entry", Duration::from_secs(20));
+    wait_for(&rx, &mut seen, "invalid", Duration::from_secs(20));
+    escape(&mut writer);
+
+    send(&mut writer, b"/help\r");
+    wait_for(&rx, &mut seen, "Commands", Duration::from_secs(20));
+    // A 24-row terminal cannot show the whole help, so it scrolls: the
+    // capability limitations are reachable rather than cut off.
+    send(&mut writer, b"jjjjjjjjjjjjjjjjjjjjjjjj");
+    wait_for(&rx, &mut seen, "Limitations", Duration::from_secs(20));
+    escape(&mut writer);
+
+    quit(&mut child, &rx, &mut seen, &mut writer);
+    assert!(!seen.contains("pty-key"), "the key must never be drawn");
 }
