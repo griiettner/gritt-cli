@@ -114,6 +114,41 @@ transcript with tool activity, a status bar, approval and diff views, a
 command palette, and a session list. Both are described in
 [Terminal modes](terminal-modes.md).
 
+### A first full-screen run
+
+You do not need a configured provider to start. Run:
+
+```bash
+gritt tui
+```
+
+The home screen shows the Gritt wordmark, a composer, and a status line with
+the working directory, connection, model, effort, and phase. With nothing
+configured it says `Use /connect to get started.`
+
+Type `/connect` and press Enter. The picker lists configured provider
+profiles, any installed agents it found, a `Set up <name>…` row for each
+known provider you have not configured, and a `Custom endpoint…` row.
+Choosing a provider that has no key opens a setup form for the profile name,
+endpoint, key variable, and key. If you reach `/models` first, a profile with
+no key is headed there by the same `Set up <profile>…` row.
+Ctrl-T cycles the protocol, Ctrl-D chooses whether the profile lands in your
+user config or this project's, and Enter on the last field saves. The profile
+goes to `config.toml` and the key goes to the operating system keychain. The
+key value is never written to a config file, never drawn on screen, and never
+appears in a transcript, so there is no secret to put in an example here.
+[Keys](keys.md) covers `gritt key-set` if you would rather store the key
+before you start.
+
+Then `/models` to pick a model from that provider's list, `/effort` to choose
+reasoning effort, and `/code` if you want tools offered. Type a prompt and
+press Enter. Ctrl-J inserts a newline, Ctrl-P opens the command palette,
+Escape cancels what is running, and Ctrl-Q leaves and restores the terminal.
+
+To look at the layout before configuring anything, `gritt tui --fixture home`
+opens a labelled design-review screen built from invented data. It creates no
+session, sends no request, and starts no MCP server.
+
 ## Resume and manage sessions
 
 ```bash

@@ -117,3 +117,16 @@ memories:
       - wiring Gritt tools into an agent harness
       - adding tools to the Gritt MCP server
       - changing how agent CLIs are invoked headlessly
+  - id: ADR-013
+    title: Reasoning effort, the MCP client runtime, and TUI runtime seams
+    file: ADR-013-effort-mcp-runtime-and-tui-seams.md
+    tags:
+      - providers
+      - sessions
+      - mcp
+      - permissions
+      - tui
+    read_when:
+      - adding or changing a reasoning effort mapping for a protocol
+      - changing MCP trust, dispatch names, or the tool permission default
+      - changing what the binary injects into the full-screen runtime

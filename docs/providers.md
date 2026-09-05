@@ -55,14 +55,70 @@ refresh is not retried until the interval passes. With no cache and a failed
 fetch the model list is reported missing and capabilities are unreported.
 
 Capabilities recorded from the list: context length, tools, vision,
-structured output, reasoning, and pricing. Gritt does not fill gaps with
-guesses. A feature the provider reports as unsupported is refused before a
+structured output, reasoning, and pricing. These describe what Gritt parsed
+out of that provider's list, not what the model can do: a provider that
+reports nothing leaves every capability unreported even for a model that
+plainly supports the feature. Gritt does not fill gaps with guesses. A feature the provider reports as unsupported is refused before a
 request is sent. A feature the provider does not report at all is allowed
 and flagged with a `capability_warning` diagnostic on the first event of the
 turn, because OpenAI and Anthropic lists report no capability flags.
 
 Skip the list for one run with `--no-models`. `gritt doctor` shows each
 profile's cache state.
+
+## Reasoning effort
+
+Effort is provider-neutral in Gritt: `auto`, `low`, `medium`, or `high`. It
+is chosen with `/effort` in the full-screen mode, stored with a native
+session, and sent through the provider adapter. `auto` means Gritt sends no
+effort field at all, on every protocol, so it is always accepted.
+
+The three explicit levels are not uniform across protocols, and Gritt refuses
+a mapping it cannot make safely rather than claiming every level means the
+same thing everywhere. One rule decides, and both the adapter and the
+session-draft validator ask it, so they refuse the same cases for the same
+stated reason:
+
+| Protocol | Explicit level |
+| --- | --- |
+| Responses | Sent as `reasoning.effort`, unless the model list reports the model without reasoning support |
+| Chat Completions | Sent as `reasoning.effort` only when the provider's list reports reasoning support for that model; refused when support is unreported |
+| Messages | Refused. There is no field that is safe for every model, and Anthropic's list reports no capability flags to route on |
+
+Chat Completions has no effort field in the protocol itself; what Gritt sends
+is the OpenRouter form. Unreported support is not a safe mapping, so an
+unreported model refuses an explicit level instead of guessing. On Messages
+the older `thinking` budget is rejected by newer models and the newer
+`output_config.effort` by older ones, and with nothing to route on but the
+model name, every explicit level is refused. Guessing from a model name is
+not done anywhere.
+
+When a model list does name explicit levels, only those are accepted, on
+every protocol. No list Gritt parses today reports them, so this rule is
+inert until a provider starts publishing them.
+
+A refusal happens before any request is sent. It is an unsupported-capability
+error naming the model and the reason, and the reason travels in the
+diagnostic so an interface can distinguish "this model does not reason" from
+"this protocol cannot carry a level" from "the list offers other levels".
+This is why `/effort` on a cold Chat Completions start offers nothing
+explicit: the catalog has not arrived, so capabilities are unreported, and
+the levels appear once it loads.
+
+### The legacy reasoning switch
+
+`RequestOptions` still carries a boolean `reasoning` from before effort
+existed. The two combine as follows:
+
+- `reasoning = true` with effort `auto` means reasoning on at the provider's
+  default level. Responses sends `reasoning: {summary: "auto"}` and Chat
+  Completions sends `reasoning: {enabled: true}`, the latter only when the
+  list reports reasoning support. Messages keeps its `thinking` budget. It
+  does not stand in for `medium`.
+- `reasoning = true` with an explicit level sends the level, under the table
+  above.
+- `reasoning = false` with an explicit level is contradictory and is refused
+  as a configuration error rather than resolved in either direction.
 
 ## Aliases and deprecated models
 

@@ -5,6 +5,7 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1002,4 +1003,385 @@ fn the_live_walkthrough_runs_at_eighty_by_twenty_four() {
 
     quit(&mut child, &rx, &mut seen, &mut writer);
     assert!(!seen.contains("pty-key"), "the key must never be drawn");
+}
+
+/// Quitting the full-screen mode kills an MCP server that never answers.
+///
+/// The launch path and the interrupt path are already covered against
+/// `gritt mcp trust` (`e2e.rs`). This is the third exit the chain added: a
+/// server trusted for this workspace is started when the full-screen mode
+/// opens on the native path, and Ctrl-Q has to take it with it. The server
+/// never speaks MCP, so it is still inside initialization when the quit
+/// arrives, and it sits in its own process group, so only a group kill ends
+/// it (TKT-0020).
+#[cfg(unix)]
+#[test]
+fn quitting_the_full_screen_mode_leaves_no_mcp_server_running() {
+    let dir = tempfile::tempdir().unwrap();
+    write_config(dir.path());
+    let database = dir.path().join("gritt.db");
+    let pidfile = dir.path().join("server.pid");
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        serde_json::json!({"mcpServers": {"never-answers": {
+            "command": "sh",
+            "args": ["-c", format!("echo $$ > {}; sleep 300", pidfile.display())],
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+
+    // Approve the definition for this workspace. The command launches the
+    // server, waits out its initialization deadline, records the decision,
+    // and cleans up; what matters here is the record it leaves behind.
+    let trust = std::process::Command::new(env!("CARGO_BIN_EXE_gritt"))
+        .args([
+            "--workspace",
+            &dir.path().to_string_lossy(),
+            "--database",
+            &database.to_string_lossy(),
+            "mcp",
+            "trust",
+            "never-answers",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        trust.status.success(),
+        "trust failed: {}",
+        String::from_utf8_lossy(&trust.stderr)
+    );
+    let _ = std::fs::remove_file(&pidfile);
+
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_gritt"));
+    command.args([
+        "--workspace",
+        &dir.path().to_string_lossy(),
+        "--database",
+        &database.to_string_lossy(),
+        "tui",
+        "--no-models",
+        "--session",
+        "mcp-quit",
+    ]);
+    command.env("GRITT_E2E_KEY", "pty-key");
+    command.env("TERM", "xterm-256color");
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let mut writer = pair.master.take_writer().unwrap();
+    let mut seen = String::new();
+    wait_for(&rx, &mut seen, ALT_SCREEN_ON, Duration::from_secs(30));
+
+    // The server the full-screen mode started, by its own pid.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !pidfile.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the full-screen mode never started the trusted server"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let server: u32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    // Ctrl-Q, while the server is still inside its handshake.
+    writer.write_all(&[0x11]).unwrap();
+    writer.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the process did not exit on Ctrl-Q"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &server.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !alive {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "an MCP server outlived the full-screen mode"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!seen.contains("pty-key"), "the key must never be drawn");
+}
+
+/// A model list served after a delay, on `GET /v1/models`.
+///
+/// The delay is the point: it forces the question of whether the eager path
+/// resolves before or after the catalog arrives.
+fn serve_models(delay: Duration, body: String) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            thread::sleep(delay);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    port
+}
+
+/// A new named session must resolve its model against the model list, not
+/// against an empty catalog that has not loaded yet.
+///
+/// The eager path persists what it resolves. TKT-0020 moved catalog warming
+/// off the launch path for responsiveness, and for a moment that made this
+/// race: `--model` could resolve before the list arrived, so a retired id
+/// would be stored unremapped and the session would be pinned to a model the
+/// provider no longer serves. The warm is awaited on the eager path for
+/// exactly this reason, and the delay here is what proves it.
+#[cfg(unix)]
+#[test]
+fn a_new_named_session_resolves_its_model_against_the_loaded_catalog() {
+    let body = serde_json::json!({
+        "data": [
+            {"id": "retired-model", "deprecated": true, "replacement": "current-model"},
+            {"id": "current-model"},
+        ]
+    })
+    .to_string();
+    let port = serve_models(Duration::from_millis(2_500), body);
+
+    // The model cache lives under the user cache directory and is keyed by
+    // profile name, so a profile called `local` would be served from
+    // whatever an earlier run left there and this race would never appear.
+    // A name unique to this run guarantees a cold catalog.
+    let profile = format!(
+        "cat{}{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "default_profile = \"{profile}\"\ndefault_model = \"fallback-model\"\n\
+             [profiles.{profile}]\nname = \"{profile}\"\nprotocol = \"chat_completions\"\n\
+             base_url = \"http://127.0.0.1:{port}/v1\"\n\
+             [profiles.{profile}.key]\nkeychain_service_entry = \"gritt-e2e-no-such-entry/x\"\n\
+             env_var_name = \"GRITT_E2E_KEY\"\n"
+        ),
+    )
+    .unwrap();
+
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_gritt"));
+    command.args([
+        "--workspace",
+        &dir.path().to_string_lossy(),
+        "--database",
+        &dir.path().join("gritt.db").to_string_lossy(),
+        "tui",
+        "--session",
+        "fresh",
+        "--model",
+        "retired-model",
+    ]);
+    command.env("GRITT_E2E_KEY", "pty-key");
+    command.env("TERM", "xterm-256color");
+    command.env("NO_COLOR", "1");
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let mut seen = String::new();
+    wait_for(&rx, &mut seen, ALT_SCREEN_ON, Duration::from_secs(30));
+    wait_for(&rx, &mut seen, "Ask Gritt", Duration::from_secs(30));
+    let mut writer = pair.master.take_writer().unwrap();
+    writer.write_all(&[0x11]).unwrap();
+    writer.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the process did not exit");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!seen.contains("pty-key"), "the key must never be drawn");
+
+    // What the session was actually pinned to, read back from the store.
+    // The screen is not evidence here: the status line can show a drafted
+    // or configured model, while the row is what a resume will use.
+    let listed = std::process::Command::new(env!("CARGO_BIN_EXE_gritt"))
+        .args([
+            "--workspace",
+            &dir.path().to_string_lossy(),
+            "--database",
+            &dir.path().join("gritt.db").to_string_lossy(),
+            "session",
+            "list",
+        ])
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+    assert!(
+        listed.contains("fresh"),
+        "the eager session was never created: {listed}"
+    );
+    assert!(
+        listed.contains(&format!("{profile}/current-model")),
+        "the session was not pinned to the provider's replacement: {listed}"
+    );
+    assert!(
+        !listed.contains("retired-model"),
+        "the session was pinned to the retired id: {listed}"
+    );
+}
+
+/// A `.mcp.json` that cannot be parsed must say so.
+///
+/// The failure happens before any entry is published, so the lifecycle
+/// subscription delivers an empty list. Reporting nothing would show "no MCP
+/// servers configured", which is what a workspace with no file looks like and
+/// is the opposite of the truth (TKT-0020).
+#[cfg(unix)]
+#[test]
+fn a_malformed_mcp_configuration_is_reported_in_the_interface() {
+    let dir = tempfile::tempdir().unwrap();
+    write_config(dir.path());
+    std::fs::write(dir.path().join(".mcp.json"), "{ this is not json").unwrap();
+
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_gritt"));
+    command.args([
+        "--workspace",
+        &dir.path().to_string_lossy(),
+        "--database",
+        &dir.path().join("gritt.db").to_string_lossy(),
+        "tui",
+        "--no-models",
+        "--session",
+        "badmcp",
+    ]);
+    command.env("GRITT_E2E_KEY", "pty-key");
+    command.env("TERM", "xterm-256color");
+    command.env("NO_COLOR", "1");
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let mut seen = String::new();
+    wait_for(&rx, &mut seen, ALT_SCREEN_ON, Duration::from_secs(30));
+    wait_for(&rx, &mut seen, "MCP configuration", Duration::from_secs(30));
+    let mut writer = pair.master.take_writer().unwrap();
+    writer.write_all(&[0x11]).unwrap();
+    writer.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the process did not exit");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !plain(&seen).contains("no MCP servers configured"),
+        "a parse failure was shown as an empty configuration"
+    );
 }

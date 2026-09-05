@@ -94,6 +94,11 @@ enum UiMsg {
         operation: u64,
         result: Result<()>,
     },
+    /// The workspace MCP runtime failed to open at startup, before any
+    /// entry could be published. Without this the subscription delivers an
+    /// empty list and the interface says no servers are configured, which
+    /// is indistinguishable from a workspace that really has none.
+    McpStartupFailed(String),
     /// A redacted definition for a first-use launch approval.
     McpApproval {
         operation: u64,
@@ -153,6 +158,18 @@ impl Ui for ChannelUi {
         Box::pin(async move { receiver.await.unwrap_or(ApprovalDecision::Denied) })
     }
 }
+
+/// The redraw cap. The plan asks for smooth updates at 30 fps rather than a
+/// frame per event, which is wasted work when a stream produces faster than
+/// a terminal can usefully show.
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
+/// How many queued messages one iteration may handle before drawing again.
+///
+/// Draining without a ceiling would let a fast producer hold the loop and
+/// starve the key reader. This bounds the work between frames, not the
+/// queue: whatever is left is handled on the next iteration.
+const MAX_COALESCED_MESSAGES: usize = 4_096;
 
 /// Reads terminal events on a thread until `stop` is set.
 fn spawn_key_reader(stop: Arc<AtomicBool>) -> mpsc::UnboundedReceiver<TerminalEvent> {
@@ -220,23 +237,33 @@ async fn fixture_loop(
     let stop = Arc::new(AtomicBool::new(false));
     let mut keys = spawn_key_reader(Arc::clone(&stop));
     let mut tick = tokio::time::interval(Duration::from_millis(50));
+    let mut dirty = true;
     loop {
-        terminal
-            .draw(|frame| draw(frame, &app))
-            .map_err(|error| Error::config(format!("draw failed: {error}")))?;
+        // Only a wakeup that could have changed the screen draws one. The
+        // tick is not one: nothing in the interface is drawn from a clock,
+        // so a tick with no input behind it would redraw the same frame.
+        if dirty {
+            terminal
+                .draw(|frame| draw(frame, &app))
+                .map_err(|error| Error::config(format!("draw failed: {error}")))?;
+            dirty = false;
+        }
         let action = tokio::select! {
-            Some(event) = keys.recv() => match event {
-                TerminalEvent::Key(key) if key.kind != KeyEventKind::Release => app.on_key(key),
-                TerminalEvent::Paste(text) => {
-                    app.on_paste(&text);
-                    Action::None
+            Some(event) = keys.recv() => {
+                dirty = true;
+                match event {
+                    TerminalEvent::Key(key) if key.kind != KeyEventKind::Release => app.on_key(key),
+                    TerminalEvent::Paste(text) => {
+                        app.on_paste(&text);
+                        Action::None
+                    }
+                    TerminalEvent::Resize(columns, rows) => {
+                        app.on_resize(columns, rows);
+                        Action::None
+                    }
+                    _ => Action::None,
                 }
-                TerminalEvent::Resize(columns, rows) => {
-                    app.on_resize(columns, rows);
-                    Action::None
-                }
-                _ => Action::None,
-            },
+            }
             _ = tick.tick() => Action::None,
         };
         match action {
@@ -543,14 +570,20 @@ async fn adopt(app: &mut App, plane: &ControlPlane, agent: &dyn Driver) -> Resul
 /// opens on a draft and creates the session when the first prompt is
 /// submitted. Native and connector sessions share the loop, the approval
 /// view, and the transcript.
+/// `start_mcp` is the workspace MCP runtime to open, when this run is on
+/// the native path. It is opened in the background rather than awaited, so
+/// a server that never answers `initialize` cannot hold the first frame,
+/// and a failure to open it is reported in the interface instead of on
+/// stderr, which the alternate screen owns (TKT-0020).
 pub async fn run_tui(
     plane: ControlPlane,
     agent: Option<Box<dyn Driver>>,
     draft: SessionDraft,
+    start_mcp: Option<Arc<crate::mcp::McpRuntime>>,
 ) -> Result<()> {
     let theme = theme_from_env();
     let mut terminal = enter()?;
-    let result = event_loop(plane, agent, draft, &mut terminal, theme).await;
+    let result = event_loop(plane, agent, draft, &mut terminal, theme, start_mcp).await;
     leave();
     result
 }
@@ -561,6 +594,7 @@ async fn event_loop(
     draft: SessionDraft,
     terminal: &mut ratatui::DefaultTerminal,
     theme: Theme,
+    start_mcp: Option<Arc<crate::mcp::McpRuntime>>,
 ) -> Result<()> {
     let mut app = App::new(StatusBar::default(), theme);
     app.draft = draft;
@@ -577,8 +611,8 @@ async fn event_loop(
     // screen shows before a session exists. It is a choice, not an open
     // connection, which is why nothing here opens anything.
     seed_draft(&mut app, &plane);
-    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
-    let mut runtime = Runtime {
+    let (ui_tx, ui_rx) = mpsc::unbounded_channel::<UiMsg>();
+    let runtime = Runtime {
         plane: Arc::new(plane),
         changes: Arc::new(WorkspaceChanges::new(app.status.workspace.clone())),
         tx: ui_tx.clone(),
@@ -601,56 +635,246 @@ async fn event_loop(
     probe_agents(&runtime);
     load_profiles(&runtime);
     subscribe_mcp(&runtime);
-    let mut handle: Option<CancelHandle> = None;
-    let mut responder: Option<oneshot::Sender<ApprovalDecision>> = None;
+    open_mcp(&runtime, start_mcp);
     let stop = Arc::new(AtomicBool::new(false));
-    let mut keys = spawn_key_reader(Arc::clone(&stop));
-    let mut tick = tokio::time::interval(Duration::from_millis(50));
-    loop {
-        terminal
-            .draw(|frame| draw(frame, &app))
-            .map_err(|error| Error::config(format!("draw failed: {error}")))?;
+    let keys = spawn_key_reader(Arc::clone(&stop));
+    let mut scheduler = Scheduler::new(app, runtime, idle_agent, ui_rx, keys);
+    while !scheduler.app.quit {
+        scheduler.step(terminal).await?;
+    }
+    stop.store(true, Ordering::SeqCst);
+    scheduler.shutdown();
+    Ok(())
+}
+
+/// What one scheduler step did. The benchmark reads these; the loop
+/// ignores them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Step {
+    /// A frame was put on the terminal.
+    pub drew: bool,
+    /// When that frame finished being written.
+    ///
+    /// This is when the user could see it. The step goes on to wait in
+    /// `select!`, handle an action, and drain the queue, all of which can
+    /// take longer than the frame did, so a caller measuring
+    /// input-to-frame latency must use this instant and not the one after
+    /// `step` returns (TKT-0020).
+    pub drew_at: Option<std::time::Instant>,
+    /// Messages taken off the queue and handled, including the drain.
+    pub messages: usize,
+    /// A terminal event was taken and handled.
+    pub input: bool,
+}
+
+/// The loop, minus the terminal it draws to and the sources it reads from.
+///
+/// `event_loop` is a `while !quit { step() }` around this, and the
+/// responsiveness benchmark drives the same `step` against a `TestBackend`
+/// with an injected input channel. There is deliberately no second copy of
+/// the scheduling rules: a benchmark that reimplements draw timing, drain
+/// order, or input priority measures the reimplementation (TKT-0020).
+struct Scheduler {
+    app: App,
+    runtime: Runtime,
+    idle: Option<Box<dyn Driver>>,
+    handle: Option<CancelHandle>,
+    responder: Option<oneshot::Sender<ApprovalDecision>>,
+    ui_rx: mpsc::UnboundedReceiver<UiMsg>,
+    keys: mpsc::UnboundedReceiver<TerminalEvent>,
+    tick: tokio::time::Interval,
+    /// Whether the screen can differ from the last frame drawn. Every
+    /// wakeup that carries input or a message sets it; the tick does not,
+    /// because nothing in the interface is drawn from a clock. An idle
+    /// session therefore draws nothing at all.
+    dirty: bool,
+    last_draw: tokio::time::Instant,
+    /// The approval whose frame has been drawn, by install identity.
+    ///
+    /// The frame cap must never let a decision key answer a prompt the
+    /// user has not seen. `y` approves a tool call or an MCP launch the
+    /// moment it reaches the reducer, so a capped frame plus a keystroke
+    /// already on its way is an approval nobody read.
+    ///
+    /// Identity rather than presence, because one iteration can answer A
+    /// and install B during its drain: `pending` is `Some` before and
+    /// after, so a flag would carry A's visibility onto B and let the next
+    /// keystroke answer a prompt that was never drawn.
+    drawn_approval: Option<u64>,
+}
+
+impl Scheduler {
+    fn new(
+        app: App,
+        runtime: Runtime,
+        idle: Option<Box<dyn Driver>>,
+        ui_rx: mpsc::UnboundedReceiver<UiMsg>,
+        keys: mpsc::UnboundedReceiver<TerminalEvent>,
+    ) -> Self {
+        Self {
+            app,
+            runtime,
+            idle,
+            handle: None,
+            responder: None,
+            ui_rx,
+            keys,
+            tick: tokio::time::interval(Duration::from_millis(50)),
+            dirty: true,
+            last_draw: tokio::time::Instant::now() - FRAME_INTERVAL,
+            drawn_approval: None,
+        }
+    }
+
+    /// True when a request is on `pending` whose own frame has not been
+    /// drawn. Compares identity, so a request installed in place of an
+    /// answered one is undrawn even though `pending` never became `None`.
+    fn undrawn_approval(&self) -> bool {
+        match self.app.pending_install() {
+            Some(install) => self.drawn_approval != Some(install),
+            None => false,
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.runtime.cancel_work(&mut self.app);
+        if let Some(handle) = &self.handle {
+            handle.cancel();
+        }
+    }
+
+    /// One iteration: draw what is owed, take one wakeup, handle it, then
+    /// handle everything else already waiting.
+    async fn step<B: ratatui::backend::Backend>(
+        &mut self,
+        terminal: &mut ratatui::Terminal<B>,
+    ) -> Result<Step> {
+        let mut outcome = Step::default();
+
+        // The frame cap yields to an approval that has not been drawn.
+        // Every other frame waits its turn; this one is what the next
+        // keystroke answers.
+        let due = self.last_draw + FRAME_INTERVAL;
+        let owed = self.undrawn_approval();
+        if self.dirty && (owed || tokio::time::Instant::now() >= due) {
+            terminal
+                .draw(|frame| draw(frame, &self.app))
+                .map_err(|error| Error::config(format!("draw failed: {error}")))?;
+            self.dirty = false;
+            self.last_draw = tokio::time::Instant::now();
+            outcome.drew = true;
+            // Wall-clock, taken here rather than by the caller: everything
+            // after this point in the step happens once the frame is
+            // already on screen.
+            outcome.drew_at = Some(std::time::Instant::now());
+            self.drawn_approval = self.app.pending_install();
+        }
+
         let action = tokio::select! {
-            Some(msg) = ui_rx.recv() => {
-                on_message(&mut app, &mut runtime, &mut idle_agent, &mut handle, &mut responder, msg).await?
-            }
-            Some(event) = keys.recv() => {
-                match event {
-                    TerminalEvent::Key(key) if key.kind != KeyEventKind::Release => app.on_key(key),
-                    TerminalEvent::Paste(text) => {
-                        app.on_paste(&text);
-                        Action::None
+            // Input first, deliberately. Under a stream the message branch
+            // is always ready, and an unbiased `select!` would put a
+            // keypress behind a random share of the backlog. A person
+            // cannot type fast enough to starve the queue, and the drain
+            // below runs on every iteration regardless.
+            biased;
+            Some(event) = self.keys.recv() => {
+                self.dirty = true;
+                outcome.input = true;
+                if self.undrawn_approval() {
+                    // Unreachable while the draw above precedes this
+                    // select, and kept so that it stays unreachable: a
+                    // key cannot answer a prompt that has never been on
+                    // screen, whatever later reordering does to the draw.
+                    Action::None
+                } else {
+                    match event {
+                        TerminalEvent::Key(key) if key.kind != KeyEventKind::Release => {
+                            self.app.on_key(key)
+                        }
+                        TerminalEvent::Paste(text) => {
+                            self.app.on_paste(&text);
+                            Action::None
+                        }
+                        TerminalEvent::Resize(columns, rows) => {
+                            // Placement depends on the width; a drawer or
+                            // a focused sidebar may no longer exist.
+                            self.app.on_resize(columns, rows);
+                            Action::None
+                        }
+                        _ => Action::None,
                     }
-                    TerminalEvent::Resize(columns, rows) => {
-                        // Placement depends on the width; a drawer or a
-                        // focused sidebar may no longer exist.
-                        app.on_resize(columns, rows);
-                        Action::None
-                    }
-                    _ => Action::None,
                 }
             }
-            _ = tick.tick() => Action::None,
+            // A frame that is owed but capped. Without this branch the
+            // loop would sit in `recv` until the next message or tick and
+            // leave a stale screen up for as long as that took.
+            _ = tokio::time::sleep_until(due), if self.dirty => Action::None,
+            Some(msg) = self.ui_rx.recv() => {
+                self.dirty = true;
+                outcome.messages += 1;
+                on_message(
+                    &mut self.app,
+                    &mut self.runtime,
+                    &mut self.idle,
+                    &mut self.handle,
+                    &mut self.responder,
+                    msg,
+                )
+                .await?
+            }
+            _ = self.tick.tick() => Action::None,
         };
         on_action(
-            &mut app,
-            &mut runtime,
-            &mut idle_agent,
-            &mut handle,
-            &mut responder,
+            &mut self.app,
+            &mut self.runtime,
+            &mut self.idle,
+            &mut self.handle,
+            &mut self.responder,
             action,
         )
         .await?;
-        if app.quit {
-            break;
+
+        // Coalescing. One message per frame cannot keep up with a stream:
+        // a turn emits a text delta per token through this same channel,
+        // so drawing after each one caps throughput at the frame rate and
+        // lets the queue grow without bound. Measured before this landed,
+        // the loop drained 69 messages a second against 1,000 produced and
+        // finished holding 8,862 (TKT-0020).
+        //
+        // Everything already waiting is handled before the next draw, in
+        // order, by the same handler. Nothing is dropped: no approval, tool
+        // result, or final event is skipped, only the intermediate frames
+        // between them. The batch is bounded so a fast producer cannot hold
+        // the loop and starve the key reader.
+        let mut coalesced = 0usize;
+        while coalesced < MAX_COALESCED_MESSAGES && !self.app.quit {
+            let Ok(msg) = self.ui_rx.try_recv() else {
+                break;
+            };
+            coalesced += 1;
+            outcome.messages += 1;
+            self.dirty = true;
+            let action = on_message(
+                &mut self.app,
+                &mut self.runtime,
+                &mut self.idle,
+                &mut self.handle,
+                &mut self.responder,
+                msg,
+            )
+            .await?;
+            on_action(
+                &mut self.app,
+                &mut self.runtime,
+                &mut self.idle,
+                &mut self.handle,
+                &mut self.responder,
+                action,
+            )
+            .await?;
         }
+        Ok(outcome)
     }
-    stop.store(true, Ordering::SeqCst);
-    runtime.cancel_work(&mut app);
-    if let Some(handle) = &handle {
-        handle.cancel();
-    }
-    Ok(())
 }
 
 /// Fills the draft's empty fields from the configured defaults and shows
@@ -734,6 +958,23 @@ fn probe_agents(runtime: &Runtime) {
     let tx = runtime.tx.clone();
     runtime.spawn_detached(async move {
         let _ = tx.send(UiMsg::Agents(agent_summaries(&plane).await));
+    });
+}
+
+/// Starts the workspace MCP runtime without blocking the first frame.
+///
+/// Approved servers launch, and every state change arrives through the
+/// subscription. A failure to read or parse `.mcp.json` happens before any
+/// entry is published, so it would otherwise be invisible: the subscription
+/// would deliver an empty list and the sidebar would say no servers are
+/// configured. That case becomes a message instead.
+fn open_mcp(runtime: &Runtime, mcp: Option<Arc<crate::mcp::McpRuntime>>) {
+    let Some(mcp) = mcp else { return };
+    let tx = runtime.tx.clone();
+    runtime.spawn_detached(async move {
+        if let Err(error) = mcp.open(&CancellationToken::new()).await {
+            let _ = tx.send(UiMsg::McpStartupFailed(error.message));
+        }
     });
 }
 
@@ -957,6 +1198,13 @@ async fn on_message(
             app.show_file_diff(diff);
         }
         UiMsg::Mcp(snapshots) => app.apply_mcp(snapshots),
+        UiMsg::McpStartupFailed(reason) => {
+            // The reason is a configuration error: parse failures and
+            // credential-shaped refusals name the field or the variable and
+            // never its value (ADR-008), so it is shown as it is.
+            app.push(EntryKind::Error, format!("MCP configuration: {reason}"));
+            app.notice = Some(format!("MCP configuration: {reason}"));
+        }
         UiMsg::McpOutcome { operation, result } => {
             let current = runtime
                 .mcp
@@ -1474,6 +1722,97 @@ async fn resume_by_id(plane: &ControlPlane, id: &str) -> Result<DraftOpen> {
         .await
 }
 
+/// The real scheduler, driven from a test (TKT-0020).
+///
+/// `Scheduler::step` is the loop. This exposes it against a `TestBackend`
+/// with an injected input channel, so the responsiveness benchmark measures
+/// the production draw timing, drain order, and input priority rather than a
+/// copy of them. It adds no scheduling of its own: every method either
+/// forwards to `step` or hands over one of the channels the loop reads.
+///
+/// Not part of the supported API.
+#[doc(hidden)]
+pub struct LoopHarness {
+    scheduler: Scheduler,
+    ui_tx: mpsc::UnboundedSender<UiMsg>,
+    keys_tx: mpsc::UnboundedSender<TerminalEvent>,
+}
+
+#[doc(hidden)]
+impl LoopHarness {
+    /// The loop's state as `event_loop` builds it, minus the terminal.
+    pub fn new(plane: ControlPlane, workspace: &std::path::Path, app: App) -> Self {
+        let (ui_tx, ui_rx) = mpsc::unbounded_channel();
+        let (keys_tx, keys_rx) = mpsc::unbounded_channel();
+        let runtime = Runtime {
+            plane: Arc::new(plane),
+            changes: Arc::new(WorkspaceChanges::new(workspace)),
+            tx: ui_tx.clone(),
+            work: None,
+            work_active: None,
+            open_work: None,
+            operations: 0,
+            pending_open: None,
+            mcp: None,
+        };
+        Self {
+            scheduler: Scheduler::new(app, runtime, None, ui_rx, keys_rx),
+            ui_tx,
+            keys_tx,
+        }
+    }
+
+    pub fn app(&self) -> &App {
+        &self.scheduler.app
+    }
+
+    pub fn app_mut(&mut self) -> &mut App {
+        &mut self.scheduler.app
+    }
+
+    /// One iteration of the production loop.
+    pub async fn step<B: ratatui::backend::Backend>(
+        &mut self,
+        terminal: &mut ratatui::Terminal<B>,
+    ) -> Result<Step> {
+        self.scheduler.step(terminal).await
+    }
+
+    /// The production `Ui` a turn streams through. A producer holding this
+    /// sends exactly what a real turn sends, on the channel the real loop
+    /// drains.
+    pub fn channel_ui(&self, generation: u64) -> Box<dyn Ui> {
+        Box::new(ChannelUi {
+            tx: self.ui_tx.clone(),
+            generation,
+        })
+    }
+
+    /// The channel the key reader thread writes to in production. Input
+    /// queued here waits its turn exactly as a real keystroke does.
+    pub fn input(&self) -> mpsc::UnboundedSender<TerminalEvent> {
+        self.keys_tx.clone()
+    }
+
+    /// Messages waiting to be handled, read from the channel itself rather
+    /// than modelled.
+    pub fn queue_depth(&self) -> usize {
+        self.scheduler.ui_rx.len()
+    }
+
+    /// Starts the real MCP lifecycle subscription, the way `event_loop`
+    /// does, so snapshots arrive as messages on the same queue.
+    pub fn subscribe_mcp(&mut self) {
+        subscribe_mcp(&self.scheduler.runtime);
+    }
+
+    /// Installs a driver so a cancel has a running turn to act on.
+    pub fn set_driver(&mut self, driver: Box<dyn Driver>) {
+        self.scheduler.handle = Some(driver.handle());
+        self.scheduler.idle = Some(driver);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The loop's two handlers, driven directly.
@@ -1549,6 +1888,337 @@ mod tests {
                     effort: Default::default(),
                 })
             })
+        }
+    }
+
+    /// A scheduler over the same `Runtime` the handler tests build, with an
+    /// injected input channel and a `TestBackend`.
+    async fn scheduler() -> (
+        Scheduler,
+        mpsc::UnboundedSender<UiMsg>,
+        mpsc::UnboundedSender<TerminalEvent>,
+        tempfile::TempDir,
+    ) {
+        let h = harness().await;
+        let (keys_tx, keys_rx) = mpsc::unbounded_channel();
+        let ui_tx = h.runtime.tx.clone();
+        let mut app = h.app;
+        app.on_resize(120, 40);
+        (
+            Scheduler::new(app, h.runtime, None, h.rx, keys_rx),
+            ui_tx,
+            keys_tx,
+            h._dir,
+        )
+    }
+
+    fn screen(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// A decision key must never answer an approval that has not been drawn.
+    ///
+    /// `y` approves the moment it reaches the reducer. The frame cap added
+    /// in TKT-0020 can suppress the frame after an approval arrives, so
+    /// without the guard a keystroke arriving in that window approves a
+    /// tool call or an MCP launch that was never on screen. Before the cap
+    /// the loop drew on every iteration and the question could not arise.
+    ///
+    /// The clock is paused, so the cap is engaged deterministically rather
+    /// than by racing it: no time passes between the first frame and the
+    /// approval, so the cap owes nothing and would suppress the frame.
+    #[tokio::test(start_paused = true)]
+    async fn an_approval_is_drawn_before_a_decision_key_is_accepted() {
+        let (mut scheduler, ui_tx, keys_tx, _dir) = scheduler().await;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+
+        // A first frame, which arms the cap. The message is only there so
+        // the step has a ready branch and does not advance the clock.
+        ui_tx.send(UiMsg::Agents(Vec::new())).unwrap();
+        let first = scheduler.step(&mut terminal).await.unwrap();
+        assert!(first.drew, "the first frame should be free");
+
+        // The approval arrives inside the cap window.
+        let (responder, mut decision) = oneshot::channel();
+        ui_tx
+            .send(UiMsg::Approval {
+                generation: scheduler.app.sidebar.generation,
+                pending: PendingApproval {
+                    request: ApprovalRequest {
+                        id: gritt_core::event::ApprovalId("a1".into()),
+                        tool: "shell".into(),
+                        resource: "rm -rf /tmp/x".into(),
+                        reason: "destructive".into(),
+                        call_id: None,
+                    },
+                    decision: Decision {
+                        outcome: gritt_core::policy::PolicyOutcome::Ask,
+                        reason: "destructive".into(),
+                        destructive: true,
+                        rule: None,
+                    },
+                    preview: None,
+                },
+                responder,
+            })
+            .unwrap();
+        let handled = scheduler.step(&mut terminal).await.unwrap();
+        assert!(
+            !handled.drew,
+            "the cap should have suppressed this frame; the test is not exercising it"
+        );
+        assert!(
+            scheduler.app.pending.is_some(),
+            "the approval was not taken off the queue"
+        );
+
+        // The keystroke lands in exactly that window.
+        keys_tx
+            .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('y'),
+                crossterm::event::KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        let mut shown = false;
+        let mut answered_unseen = false;
+        let mut delivered = false;
+        for _ in 0..8 {
+            scheduler.step(&mut terminal).await.unwrap();
+            if screen(&terminal).contains("approve?") {
+                shown = true;
+            }
+            if decision.try_recv().is_ok() {
+                delivered = true;
+                if !shown {
+                    answered_unseen = true;
+                }
+                break;
+            }
+        }
+        assert!(
+            !answered_unseen,
+            "a decision was sent for an approval that had not been drawn"
+        );
+        assert!(shown, "the approval was never drawn");
+        // The guard delays the key, it does not eat it: once the prompt has
+        // been drawn the keystroke must still answer it.
+        assert!(delivered, "the decision never reached its responder");
+    }
+
+    /// A second approval installed in place of an answered one must be
+    /// drawn on its own account.
+    ///
+    /// Answering A and installing B can happen in the same iteration: the
+    /// turn that receives A's decision enqueues B from another worker, and
+    /// the drain handles it before the next frame. `pending` is `Some`
+    /// throughout, so tracking presence rather than identity would carry
+    /// A's visibility onto B and let the next keystroke answer a prompt
+    /// that had never been drawn.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_approval_does_not_inherit_the_first_one_s_visibility() {
+        let (mut scheduler, ui_tx, keys_tx, _dir) = scheduler().await;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+
+        // A is installed and drawn, then answered.
+        let (responder_a, mut decision_a) = oneshot::channel();
+        ui_tx
+            .send(approval_message(
+                scheduler.app.sidebar.generation,
+                "a1",
+                "rm -rf /tmp/a",
+                responder_a,
+            ))
+            .unwrap();
+        for _ in 0..4 {
+            scheduler.step(&mut terminal).await.unwrap();
+            if screen(&terminal).contains("/tmp/a") {
+                break;
+            }
+        }
+        assert!(screen(&terminal).contains("/tmp/a"), "A was never drawn");
+        let drawn_for_a = scheduler.drawn_approval;
+
+        // One step now answers A and installs B: the key is taken first,
+        // and B's message is handled by the same step's drain. `pending`
+        // is `Some` before and after, which is the transition that made
+        // presence-tracking wrong.
+        let (responder_b, mut decision_b) = oneshot::channel();
+        keys_tx
+            .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('y'),
+                crossterm::event::KeyModifiers::NONE,
+            )))
+            .unwrap();
+        ui_tx
+            .send(approval_message(
+                scheduler.app.sidebar.generation,
+                "b1",
+                "rm -rf /tmp/b",
+                responder_b,
+            ))
+            .unwrap();
+        let step = scheduler.step(&mut terminal).await.unwrap();
+        assert!(step.input, "the step did not answer A");
+        assert!(step.messages > 0, "the step did not install B");
+        assert!(
+            decision_a.try_recv().is_ok(),
+            "A's own decision never reached its responder"
+        );
+        assert!(
+            scheduler.app.pending.is_some(),
+            "B is not on screen; the transition under test did not happen"
+        );
+
+        // The next decision key is already on its way, as it would be from
+        // a user still answering A.
+        keys_tx
+            .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('y'),
+                crossterm::event::KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        let mut shown_b = false;
+        let mut answered_unseen = false;
+        let mut delivered_b = false;
+        for _ in 0..8 {
+            scheduler.step(&mut terminal).await.unwrap();
+            if screen(&terminal).contains("/tmp/b") {
+                shown_b = true;
+            }
+            if decision_b.try_recv().is_ok() {
+                delivered_b = true;
+                if !shown_b {
+                    answered_unseen = true;
+                }
+                break;
+            }
+        }
+        assert_ne!(
+            scheduler.drawn_approval, drawn_for_a,
+            "B inherited A's visibility"
+        );
+        assert!(
+            !answered_unseen,
+            "a decision was sent for a second approval that had not been drawn"
+        );
+        assert!(shown_b, "the second approval was never drawn");
+        assert!(
+            delivered_b,
+            "the second decision never reached its responder"
+        );
+    }
+
+    /// One `step` draws before it takes input, so a frame cannot show a
+    /// keystroke handled in the same step.
+    ///
+    /// The load benchmark relies on exactly this to attribute
+    /// input-to-frame latency: a frame drawn at the top of a step completes
+    /// only the input handled in earlier steps. If the order here ever
+    /// changes, that attribution becomes wrong and this fails first.
+    #[tokio::test(start_paused = true)]
+    async fn a_step_draws_before_it_handles_input() {
+        let (mut scheduler, ui_tx, keys_tx, _dir) = scheduler().await;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        // Something to draw, and a key waiting behind it.
+        ui_tx.send(UiMsg::Agents(Vec::new())).unwrap();
+        scheduler.step(&mut terminal).await.unwrap();
+        scheduler.app.composer.clear();
+
+        keys_tx
+            .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('Z'),
+                crossterm::event::KeyModifiers::NONE,
+            )))
+            .unwrap();
+        // Make a frame owed so this step both draws and takes the key.
+        scheduler.dirty = true;
+        scheduler.last_draw = tokio::time::Instant::now() - FRAME_INTERVAL;
+        let step = scheduler.step(&mut terminal).await.unwrap();
+
+        assert!(step.drew, "the step did not draw");
+        assert!(step.input, "the step did not take the key");
+        assert!(
+            !screen(&terminal).contains('Z'),
+            "the frame drawn by this step already showed the key it handled afterwards"
+        );
+        assert!(
+            scheduler.app.composer.text().contains('Z'),
+            "the key was not applied at all"
+        );
+    }
+
+    /// `Step::drew_at` is taken when the frame is written, not when the
+    /// step returns.
+    ///
+    /// After drawing, a step waits in `select!` and then drains. That time
+    /// is scheduler time with the frame already on screen, and the load
+    /// benchmark's input-to-frame numbers are wrong by exactly that much if
+    /// they use the later instant. Real time here, not a paused clock: the
+    /// point is to observe the gap.
+    #[tokio::test]
+    async fn a_step_records_when_its_frame_was_drawn_not_when_it_returned() {
+        let (mut scheduler, ui_tx, _keys_tx, _dir) = scheduler().await;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        // The first frame, then a step with nothing queued to spend the
+        // interval's immediate first tick. After that a tick really waits.
+        ui_tx.send(UiMsg::Agents(Vec::new())).unwrap();
+        scheduler.step(&mut terminal).await.unwrap();
+        scheduler.step(&mut terminal).await.unwrap();
+
+        // Owe a frame, and leave both queues empty so the step draws and
+        // then waits out the 50 ms tick with nothing to do.
+        scheduler.dirty = true;
+        scheduler.last_draw = tokio::time::Instant::now() - FRAME_INTERVAL;
+        let step = scheduler.step(&mut terminal).await.unwrap();
+        let returned_at = std::time::Instant::now();
+
+        assert!(step.drew, "the step did not draw");
+        let drew_at = step.drew_at.expect("a drawn step records when");
+        let after_the_frame = returned_at.duration_since(drew_at);
+        assert!(
+            after_the_frame >= Duration::from_millis(20),
+            "the step returned {after_the_frame:?} after its frame; this test needs it to \
+             wait, so it is not proving anything"
+        );
+    }
+
+    fn approval_message(
+        generation: u64,
+        id: &str,
+        resource: &str,
+        responder: oneshot::Sender<ApprovalDecision>,
+    ) -> UiMsg {
+        UiMsg::Approval {
+            generation,
+            pending: PendingApproval {
+                request: ApprovalRequest {
+                    id: gritt_core::event::ApprovalId(id.into()),
+                    tool: "shell".into(),
+                    resource: resource.into(),
+                    reason: "destructive".into(),
+                    call_id: None,
+                },
+                decision: Decision {
+                    outcome: gritt_core::policy::PolicyOutcome::Ask,
+                    reason: "destructive".into(),
+                    destructive: true,
+                    rule: None,
+                },
+                preview: None,
+            },
+            responder,
         }
     }
 
