@@ -960,7 +960,7 @@ async fn explicit_effort_reaches_each_protocol_in_its_own_shape() {
 }
 
 #[tokio::test]
-async fn legacy_reasoning_switch_keeps_its_wire_shape_without_a_level() {
+async fn legacy_reasoning_switch_enables_the_provider_default_level_instead_of_medium() {
     let (context, transport, _) = make_context(
         Protocol::Responses,
         vec![sse(Protocol::Responses, "stream-text.sse")],
@@ -1129,20 +1129,47 @@ async fn effort_survives_continuation_and_old_state_restores_as_auto() {
     let second = transport.requests()[1].body_json().unwrap();
     assert_eq!(second["reasoning"]["effort"], "high");
 
-    // State written before the field existed still restores.
-    let (context, _, _) = make_context(Protocol::Responses, vec![], 32);
-    let fresh = adapter_for(context);
-    fresh
-        .restore(ContinuationState {
-            owner: "responses".into(),
-            state: serde_json::json!({
+    // State written before the field existed still restores on every
+    // protocol.
+    let old_options =
+        serde_json::json!({ "max_tokens": null, "reasoning": null, "structured_output": null });
+    for (protocol, owner, state) in [
+        (
+            Protocol::Responses,
+            "responses",
+            serde_json::json!({
                 "previous_response_id": "resp_old", "model": "gpt-5-nano", "tools": [],
-                "options": { "max_tokens": null, "reasoning": null, "structured_output": null },
-                "sequence": 3
+                "options": old_options, "sequence": 3
             }),
-        })
-        .await
-        .unwrap();
-    let restored = fresh.continuation().await.unwrap().unwrap();
-    assert_eq!(restored.state["options"]["effort"], "auto");
+        ),
+        (
+            Protocol::ChatCompletions,
+            "chat_completions",
+            serde_json::json!({
+                "messages": [{ "role": "user", "content": "hi" }], "model": "openai/gpt-5-nano",
+                "tools": [], "options": old_options, "sequence": 3
+            }),
+        ),
+        (
+            Protocol::Messages,
+            "messages",
+            serde_json::json!({
+                "system": null, "messages": [{ "role": "user", "content": "hi" }],
+                "model": "claude-sonnet-5", "tools": [], "options": old_options, "sequence": 3
+            }),
+        ),
+    ] {
+        let (context, _, _) = make_context(protocol, vec![], 32);
+        let fresh = adapter_for(context);
+        fresh
+            .restore(ContinuationState {
+                owner: owner.into(),
+                state,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{protocol:?}: {error}"));
+        let restored = fresh.continuation().await.unwrap().unwrap();
+        assert_eq!(restored.state["options"]["effort"], "auto", "{protocol:?}");
+        assert_eq!(restored.owner, owner);
+    }
 }

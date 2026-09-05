@@ -306,6 +306,7 @@ tickets:
     artifacts:
       task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0016/task.md
       report: .agents/tasks/griiettner/TKT-0001-0025/TKT-0016/report.md
+      updates: .agents/tasks/griiettner/TKT-0001-0025/TKT-0016/updates/
     dependencies: []
     areas:
       - crates/gritt-core

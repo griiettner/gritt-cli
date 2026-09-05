@@ -174,10 +174,10 @@ What landed:
   returns a default value for an unknown model. For `effort_support` a
   default value and `None` produce the same answer, so no precision is
   lost.
-- The draft validator resolves the model with the profile as the alias
-  hint, so a bare default model such as `openai/gpt-5-nano` validates
-  under any selected profile. A qualified name or global alias that
-  resolves elsewhere is `ModelOutsideProfile`.
+- The draft validator takes an id the selected profile's catalog lists
+  as that model before any alias or qualified reading (review fix), then
+  resolves with the profile as the alias hint. A qualified name or global
+  alias that resolves elsewhere is `ModelOutsideProfile`.
 
 ## Edge Cases and Failures
 
@@ -278,4 +278,7 @@ user directory outcomes, failing keychain outcome without the value.
 
 ## Updates
 
-None yet.
+- [2026-09-04 review fixes](updates/2026-09-04-review-fixes.md): catalog
+  ids with a profile-name prefix stay in the selected profile, a removed
+  stored profile is a typed rejection, resume warms the catalog before
+  resolution, and old-continuation tests cover every protocol.

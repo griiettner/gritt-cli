@@ -71,6 +71,17 @@ fn config() -> Config {
     config
 }
 
+/// The shared config plus a profile named like OpenRouter's vendor prefix,
+/// so `openai/...` catalog ids look like qualified names.
+fn config_with_openai_profile() -> Config {
+    let mut config = config();
+    config.profiles.insert(
+        "openai".into(),
+        profile("openai", Protocol::Responses, "https://api.openai.com/v1"),
+    );
+    config
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     plane: ControlPlane,
@@ -78,13 +89,20 @@ struct Fixture {
 }
 
 async fn fixture_plane(responses: Vec<FixtureResponse>, cache: Option<ModelCache>) -> Fixture {
+    fixture_plane_with(config(), responses, cache).await
+}
+
+async fn fixture_plane_with(
+    config: Config,
+    responses: Vec<FixtureResponse>,
+    cache: Option<ModelCache>,
+) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
         Store::open(DatabaseLocation::Explicit(dir.path().join("gritt.db")))
             .await
             .unwrap(),
     );
-    let config = config();
     let telemetry = Arc::new(Telemetry::new(Arc::clone(&store), config.logging.clone()));
     let transport = Arc::new(FixtureTransport::new(responses, 17));
     let builder = AgentBuilder {
@@ -274,13 +292,16 @@ async fn a_provider_change_invalidates_the_model_selection() {
     );
     let outcome = fx
         .plane
-        .validate_draft(&SessionDraft::default().with_profile("other"))
+        .validate_draft(
+            &SessionDraft::default()
+                .with_profile("other")
+                .with_model("model-y"),
+        )
         .await
         .unwrap();
-    // `other` has no model of its own and the default model is
-    // openrouter's bare id; without a catalog it resolves under `other`.
     let (resolved, catalog, _) = ready(outcome);
     assert_eq!(resolved.profile, "other");
+    assert_eq!(resolved.model, "model-y");
     assert_eq!(catalog, CatalogState::Skipped);
 }
 
@@ -628,4 +649,177 @@ async fn profile_summaries_report_availability_without_values() {
         outcome,
         gritt_harness::setup::CredentialStoreOutcome::Unavailable { .. }
     ));
+}
+
+#[tokio::test]
+async fn catalog_ids_with_a_profile_name_prefix_stay_in_the_selected_profile() {
+    let fx = fixture_plane_with(config_with_openai_profile(), vec![], None).await;
+    seed_catalog(&fx.plane, "openrouter", "openai/gpt-5-nano", Some(true));
+    // Creation: the OpenRouter catalog id is not read as `openai/...`.
+    let (resolved, _, warnings) = ready(
+        fx.plane
+            .validate_draft(
+                &SessionDraft::default()
+                    .with_profile("openrouter")
+                    .with_model("openai/gpt-5-nano")
+                    .with_effort(ReasoningEffort::Low),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(resolved.profile, "openrouter");
+    assert_eq!(resolved.model, "openai/gpt-5-nano");
+    assert!(warnings.is_empty());
+    // A qualified name that is not a catalog id still routes by profile.
+    let outcome = fx
+        .plane
+        .validate_draft(
+            &SessionDraft::default()
+                .with_profile("openrouter")
+                .with_model("openai/gpt-5-mini"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.errors(),
+        &[DraftError::ModelOutsideProfile {
+            model: "openai/gpt-5-mini".into(),
+            model_profile: "openai".into(),
+            profile: "openrouter".into(),
+        }]
+    );
+    let DraftOpen::Opened { driver, .. } = fx
+        .plane
+        .open_draft(
+            SessionDraft::default()
+                .with_name("prefixed")
+                .with_profile("openrouter")
+                .with_model("openai/gpt-5-nano"),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected open");
+    };
+    let id = driver.session().id.clone();
+    drop(driver);
+    // Resume with the same catalog id, with and without the profile.
+    for draft in [
+        SessionDraft::default()
+            .with_name("prefixed")
+            .with_model("openai/gpt-5-nano"),
+        SessionDraft::default()
+            .with_name("prefixed")
+            .with_profile("openrouter")
+            .with_model("openai/gpt-5-nano"),
+    ] {
+        let (resolved, _, _) = ready(fx.plane.validate_draft(&draft).await.unwrap());
+        assert_eq!(resolved.resume, Some(id.clone()));
+        assert_eq!(resolved.profile, "openrouter");
+    }
+
+    // Resume compares the exact stored id even when no catalog is loaded.
+    let cold = fixture_plane_with(config_with_openai_profile(), vec![], None).await;
+    let now = Utc::now();
+    cold.plane
+        .builder
+        .store
+        .create(Session {
+            id: SessionId("p1".into()),
+            name: "stored".into(),
+            kind: SessionKind::Native {
+                provider_profile: "openrouter".into(),
+                model: "openai/gpt-5-nano".into(),
+                effort: ReasoningEffort::Auto,
+            },
+            phase: Phase::Planning,
+            workspace: cold.dir.path().to_path_buf(),
+            created_at: now,
+            updated_at: now,
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+    let (resolved, catalog, _) = ready(
+        cold.plane
+            .validate_draft(
+                &SessionDraft::default()
+                    .with_name("stored")
+                    .with_model("openai/gpt-5-nano"),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(resolved.resume, Some(SessionId("p1".into())));
+    assert_eq!(catalog, CatalogState::Skipped);
+    let outcome = cold
+        .plane
+        .validate_draft(
+            &SessionDraft::default()
+                .with_name("stored")
+                .with_model("openai/gpt-5-mini"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome.errors(),
+        [DraftError::SessionPinned { .. }]
+    ));
+}
+
+#[tokio::test]
+async fn a_removed_profile_rejects_resume_without_touching_the_session() {
+    let fx = fixture_plane(vec![], None).await;
+    let now = Utc::now();
+    let stored = Session {
+        id: SessionId("g1".into()),
+        name: "orphan".into(),
+        kind: SessionKind::Native {
+            provider_profile: "gone".into(),
+            model: "some-model".into(),
+            effort: ReasoningEffort::Auto,
+        },
+        phase: Phase::Planning,
+        workspace: fx.dir.path().to_path_buf(),
+        created_at: now,
+        updated_at: now,
+        parent_id: None,
+    };
+    fx.plane.builder.store.create(stored.clone()).await.unwrap();
+    let draft = SessionDraft::default()
+        .with_name("orphan")
+        .with_effort(ReasoningEffort::High)
+        .with_phase(Phase::Coding);
+    let outcome = fx.plane.validate_draft(&draft).await.unwrap();
+    assert_eq!(
+        outcome,
+        DraftOutcome::Rejected {
+            errors: vec![DraftError::UnknownProfile {
+                profile: "gone".into()
+            }],
+            catalog: None,
+        }
+    );
+    assert!(matches!(
+        fx.plane.open_draft(draft).await.unwrap(),
+        DraftOpen::Rejected { .. }
+    ));
+    let after = fx
+        .plane
+        .builder
+        .store
+        .get(&SessionId("g1".into()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, stored);
+    assert!(fx
+        .plane
+        .builder
+        .store
+        .read_events(&SessionId("g1".into()))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(fx.plane.builder.store.list().await.unwrap().len(), 1);
 }

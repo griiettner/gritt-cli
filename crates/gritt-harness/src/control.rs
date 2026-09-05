@@ -188,36 +188,38 @@ impl ControlPlane {
                 connector: id,
             });
         };
+        if !self.builder.config.profiles.contains_key(provider_profile) {
+            return rejected(DraftError::UnknownProfile {
+                profile: provider_profile.clone(),
+            });
+        }
+        // Warmed before resolution so the answer does not depend on
+        // whether a picker loaded the list earlier.
+        let catalog = self.warm_catalog(provider_profile).await?;
         let profile_mismatch = draft
             .profile
             .as_deref()
             .is_some_and(|wanted| wanted != provider_profile);
         let model_mismatch = match draft.model.as_deref() {
             None => false,
-            Some(wanted) => {
-                match alias::resolve(
-                    &self.builder.config,
-                    &self.builder.catalog,
-                    wanted,
-                    Some(provider_profile),
-                ) {
-                    Ok(resolved) => {
-                        resolved.profile != *provider_profile || resolved.model != *model
-                    }
-                    Err(_) => true,
-                }
-            }
+            Some(wanted) if wanted == model => false,
+            Some(wanted) => match self.resolve_under_profile(provider_profile, wanted) {
+                Ok(resolved) => resolved.profile != *provider_profile || resolved.model != *model,
+                Err(_) => true,
+            },
         };
         if profile_mismatch || model_mismatch {
-            return rejected(DraftError::SessionPinned {
-                name: session.name,
-                profile: provider_profile.clone(),
-                model: model.clone(),
-                requested_profile: draft.profile.clone(),
-                requested_model: draft.model.clone(),
+            return Ok(DraftOutcome::Rejected {
+                errors: vec![DraftError::SessionPinned {
+                    name: session.name,
+                    profile: provider_profile.clone(),
+                    model: model.clone(),
+                    requested_profile: draft.profile.clone(),
+                    requested_model: draft.model.clone(),
+                }],
+                catalog: Some(catalog),
             });
         }
-        let catalog = self.warm_catalog(provider_profile).await?;
         let effort = draft.effort.unwrap_or(*stored_effort);
         if let Some(error) = self.effort_error(provider_profile, model, effort) {
             return Ok(DraftOutcome::Rejected {
@@ -267,19 +269,18 @@ impl ControlPlane {
         let Some(model_name) = draft.model.clone().or_else(|| config.default_model.clone()) else {
             return rejected(DraftError::MissingModel, catalog);
         };
-        let resolved =
-            match alias::resolve(config, &self.builder.catalog, &model_name, Some(&profile)) {
-                Ok(resolved) => resolved,
-                Err(error) => {
-                    return rejected(
-                        DraftError::ModelResolution {
-                            model: model_name,
-                            message: error.message,
-                        },
-                        catalog,
-                    );
-                }
-            };
+        let resolved = match self.resolve_under_profile(&profile, &model_name) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return rejected(
+                    DraftError::ModelResolution {
+                        model: model_name,
+                        message: error.message,
+                    },
+                    catalog,
+                );
+            }
+        };
         if resolved.profile != profile {
             return rejected(
                 DraftError::ModelOutsideProfile {
@@ -325,6 +326,35 @@ impl ControlPlane {
             catalog,
             warnings,
         })
+    }
+
+    /// Resolves a model name under the selected profile. An id the
+    /// profile's catalog lists is taken as that model before any alias or
+    /// `profile/model` reading, because catalog ids such as OpenRouter's
+    /// `openai/gpt-5-nano` share the qualified-name shape whenever a
+    /// profile of the same name is configured. Anything else goes through
+    /// alias and deprecation resolution with the profile as the hint.
+    fn resolve_under_profile(&self, profile: &str, name: &str) -> Result<alias::ModelRef> {
+        if let Some(info) = self.builder.catalog.model(profile, name) {
+            return Ok(match (info.deprecated, info.replaced_by) {
+                (true, Some(replacement)) => alias::ModelRef {
+                    profile: profile.to_owned(),
+                    model: replacement,
+                    remapped_from: Some(name.to_owned()),
+                },
+                _ => alias::ModelRef {
+                    profile: profile.to_owned(),
+                    model: name.to_owned(),
+                    remapped_from: None,
+                },
+            });
+        }
+        alias::resolve(
+            &self.builder.config,
+            &self.builder.catalog,
+            name,
+            Some(profile),
+        )
     }
 
     /// The same rule the adapter applies before a request.
