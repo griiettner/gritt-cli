@@ -4,7 +4,12 @@
 //! server on this machine still speaks the protocol Gritt implements. This
 //! check does exactly that and nothing more: it initializes each configured
 //! server whose executable is present and lists its tools. It never calls a
-//! tool, so no server state and no memory database is touched.
+//! tool.
+//!
+//! That is the limit of what it promises. A server may do whatever it likes
+//! during its own startup, including writing to its own storage, and this
+//! check neither prevents nor observes that; it only guarantees that Gritt
+//! issues no `tools/call`.
 //!
 //! Run it with `GRITT_LIVE_MCP_TESTS=1`. Without that variable it skips, and
 //! a skip is reported as a skip rather than a pass.
@@ -19,6 +24,16 @@ use gritt_core::mcp::{
 use gritt_harness::mcp::trust::MemoryTrustStore;
 use gritt_harness::mcp::{stdio, McpRuntime};
 use gritt_harness::CancellationToken;
+
+/// A one-line rendering of a state and its reason, for the failure message.
+fn describe(state: &McpServerState) -> String {
+    let reason = state.reason();
+    if reason.is_empty() {
+        format!("{state:?}")
+    } else {
+        reason.to_owned()
+    }
+}
 
 fn repository_root() -> PathBuf {
     // `crates/gritt-harness` -> the workspace root.
@@ -92,6 +107,7 @@ async fn every_configured_server_is_reachable_or_explained() {
         config.len(),
         "every configured entry must be accounted for"
     );
+    let mut failures = Vec::new();
     for snapshot in &snapshots {
         let unavailable = unavailable.contains(&snapshot.name);
         println!(
@@ -124,7 +140,23 @@ async fn every_configured_server_is_reachable_or_explained() {
                 snapshot.name
             );
         }
+        // An entry whose executable is present, on a transport Gritt
+        // supports, is expected to work. Letting that pass silently would
+        // make a green run meaningless.
+        let expected_to_work = !unavailable
+            && !matches!(
+                snapshot.state,
+                McpServerState::Invalid { .. } | McpServerState::UnsupportedTransport { .. }
+            );
+        if expected_to_work && !snapshot.state.is_ready() {
+            failures.push(format!("{}: {}", snapshot.name, describe(&snapshot.state)));
+        }
     }
+    assert!(
+        failures.is_empty(),
+        "available servers failed to initialize: {}",
+        failures.join("; ")
+    );
     if !unavailable.is_empty() {
         println!("  unavailable executables: {}", unavailable.join(", "));
     }
