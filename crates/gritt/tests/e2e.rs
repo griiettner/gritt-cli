@@ -517,3 +517,85 @@ fn doctor_and_telemetry_stay_content_free() {
     assert!(text.contains("key available"), "{text}");
     assert!(!text.contains(marker) && !text.contains(KEY), "{text}");
 }
+
+/// An interrupt during MCP startup must take the servers with it.
+///
+/// `gritt mcp trust` launches approved servers before anything else happens,
+/// and those children sit in their own process groups, so a signal delivered
+/// to Gritt alone does not reach them. The server here never speaks MCP, so
+/// the interrupt lands squarely inside initialization.
+#[cfg(unix)]
+#[test]
+fn interrupting_mcp_startup_leaves_no_server_running() {
+    let space = Space::new(1);
+    let pidfile = space.path().join("server.pid");
+    std::fs::write(
+        space.path().join(".mcp.json"),
+        serde_json::json!({"mcpServers": {"never-answers": {
+            "command": "sh",
+            "args": ["-c", format!("echo $$ > {}; sleep 120", pidfile.display())],
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let child = space
+        .command(&["mcp", "trust", "never-answers"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Wait until the server is actually running, then interrupt.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !pidfile.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the MCP server never started"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let server: u32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output().unwrap());
+    });
+    let output = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("gritt did not stop after Ctrl-C during MCP startup");
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "stderr: {}",
+        stderr(&output)
+    );
+
+    // The server it launched is gone too.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let alive = Command::new("kill")
+            .args(["-0", &server.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !alive {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an MCP server outlived the interrupted command"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}

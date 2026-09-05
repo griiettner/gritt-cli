@@ -44,6 +44,9 @@ fn mark(variable: &str, contents: &str) {
 
 fn main() {
     let behavior = std::env::args().nth(1).unwrap_or_else(|| "basic".into());
+    // Recorded before anything else, so a test can name this process even
+    // when the handshake never completes and the client never installs it.
+    mark("FIXTURE_PID", &std::process::id().to_string());
     match behavior.as_str() {
         // Spawns a process that outlives it, then exits. Cleanup has to
         // reach the descendant through the process group.
@@ -67,21 +70,37 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_millis(300));
             return;
         }
-        // Answers the handshake, then stops reading stdin for good, so the
-        // client's pipe to it fills. Shutdown must not depend on that write.
+        // Completes startup, then stops reading stdin for good, so the
+        // client's pipe to it fills on the next write. Shutdown must not
+        // depend on that write, and a caller must not hang on it.
         "deaf" => {
-            let mut first = String::new();
-            if std::io::stdin().read_line(&mut first).is_ok() {
-                let id = serde_json::from_str::<serde_json::Value>(first.trim())
-                    .ok()
-                    .and_then(|message| message.get("id").cloned())
-                    .unwrap_or(serde_json::Value::Null);
-                send(&serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "serverInfo": {"name": "deaf", "version": "0.1.0"}}}));
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                let Ok(line) = line else { break };
+                let Ok(message) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                    continue;
+                };
+                let id = message.get("id").cloned();
+                match message
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                {
+                    "initialize" => send(&serde_json::json!({
+                        "jsonrpc": "2.0", "id": id, "result": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "deaf", "version": "0.1.0"}}})),
+                    "tools/list" => {
+                        send(&serde_json::json!({"jsonrpc": "2.0", "id": id,
+                            "result": {"tools": [tool("echo", "never answered")]}}));
+                        // Startup is done and the server goes deaf. Every
+                        // later write from the client fills the pipe.
+                        break;
+                    }
+                    _ => {}
+                }
             }
-            // Never reads stdin again.
             std::thread::sleep(std::time::Duration::from_secs(300));
             return;
         }
@@ -128,6 +147,16 @@ fn main() {
             .unwrap_or_default()
             .to_owned();
         let id = message.get("id").cloned();
+        // A response to the ping this fixture sent. Sending a ping only shows
+        // the server asked; this shows the client answered.
+        if method.is_empty()
+            && id.as_ref().and_then(serde_json::Value::as_str) == Some("server-ping-1")
+        {
+            if message.get("result").is_some() {
+                mark("FIXTURE_PING_ANSWERED", "yes");
+            }
+            continue;
+        }
         match method.as_str() {
             "notifications/cancelled" => {
                 if let Some(request) = message

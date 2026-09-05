@@ -740,6 +740,12 @@ mod http_fixture {
         /// Reflects the credential it was given into its metadata, its tool
         /// descriptions, and its results.
         EchoSecret,
+        /// Accepts requests but never answers a notification POST, so a
+        /// cancellation notification hangs.
+        StallNotifications,
+        /// Sends a server-initiated `ping` on the `tools/list` stream and
+        /// records the reply it receives.
+        ServerRequests,
     }
 
     /// One recorded request: `"<HTTP method> <JSON-RPC method>"` and the
@@ -749,13 +755,18 @@ mod http_fixture {
     pub struct Endpoint {
         pub url: String,
         pub seen: Arc<std::sync::Mutex<Vec<SeenRequest>>>,
+        /// Bodies of the POSTs the client made on its own account, so a test
+        /// can see the answer to a server request and its headers.
+        pub replies: Arc<std::sync::Mutex<Vec<SeenRequest>>>,
     }
 
     pub async fn start(mode: Mode) -> Endpoint {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let replies = Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = Arc::clone(&seen);
+        let record_replies = Arc::clone(&replies);
         tokio::spawn(async move {
             let mut calls = 0usize;
             let mut initialized = false;
@@ -803,6 +814,14 @@ mod http_fixture {
                     .lock()
                     .unwrap()
                     .push((format!("{method} {rpc}"), headers.clone()));
+                // A body with an id but no method is the client answering a
+                // request this server made.
+                if rpc.is_empty() && message.get("id").is_some() {
+                    record_replies
+                        .lock()
+                        .unwrap()
+                        .push((body.to_owned(), headers.clone()));
+                }
                 let id = message.get("id").cloned();
                 let response = match (method.as_str(), rpc.as_str()) {
                     ("DELETE", _) => {
@@ -837,6 +856,21 @@ mod http_fixture {
                             initialized,
                             "tools/list arrived before notifications/initialized"
                         );
+                        if mode == Mode::ServerRequests {
+                            // The response the caller waits for, preceded by
+                            // a request the client has to answer on its own.
+                            let stream = sse(&[
+                                serde_json::json!({"jsonrpc": "2.0", "id": "srv-1",
+                                    "method": "ping"}),
+                                serde_json::json!({"jsonrpc": "2.0", "id": id,
+                                    "result": {"tools": [{"name": "fetch",
+                                        "description": "fetch a page",
+                                        "inputSchema": {"type": "object"}}]}}),
+                            ]);
+                            let _ = socket.write_all(stream.as_bytes()).await;
+                            let _ = socket.flush().await;
+                            continue;
+                        }
                         let payload = if mode == Mode::EchoSecret {
                             serde_json::json!({
                                 "jsonrpc": "2.0", "id": id,
@@ -862,6 +896,12 @@ mod http_fixture {
                     }
                     (_, "tools/call") => {
                         calls += 1;
+                        if mode == Mode::StallNotifications {
+                            // Slow enough that the caller cancels first, which
+                            // is what produces the notification this mode
+                            // then refuses to answer.
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
                         match mode {
                             Mode::SessionLost => {
                                 "HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_owned()
@@ -870,15 +910,25 @@ mod http_fixture {
                                 "jsonrpc": "2.0", "id": id,
                                 "result": {"content": [{"type": "text",
                                     "text": format!("issued for {secret}")}]}})]),
-                            Mode::Mixed => sse(&[serde_json::json!({"jsonrpc": "2.0", "id": id,
-                                "result": {"content": [{"type": "text",
-                                    "text": format!("call {calls}")}]}})]),
+                            Mode::Mixed | Mode::StallNotifications | Mode::ServerRequests => {
+                                sse(&[serde_json::json!({"jsonrpc": "2.0", "id": id,
+                                    "result": {"content": [{"type": "text",
+                                        "text": format!("call {calls}")}]}})])
+                            }
                         }
                     }
                     // Notifications get 202 and no body.
                     _ => {
                         if rpc == "notifications/initialized" {
                             initialized = true;
+                        }
+                        if mode == Mode::StallNotifications
+                            && rpc.starts_with("notifications/")
+                            && rpc != "notifications/initialized"
+                        {
+                            // Held open forever. Shutdown must not wait on it.
+                            std::mem::forget(socket);
+                            continue;
                         }
                         "HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_owned()
                     }
@@ -890,6 +940,7 @@ mod http_fixture {
         Endpoint {
             url: format!("http://127.0.0.1:{port}/mcp"),
             seen,
+            replies,
         }
     }
 
@@ -1489,12 +1540,16 @@ async fn a_descendant_that_outlives_its_parent_is_cleaned_up_too() {
 async fn the_handshake_is_ordered_and_server_requests_are_answered() {
     let dir = tempfile::tempdir().unwrap();
     let initialized = dir.path().join("initialized");
+    let ping_answered = dir.path().join("ping-answered");
     std::fs::write(
         dir.path().join(".mcp.json"),
         serde_json::json!({"mcpServers": {"strict": {
             "command": FIXTURE,
             "args": ["strict"],
-            "env": {"FIXTURE_INITIALIZED": initialized.to_string_lossy()},
+            "env": {
+                "FIXTURE_INITIALIZED": initialized.to_string_lossy(),
+                "FIXTURE_PING_ANSWERED": ping_answered.to_string_lossy(),
+            },
         }}})
         .to_string(),
     )
@@ -1519,4 +1574,413 @@ async fn the_handshake_is_ordered_and_server_requests_are_answered() {
     .unwrap();
     assert!(result.output.contains("echo"));
     runtime.shutdown().await;
+}
+
+// --- Round 2 review fixes ----------------------------------------------
+
+/// A trust store whose answer can be held open, so a test can land a
+/// lifecycle change in the middle of the await.
+struct PausedTrust {
+    release: tokio::sync::Semaphore,
+    decision: gritt_core::mcp::TrustDecision,
+}
+
+impl PausedTrust {
+    fn new(decision: gritt_core::mcp::TrustDecision) -> Arc<Self> {
+        Arc::new(Self {
+            release: tokio::sync::Semaphore::new(0),
+            decision,
+        })
+    }
+
+    fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+impl gritt_harness::mcp::trust::TrustStore for PausedTrust {
+    fn decision<'a>(
+        &'a self,
+        _workspace: &'a str,
+        _server: &'a str,
+        _fingerprint: &'a str,
+    ) -> gritt_core::session::BoxFuture<
+        'a,
+        gritt_core::Result<Option<gritt_core::mcp::TrustDecision>>,
+    > {
+        Box::pin(async move {
+            // Forgotten rather than dropped: a dropped permit is returned to
+            // the semaphore, which would let every later read straight
+            // through and pause nothing.
+            let permit = self.release.acquire().await.expect("paused trust");
+            permit.forget();
+            Ok(Some(self.decision))
+        })
+    }
+
+    fn record<'a>(
+        &'a self,
+        _record: gritt_core::mcp::TrustRecord,
+    ) -> gritt_core::session::BoxFuture<'a, gritt_core::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// The pid a fixture recorded for itself, whether or not it ever connected.
+async fn recorded_pid(path: &Path) -> u32 {
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(pid) = text.trim().parse() {
+                return pid;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the fixture never recorded its pid at {}", path.display());
+}
+
+#[tokio::test]
+async fn rotating_a_token_keeps_redacting_what_the_running_server_still_holds() {
+    // The definition names `${GRITT_TEST_ROTATED}` and never changes, so its
+    // fingerprint does not change and the connection is retained across the
+    // reload. The process keeps the value it was launched with.
+    let first = "sk-rotation-first-8801";
+    let second = "sk-rotation-second-8802";
+    std::env::set_var("GRITT_TEST_ROTATED", first);
+    let dir = workspace(serde_json::json!({"rotating": {
+        "command": FIXTURE,
+        "args": ["echo"],
+        "env": {"FIXTURE_API_KEY": "${GRITT_TEST_ROTATED}"},
+    }}));
+    let runtime = runtime(dir.path());
+    let cancel = CancellationToken::new();
+    runtime.open(&cancel).await.unwrap();
+    let before = runtime.child_pids().await;
+    assert_eq!(before.len(), 1);
+
+    // The environment rotates; the file does not.
+    std::env::set_var("GRITT_TEST_ROTATED", second);
+    runtime.reload().await.unwrap();
+    assert_eq!(
+        state_of(&runtime.snapshots().await, "rotating"),
+        &McpServerState::Ready,
+        "the unchanged definition should keep its connection"
+    );
+    assert_eq!(
+        runtime.child_pids().await,
+        before,
+        "the process should not have been restarted"
+    );
+
+    // That process still echoes the first token, so that is the value that
+    // has to be redacted.
+    let result = call(
+        &runtime,
+        "mcp__rotating__leaky",
+        serde_json::json!({}),
+        &cancel,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !result.output.contains(first),
+        "the retained connection leaked its own token: {}",
+        result.output
+    );
+    assert!(result.output.contains("[redacted]"), "{}", result.output);
+
+    let error = call(
+        &runtime,
+        "mcp__rotating__leaky",
+        serde_json::json!({"text": "error"}),
+        &cancel,
+    )
+    .await
+    .unwrap_err();
+    assert!(!error.message.contains(first), "{}", error.message);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_during_startup_takes_the_children_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let ready_pid = dir.path().join("ready.pid");
+    let stalled_pid = dir.path().join("stalled.pid");
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        serde_json::json!({"mcpServers": {
+            // One that finishes its handshake, and one that never answers.
+            "ready": {"command": FIXTURE, "args": ["basic"],
+                      "env": {"FIXTURE_PID": ready_pid.to_string_lossy()}},
+            "stalled": {"command": FIXTURE, "args": ["silent"],
+                        "env": {"FIXTURE_PID": stalled_pid.to_string_lossy()}},
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let runtime = Arc::new(
+        McpRuntime::new(
+            dir.path(),
+            McpRuntimeSettings {
+                // Long enough that the stalled handshake is still running when
+                // shutdown arrives.
+                init_timeout: Duration::from_secs(120),
+                max_concurrent_init: 4,
+                ..settings()
+            },
+        )
+        .with_trust(MemoryTrustStore::trust_all()),
+    );
+    let config = runtime.read_config().unwrap();
+    runtime.load(&config).await.unwrap();
+
+    let starter = Arc::clone(&runtime);
+    let token = CancellationToken::new();
+    let starting = tokio::spawn(async move { starter.start(&token).await });
+
+    let ready = recorded_pid(&ready_pid).await;
+    let stalled = recorded_pid(&stalled_pid).await;
+
+    // Shutdown lands while `start` is still inside the stalled handshake.
+    let began = std::time::Instant::now();
+    runtime.shutdown().await;
+    assert!(
+        began.elapsed() < Duration::from_secs(60),
+        "shutdown waited on the stalled handshake for {:?}",
+        began.elapsed()
+    );
+    // Both children are gone, including the one that only ever existed
+    // inside an in-flight initialization.
+    assert_all_gone(
+        &[ready, stalled],
+        "a child outlived a shutdown during startup",
+    )
+    .await;
+    assert!(runtime.child_pids().await.is_empty());
+    // The interrupted start must not install anything afterwards.
+    let snapshots = starting.await.unwrap();
+    assert!(
+        snapshots.iter().all(|snapshot| !snapshot.state.is_ready()),
+        "a server was installed after shutdown: {snapshots:?}"
+    );
+    assert!(runtime.tool_set().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_lifecycle_change_during_a_slow_trust_read_wins() {
+    let dir = workspace(serde_json::json!({"contested": stdio("basic")}));
+    let trust = PausedTrust::new(gritt_core::mcp::TrustDecision::Approved);
+    let runtime =
+        Arc::new(McpRuntime::new(dir.path(), settings()).with_trust(Arc::clone(&trust) as Arc<_>));
+    let cancel = CancellationToken::new();
+    // The initial load also reads trust, so let that one through first.
+    trust.release();
+    runtime.open(&cancel).await.unwrap();
+    assert_eq!(
+        state_of(&runtime.snapshots().await, "contested"),
+        &McpServerState::Ready
+    );
+
+    // A restart whose trust read is held open.
+    let restarting = Arc::clone(&runtime);
+    let token = cancel.clone();
+    let restart = tokio::spawn(async move { restarting.restart("contested", &token).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Meanwhile the server is stopped. The fingerprint is unchanged, so only
+    // the generation can tell the pending Approved answer that it is stale.
+    runtime.stop("contested").await.unwrap();
+    trust.release();
+    let outcome = restart.await.unwrap();
+
+    assert!(
+        outcome.is_err(),
+        "a stale approval restarted a stopped server"
+    );
+    assert_eq!(
+        state_of(&runtime.snapshots().await, "contested"),
+        &McpServerState::Stopped,
+        "the newer decision must stand"
+    );
+    assert!(runtime.child_pids().await.is_empty());
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_blocked_writer_neither_hangs_callers_nor_shutdown() {
+    let dir = workspace(serde_json::json!({"deaf": stdio("deaf")}));
+    let runtime = Arc::new(
+        McpRuntime::new(
+            dir.path(),
+            McpRuntimeSettings {
+                init_timeout: Duration::from_secs(5),
+                // Long, so what ends these calls is the blocked write and the
+                // saturated queue rather than the call deadline.
+                call_timeout: Duration::from_secs(300),
+                ..settings()
+            },
+        )
+        .with_trust(MemoryTrustStore::trust_all()),
+    );
+    let cancel = CancellationToken::new();
+    let snapshots = runtime.open(&cancel).await.unwrap();
+    assert_eq!(state_of(&snapshots, "deaf"), &McpServerState::Ready);
+    let pids = runtime.child_pids().await;
+    assert_eq!(pids.len(), 1);
+    let frozen = runtime
+        .tool_set()
+        .await
+        .lookup("mcp__deaf__echo")
+        .cloned()
+        .expect("the deaf fixture lists one tool before it stops reading");
+
+    // Enough payload to fill the pipe to a server that is no longer reading,
+    // and enough separate calls to saturate the command queue behind it.
+    let payload = serde_json::json!({"text": "x".repeat(64 * 1024)});
+    let mut calls = Vec::new();
+    for _ in 0..200 {
+        let runtime = Arc::clone(&runtime);
+        let frozen = frozen.clone();
+        let payload = payload.clone();
+        let token = cancel.clone();
+        calls.push(tokio::spawn(async move {
+            runtime.call(&frozen, &payload, &token).await
+        }));
+    }
+
+    // Nothing hangs: every call comes back with an error well inside the
+    // call deadline, because the write and the queue both have their own.
+    let settled = tokio::time::timeout(Duration::from_secs(120), async {
+        let mut errors = Vec::new();
+        for call in calls {
+            if let Ok(Err(error)) = call.await {
+                errors.push(error.message);
+            }
+        }
+        errors
+    })
+    .await
+    .expect("callers hung on a server that stopped reading");
+    assert!(
+        !settled.is_empty(),
+        "a server that stopped reading should have failed these calls"
+    );
+    assert!(
+        settled
+            .iter()
+            .any(|message| message.contains("stopped accepting messages")
+                || message.contains("stopped reading")
+                || message.contains("connection is closed")),
+        "unexpected failures: {settled:?}"
+    );
+
+    // And shutdown does not wait on the parked write.
+    let began = std::time::Instant::now();
+    runtime.shutdown().await;
+    assert!(
+        began.elapsed() < Duration::from_secs(30),
+        "shutdown waited on a blocked write for {:?}",
+        began.elapsed()
+    );
+    assert_all_gone(&pids, "the deaf server survived shutdown").await;
+}
+
+/// A runtime pointed at a local Streamable HTTP endpoint.
+fn http_runtime(dir: &Path) -> Arc<McpRuntime> {
+    let transport: Arc<dyn gritt_provider::transport::HttpTransport> =
+        Arc::new(gritt_provider::ReqwestTransport::new().unwrap());
+    Arc::new(
+        McpRuntime::new(dir, settings())
+            .with_http_transport(transport)
+            .with_trust(MemoryTrustStore::trust_all()),
+    )
+}
+
+#[tokio::test]
+async fn a_server_request_is_answered_with_a_compliant_post() {
+    let endpoint = http_fixture::start(http_fixture::Mode::ServerRequests).await;
+    let dir = workspace(serde_json::json!({"asks": {
+        "type": "http",
+        "url": endpoint.url,
+    }}));
+    let runtime = http_runtime(dir.path());
+    let cancel = CancellationToken::new();
+    let snapshots = runtime.open(&cancel).await.unwrap();
+    // The server sent a `ping` on the discovery stream. Discovery still
+    // finished, so the reply did not disturb the caller's own response.
+    assert_eq!(state_of(&snapshots, "asks"), &McpServerState::Ready);
+    assert_eq!(snapshot(&snapshots, "asks").tool_count, 1);
+
+    // The answer arrived, as its own POST.
+    let mut replies = Vec::new();
+    for _ in 0..100 {
+        replies = endpoint.replies.lock().unwrap().clone();
+        if !replies.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(replies.len(), 1, "the server request was never answered");
+    let (body, headers) = &replies[0];
+    let answer: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(answer["id"], "srv-1");
+    assert!(answer.get("result").is_some(), "{answer}");
+    // Every client POST must offer both body shapes, this one included; a
+    // strict endpoint rejects it otherwise and the originating call hangs.
+    let accept = headers.get("accept").cloned().unwrap_or_default();
+    assert!(
+        accept.contains("application/json") && accept.contains("text/event-stream"),
+        "the reply omitted the required Accept header: {accept:?}"
+    );
+    // It also carries the session and the negotiated revision, like any
+    // other post-handshake request.
+    assert_eq!(
+        headers.get("mcp-session-id").map(String::as_str),
+        Some("session-abc")
+    );
+    assert_eq!(
+        headers.get("mcp-protocol-version").map(String::as_str),
+        Some("2025-06-18")
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stalled_notification_cannot_hold_up_shutdown() {
+    let endpoint = http_fixture::start(http_fixture::Mode::StallNotifications).await;
+    let dir = workspace(serde_json::json!({"stalls": {
+        "type": "http",
+        "url": endpoint.url,
+    }}));
+    let runtime = http_runtime(dir.path());
+    let cancel = CancellationToken::new();
+    runtime.open(&cancel).await.unwrap();
+
+    // Cancelling a call sends `notifications/cancelled`, which this endpoint
+    // accepts and then never answers.
+    let frozen = runtime
+        .tool_set()
+        .await
+        .lookup("mcp__stalls__fetch")
+        .cloned()
+        .unwrap();
+    let canceller = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        canceller.cancel();
+    });
+    let error = runtime
+        .call(&frozen, &serde_json::json!({}), &cancel)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, gritt_core::ErrorKind::Cancelled);
+
+    // The hung notification POST is owned, so shutdown cancels it rather
+    // than waiting for an answer that never comes.
+    let began = std::time::Instant::now();
+    runtime.shutdown().await;
+    assert!(
+        began.elapsed() < Duration::from_secs(30),
+        "shutdown waited on a stalled notification for {:?}",
+        began.elapsed()
+    );
 }
