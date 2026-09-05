@@ -159,6 +159,13 @@ pub struct McpRuntime {
     /// otherwise persist in one order and apply in the other, leaving the
     /// stored decision disagreeing with the live one.
     decisions: Mutex<()>,
+    /// Held between creating a server process and registering it against its
+    /// reserved slot.
+    ///
+    /// Unset in production, where that window is a few microseconds and
+    /// cannot be observed reliably. A test sets it to prove shutdown waits
+    /// for a launch that has a child but has not attached it yet.
+    launch_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// Whether the workspace file has been read and its approved servers
     /// started. A session that begins on a connector never opens the
     /// runtime; entering a native session later does.
@@ -178,6 +185,7 @@ impl McpRuntime {
             generations: AtomicU64::new(1),
             launches: AtomicU64::new(1),
             decisions: Mutex::new(()),
+            launch_gate: None,
             opened: AtomicBool::new(false),
         }
     }
@@ -191,6 +199,16 @@ impl McpRuntime {
     /// keeps them for the run only.
     pub fn with_trust(mut self, trust: Arc<dyn TrustStore>) -> Self {
         self.trust = trust;
+        self
+    }
+
+    /// Holds every launch between spawning its process and registering it.
+    ///
+    /// Only a test sets this, to keep that window open long enough to observe.
+    /// Each launch acquires one permit, so a semaphore with no permits freezes
+    /// them there until the test adds some.
+    pub fn with_launch_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Self {
+        self.launch_gate = Some(gate);
         self
     }
 
@@ -689,16 +707,30 @@ impl McpRuntime {
         // child is gone".
         let deadline = std::time::Instant::now() + LAUNCH_DRAIN_TIMEOUT;
         loop {
-            let remaining: Vec<Arc<Connection>> = {
+            let (reserved, attached) = {
                 let state = self.state.lock().await;
-                state.launching.values().flatten().cloned().collect()
+                (
+                    state.launching.len(),
+                    state
+                        .launching
+                        .values()
+                        .flatten()
+                        .cloned()
+                        .collect::<Vec<Arc<Connection>>>(),
+                )
             };
-            if remaining.is_empty() || std::time::Instant::now() >= deadline {
-                // Anything still here has already been closed above; the
-                // bound only guards against a future that never returns.
+            // The count of *slots* is the condition, not the count of
+            // connections. A slot still holding `None` is a launch that has
+            // reserved its place and may be inside spawning right now: its
+            // child exists, or is about to, and waiting for the slot to
+            // clear is the only way to know which. Leaving on an empty
+            // connection list would let that child outlive shutdown, and the
+            // signal handler exits the process immediately afterwards.
+            if reserved == 0 || std::time::Instant::now() >= deadline {
+                // The bound only guards against a future that never returns.
                 break;
             }
-            close_all(remaining).await;
+            close_all(attached).await;
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -973,6 +1005,13 @@ impl McpRuntime {
                 return Err(reason);
             }
         };
+        if let Some(gate) = &self.launch_gate {
+            // The child exists but its slot still holds `None`. Shutdown has
+            // to treat that as work in progress.
+            if let Ok(permit) = gate.acquire().await {
+                permit.forget();
+            }
+        }
         self.attach_launch(launch, &connection).await;
         let tail = |reason: String| match &stderr {
             Some(stderr) => {
