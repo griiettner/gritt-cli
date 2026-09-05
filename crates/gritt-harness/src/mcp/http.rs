@@ -177,11 +177,11 @@ pub fn connect(
                 command = commands.recv() => {
                     let Some(command) = command else { break };
                     match command {
-                        Command::Request { id, method, params, reply } => {
+                        Command::Request { id, method, params, reply, cancelled } => {
                             // Checked immediately before the POST is spawned,
                             // independently of the order the commands arrived
                             // in.
-                            if task.flags.take_abandoned(id) {
+                            if cancelled.load(Ordering::SeqCst) {
                                 let _ = reply.send(Err(Error::cancelled()));
                                 continue;
                             }
@@ -412,11 +412,14 @@ struct SseBudget {
     /// holding for an event that has not ended.
     pending: usize,
     total: usize,
-    /// Consecutive line terminators seen so far, carried across chunk
-    /// boundaries. Without this a `\n\n` split between two chunks would
+    /// Consecutive line endings seen so far, carried across chunk
+    /// boundaries. Without this a blank line split between two chunks would
     /// never be recognized and `pending` would grow for ever on a perfectly
     /// valid stream.
     newlines: usize,
+    /// Whether the previous byte was a carriage return, so a `\n` that
+    /// follows one is the same line ending rather than a second.
+    saw_cr: bool,
     max_event: usize,
     max_stream: usize,
 }
@@ -427,6 +430,7 @@ impl SseBudget {
             pending: 0,
             total: 0,
             newlines: 0,
+            saw_cr: false,
             max_event,
             max_stream,
         }
@@ -445,24 +449,29 @@ impl SseBudget {
             return Err(Error::config("the MCP stream exceeded its size limit"));
         }
         for byte in chunk {
-            match byte {
-                // Transparent to the run, so `\r\n\r\n` ends an event just
-                // as `\n\n` does.
-                b'\r' => self.pending += 1,
-                b'\n' => {
-                    self.newlines += 1;
-                    if self.newlines >= 2 {
-                        // A blank line ends the event; nothing is outstanding.
-                        self.pending = 0;
-                        self.newlines = 0;
-                    } else {
-                        self.pending += 1;
-                    }
-                }
-                _ => {
+            // The same rule the provider's parser uses: a line ends at `\n`,
+            // `\r`, or `\r\n`, and a blank line ends an event. Treating a
+            // bare `\r` as ordinary content would make a CR-framed stream
+            // look like one endless event.
+            if *byte == b'\n' && self.saw_cr {
+                // The second half of a `\r\n`; the ending was already
+                // counted.
+                self.saw_cr = false;
+                continue;
+            }
+            self.saw_cr = *byte == b'\r';
+            if *byte == b'\n' || *byte == b'\r' {
+                self.newlines += 1;
+                if self.newlines >= 2 {
+                    // A blank line ends the event; nothing is outstanding.
+                    self.pending = 0;
                     self.newlines = 0;
+                } else {
                     self.pending += 1;
                 }
+            } else {
+                self.newlines = 0;
+                self.pending += 1;
             }
             if self.pending > self.max_event {
                 return Err(Error::config("the MCP stream sent an oversized event"));
@@ -501,6 +510,38 @@ mod tests {
         budget.admit(b"data: a\r\n").unwrap();
         budget.admit(b"\r\nxy").unwrap();
         assert_eq!(budget.pending, 2);
+    }
+
+    #[test]
+    fn bare_cr_framing_ends_events_the_way_the_parser_sees_it() {
+        // The provider's SSE parser treats a lone `\r` as a line ending, so
+        // the budget has to as well; otherwise a CR-framed stream looks like
+        // one event that never ends.
+        let mut budget = SseBudget::new(16, 1024);
+        budget.admit(b"data: a\r\rdata: b").unwrap();
+        assert_eq!(budget.pending, 7);
+        // Split across chunks, like a socket delivers it.
+        let mut budget = SseBudget::new(16, 1024);
+        budget.admit(b"data: a\r").unwrap();
+        budget.admit(b"\rxy").unwrap();
+        assert_eq!(budget.pending, 2);
+    }
+
+    #[test]
+    fn many_small_cr_framed_events_do_not_exhaust_the_event_bound() {
+        // The case the bound used to reject: far more CR-framed bytes in
+        // total than one event may hold, every one of them valid.
+        let mut budget = SseBudget::new(16, 1024 * 1024);
+        let burst: Vec<u8> = std::iter::repeat_n(b"data: a\r\r".as_slice(), 50)
+            .flatten()
+            .copied()
+            .collect();
+        budget.admit(&burst).unwrap();
+        assert_eq!(budget.pending, 0);
+        for byte in &burst {
+            budget.admit(&[*byte]).unwrap();
+        }
+        assert_eq!(budget.pending, 0);
     }
 
     #[test]
