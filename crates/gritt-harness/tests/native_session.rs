@@ -99,6 +99,7 @@ async fn fixture_builder(
         cache: None,
         workspace: Workspace::open(dir.path()).unwrap(),
         approval,
+        mcp: None,
     };
     Fixture {
         _dir: dir,
@@ -1087,6 +1088,7 @@ async fn resume_refuses_a_session_from_another_workspace() {
         cache: None,
         workspace: Workspace::open(other.path()).unwrap(),
         approval: ApprovalMode::Ask,
+        mcp: None,
     };
     for selector in [
         SessionSelector::Named("elsewhere".into()),
@@ -1647,6 +1649,7 @@ async fn two_profile_builder(dir: &std::path::Path) -> AgentBuilder {
         cache: None,
         workspace: Workspace::open(dir).unwrap(),
         approval: ApprovalMode::DenyAll,
+        mcp: None,
     }
 }
 
