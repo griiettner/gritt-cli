@@ -265,7 +265,7 @@ Run from `/Users/griiettner/Projects/grittflow/gritt-cli-tkt-0019`:
 | --- | --- |
 | `cargo fmt --all --check` | pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | pass |
-| `cargo test -p gritt-harness` | pass, 313 tests over 10 targets |
+| `cargo test -p gritt-harness` | pass, 314 tests over 10 targets |
 | `cargo test -p gritt --test tui_pty` | pass, 10 tests |
 | `cargo test --workspace --no-fail-fast` | pass, 478 tests, 0 failed |
 | `GRITT_LIVE_MCP_TESTS=1 cargo test -p gritt-harness --test mcp_live_smoke` | pass, 1 test, after the note below |
@@ -279,7 +279,7 @@ files on a fresh worktree, measured here at 41 s before it answers
 check passed in 1.08 s. Wiring `McpRuntimeSettings` to `config.toml`
 remains TKT-0017's follow-up.
 
-New test counts: 22 reducer tests in `src/tui/app/tests.rs`, 11
+New test counts: 22 reducer tests in `src/tui/app/tests.rs`, 12
 runtime-handler tests in `src/tui/run.rs`, 11 in the new
 `tests/tui_integration.rs`, 4 PTY tests in `crates/gritt/tests/tui_pty.rs`,
 3 new snapshot screens at 5 sizes each, and 6 unit tests in
@@ -347,7 +347,7 @@ What a human should still check in a real terminal:
 
 ## Completion Gate
 
-- **Acceptance:** yes, after four rounds of review fixes. The first version was
+- **Acceptance:** yes, after five rounds of review fixes. The first version was
   overstated on three of these and the review was right: installed agents
   could not actually be selected, connector sessions could not resume, and
   late asynchronous work was only partly rejected — catalogs and scans
@@ -372,8 +372,13 @@ What a human should still check in a real terminal:
   slot, which let a later request end a live MCP launch's label, and a
   cancelled session change left its label behind to mask everything after
   it. All closed, each with a test that fails against the previous code;
-  see the update file, whose closing note records what these four rounds
-  had in common.
+  see the update file, whose closing note records what these rounds had in
+  common. Round 5 found the last one, a regression in round 4's own fix:
+  ordinary completions were matched by kind alone, so a queued response
+  could retire the request that had replaced it and discard the handle
+  that was the only way to cancel it. Ordinary work is now identified by
+  kind and request together, and one answer decides both whether to retire
+  the ownership and whether to apply the result.
 - **Scope:** yes. No new MCP protocol feature, no provider request
   mapping change, no LSP or skill execution, no visual redesign, and no
   user documentation. No cost or context figure whose source is unknown.

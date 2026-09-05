@@ -398,3 +398,69 @@ into TKT-0020 and any later work on this loop.
 
 Unchanged. The manual terminal walkthrough by a human is still
 outstanding and is the chain's to close.
+
+---
+
+# Round 5
+
+## Trigger
+
+Fifth review of PR #11 at `ee1da95` returned `needs-fix` with one
+confirmed Medium finding. Both round-4 scenarios were confirmed fixed; the
+finding is a regression that round 4's own fix introduced.
+
+## The finding
+
+`finish_work` matched a completion by its `Work` kind alone. Ordinary
+requests of the same kind supersede each other, so an older queued
+response satisfied the match for the newer one and retired it — ending the
+label and, worse, dropping the `JoinHandle` that was the only way to stop
+it. The reachable sequence:
+
+1. Diff A is requested; its result is queued.
+2. The user opens diff B before A's response is handled. B supersedes A
+   and owns the slot.
+3. A's completion arrives and is treated as B's, retiring B's ownership
+   and discarding its handle.
+4. `/new` can no longer cancel B, because there is nothing left to abort.
+5. B finishes and opens its diff over the fresh draft.
+
+Before round 4, A ended only the label and B's handle survived, so `/new`
+could still abort it. Round 4 traded that for the ownership retirement it
+needed, and did not carry the request identity with it.
+
+## The change
+
+The identity of ordinary work is the kind *and* the request. `ActiveWork`
+holds both, every ordinary message carries the `operation` it answers, and
+the id is allocated where the request is made. `finish_work` retires the
+slot only for the request that still owns it and *returns whether it did*,
+marked `#[must_use]`; every handler asks once and uses the same answer to
+decide both whether to retire the ownership and whether to apply the
+result. Those two decisions can no longer be made separately, which is the
+failure mode that produced findings in four consecutive rounds.
+
+A stale completion therefore changes nothing and shows nothing. That
+closes a second, quieter case in the same code: a cancelled diff used to
+open its overlay when its result eventually landed, over whatever the
+reader had moved on to.
+
+`a_queued_diff_cannot_retire_the_one_that_replaced_it` drives the reported
+sequence deterministically — A queued, B live, A's completion, `/new`,
+then B's late completion — and fails against the previous code.
+
+## Validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, 0 errors |
+| `cargo test --workspace --no-fail-fast` | pass, 478 passed, 0 failed |
+| `cargo test -p gritt --test tui_pty` | pass, 10 passed |
+| `cargo test -p gritt-harness` | pass, 314 passed |
+| `GRITT_LIVE_MCP_TESTS=1 ... --test mcp_live_smoke` | pass, 1 passed |
+
+## Remaining follow-up
+
+Unchanged. The manual terminal walkthrough by a human is still
+outstanding and is the chain's to close.
