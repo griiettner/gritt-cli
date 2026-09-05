@@ -220,9 +220,9 @@ Run from `/Users/griiettner/Projects/grittflow/gritt-cli-tkt-0018`:
 | `cargo clippy --workspace --all-targets -- -D warnings` | pass, no warnings |
 | `cargo test -p gritt-harness` | pass, 226 tests (128 lib, 98 integration) |
 | `cargo test -p gritt --test tui_pty` | pass, 6 tests |
-| `cargo test --workspace --no-fail-fast` | pass, 422 tests, 0 failed |
+| `cargo test --workspace --no-fail-fast` | pass, 424 tests, 0 failed |
 
-Counts are after three rounds of review fixes; the first gate on this
+Counts are after four rounds of review fixes; the first gate on this
 branch saw 395. See the update file for what each round changed.
 
 Tests added: 27 reducer tests in `src/tui/app/tests.rs`, 20 unit tests
@@ -322,14 +322,17 @@ What a human should still check, because a PTY byte stream cannot:
 
 ## Follow-up
 
-0. **Three review rounds landed on this branch.** Twelve findings in
-   total, one high and eleven medium. Most were one of two shapes, and both
+0. **Four review rounds landed on this branch.** Thirteen findings in
+   total, one high and twelve medium. Most were one of two shapes, and both
    are worth knowing before extending this code. The first is two parts of
    the interface disagreeing about state: a highlight index against a
    filtered list, a renderer hiding an overlay the reducer still routed to,
    a focus predicate that knew the terminal width but not the layout. The
-   second is a fix that moved the cost rather than removing it: making
-   backward cursor steps grapheme-aware turned them quadratic. See
+   second is a fix that moved a cost rather than removing it: making
+   backward cursor steps grapheme-aware turned them quadratic, and the
+   repair for that was still quadratic for flag emoji, which the ASCII
+   regression could not see. Text traversal here is worth measuring on
+   regional indicators, not just on ASCII. See
    [the update file](updates/2026-09-05-review-fixes.md).
 1. **TKT-0019 wiring.** `ModelCatalogView`, `AgentSummary`, and
    `SidebarModel` are populated by `fixture.rs` today. They exist to be
@@ -348,9 +351,19 @@ What a human should still check, because a PTY byte stream cannot:
 5. **Changed files are not selectable.** The sidebar section renders and
    the plan wants selecting a file to open a read-only diff. That needs the
    harness workspace service from step 4 and belongs with it.
-6. **Responsiveness is unmeasured.** Plan step 5 owns the budgets. The
-   layout cache and event-driven redraw are in place to meet them, but
-   nothing was timed here.
+6. **Responsiveness is unmeasured, with one exception now on record.**
+   Plan step 5 owns the budgets. The layout cache and event-driven redraw
+   are in place to meet them, but nothing was timed here except the
+   composer traversal the reviews forced. Word-scale backward operations
+   are linear. A single backward step over a run of adjacent flag emoji is
+   still linear in the draft, because the cursor that decides where a flag
+   begins has to count the indicators behind it: measured in a debug build,
+   2,000 Left presses took 520 ms over 5,000 flags, 1.14 s over 10,000, and
+   2.41 s over 20,000, about 1.2 ms per press at the largest. That is
+   inside the plan's 50 ms input-to-frame budget, and removing it means
+   giving `Composer` a persistent grapheme cursor, which changes a type
+   that is currently plain cloneable data compared by value. Worth deciding
+   against real budgets in step 5 rather than in a review round.
 7. **`/new` clears presentation, not the session.** It empties the
    transcript view and the draft state, but the live driver and its
    continuation state stay open until TKT-0019 wires a real fresh session.

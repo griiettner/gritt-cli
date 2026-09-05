@@ -23,6 +23,12 @@ pub fn clusters(text: &str) -> impl Iterator<Item = (usize, &str)> {
     text.grapheme_indices(true)
 }
 
+/// Whether a cluster is whitespace, which is decided by the character it
+/// is built on.
+fn cluster_is_space(cluster: &str) -> bool {
+    cluster.chars().next().is_some_and(char::is_whitespace)
+}
+
 /// The length of the last cluster of `text`, or 0 when it is empty.
 ///
 /// This walks backwards from the end rather than forwards from the start.
@@ -377,52 +383,43 @@ impl Composer {
         end
     }
 
-    /// Whether the cluster starting at `offset` is whitespace. A cluster
-    /// is whitespace when the character it is built on is.
-    fn is_space_at(&self, start: usize, end: usize) -> bool {
-        self.text[start..end]
-            .chars()
-            .next()
-            .is_some_and(char::is_whitespace)
-    }
-
     /// Skips whitespace backwards, then the word before the cursor.
+    ///
+    /// One reverse iterator does the whole scan. Asking for the previous
+    /// boundary repeatedly would build a fresh cursor each time, and a
+    /// fresh cursor has to count the regional indicators behind it to
+    /// decide where a flag begins: a run of flag emoji would then be
+    /// rescanned once per cluster. Stepping one iterator keeps that count
+    /// alive, so the scan costs the text it crosses and no more.
     fn word_start(&self, at: usize) -> usize {
         let mut offset = at;
-        while offset > 0 {
-            let previous = self.prev_boundary(offset);
-            if self.is_space_at(previous, offset) {
-                offset = previous;
+        let mut in_word = false;
+        for cluster in self.text[..at].graphemes(true).rev() {
+            if cluster_is_space(cluster) {
+                if in_word {
+                    break;
+                }
             } else {
-                break;
+                in_word = true;
             }
-        }
-        while offset > 0 {
-            let previous = self.prev_boundary(offset);
-            if self.is_space_at(previous, offset) {
-                break;
-            }
-            offset = previous;
+            offset -= cluster.len();
         }
         offset
     }
 
+    /// The forward mirror, on one forward iterator for the same reason.
     fn word_end(&self, at: usize) -> usize {
         let mut offset = at;
-        while offset < self.text.len() {
-            let next = self.next_boundary(offset);
-            if self.is_space_at(offset, next) {
-                offset = next;
+        let mut in_word = false;
+        for cluster in self.text[at..].graphemes(true) {
+            if cluster_is_space(cluster) {
+                if in_word {
+                    break;
+                }
             } else {
-                break;
+                in_word = true;
             }
-        }
-        while offset < self.text.len() {
-            let next = self.next_boundary(offset);
-            if self.is_space_at(offset, next) {
-                break;
-            }
-            offset = next;
+            offset += cluster.len();
         }
         offset
     }
@@ -566,6 +563,86 @@ mod tests {
             "10k Left presses took {:?}",
             start.elapsed()
         );
+    }
+
+    /// The same guarantee for the worst case the segmentation algorithm
+    /// has: a run of adjacent regional indicators. Whether two of them are
+    /// one flag or two halves depends on how many precede them, so a fresh
+    /// cursor counts backwards through the whole run. The word scan must
+    /// therefore carry one iterator rather than start over per cluster.
+    #[test]
+    fn backward_word_editing_stays_linear_across_a_run_of_flag_emoji() {
+        use std::time::{Duration, Instant};
+
+        // 20,000 flags, no whitespace anywhere to cut the scan short.
+        let flags = "\u{1F1FA}\u{1F1F8}".repeat(20_000);
+        assert_eq!(flags.graphemes(true).count(), 20_000);
+        let budget = Duration::from_secs(5);
+
+        let mut composer = Composer::from_text(flags.clone());
+        let start = Instant::now();
+        composer.move_word_left(false);
+        assert_eq!(composer.cursor(), 0, "Ctrl-Left did not reach the start");
+        assert!(
+            start.elapsed() < budget,
+            "Ctrl-Left over 20k flags took {:?}",
+            start.elapsed()
+        );
+
+        let mut composer = Composer::from_text(flags.clone());
+        let start = Instant::now();
+        composer.delete_word_back();
+        assert!(composer.is_empty(), "Ctrl-W left text behind");
+        assert!(
+            start.elapsed() < budget,
+            "Ctrl-W over 20k flags took {:?}",
+            start.elapsed()
+        );
+
+        // Forward is the mirror of the same scan.
+        let mut composer = Composer::from_text(flags);
+        composer.move_text_start(false);
+        let start = Instant::now();
+        composer.move_word_right(false);
+        assert_eq!(composer.cursor(), composer.text().len());
+        assert!(
+            start.elapsed() < budget,
+            "Ctrl-Right over 20k flags took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn word_moves_still_land_between_flags_and_words() {
+        // Correctness, not speed: a flag is one character to step over.
+        let mut composer = Composer::from_text("hi \u{1F1FA}\u{1F1F8}\u{1F1EB}\u{1F1F7} bye");
+        composer.move_word_left(false);
+        assert_eq!(&composer.text()[composer.cursor()..], "bye");
+        composer.move_word_left(false);
+        assert_eq!(
+            &composer.text()[composer.cursor()..],
+            "\u{1F1FA}\u{1F1F8}\u{1F1EB}\u{1F1F7} bye"
+        );
+        composer.move_word_left(false);
+        assert_eq!(composer.cursor(), 0);
+        // One Left step crosses one whole flag, not one indicator: from
+        // the start of `bye`, one step takes the space and the next takes
+        // the whole second flag.
+        composer.move_text_end(false);
+        composer.move_word_left(false);
+        composer.move_left(false);
+        assert_eq!(&composer.text()[composer.cursor()..], " bye");
+        composer.move_left(false);
+        assert_eq!(
+            &composer.text()[composer.cursor()..],
+            "\u{1F1EB}\u{1F1F7} bye"
+        );
+        // And Backspace removes the flag whole.
+        composer.move_text_end(false);
+        composer.move_word_left(false);
+        composer.backspace();
+        composer.backspace();
+        assert_eq!(composer.text(), "hi \u{1F1FA}\u{1F1F8}bye");
     }
 
     #[test]

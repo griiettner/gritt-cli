@@ -356,6 +356,79 @@ NOTE: changed files against `main`: 64
 tkt_chain_check ok (0 warning(s))
 ```
 
+## Round 4
+
+The fourth review confirmed the focus fix and returned one medium finding,
+again in the traversal round 3 rewrote. Findings are in
+`/tmp/review-tkt-0018-r4-findings.md`.
+
+**R4-1: backward word traversal was still quadratic for adjacent flag
+emoji.** Round 3 fixed the cost of a single backward step for ordinary
+text, but `word_start` still asked for the previous boundary once per
+cluster, and each ask built a fresh grapheme cursor. That is cheap for
+ASCII and it is not cheap for regional indicators: whether two of them are
+one flag or two halves depends on how many precede them, so a fresh cursor
+counts backwards through the whole run before it can answer. A word scan
+over a long paste of `🇺🇸` therefore rescanned a shrinking prefix per
+cluster. The round 3 regression used ASCII only and could not see it.
+
+`word_start` now carries one reverse iterator across the whole scan and
+subtracts each cluster's length as it goes, so the regional-indicator count
+the cursor keeps stays alive between steps and the scan costs the text it
+crosses. `word_end` is the forward mirror, rewritten the same way for the
+same reason. Verified against the vendored source before choosing the
+approach rather than assumed: `GraphemeCursor` caches `ris_count` and
+reuses it on a subsequent `prev_boundary`
+(`unicode-segmentation-1.13.3/src/grapheme.rs:214,822`), while a fresh
+cursor starts at `None` and counts the run (`:317,519`), and
+`Graphemes::next_back` steps one cursor it owns (`:125`).
+
+Covered by `backward_word_editing_stays_linear_across_a_run_of_flag_emoji`,
+which builds 20,000 adjacent flags with no whitespace and bounds Ctrl-Left,
+Ctrl-W, and Ctrl-Right at five seconds each, and by
+`word_moves_still_land_between_flags_and_words`, which checks the
+correctness the speed fix must not break: a flag is one character to step
+over, to delete, and to stop beside. The whole composer suite runs in
+0.03s.
+
+### A residual worth naming
+
+Fixing the word scan does not make a *single* backward step cheap on a flag
+run, because one step still builds one cursor that counts the indicators
+behind it. Measured in a debug build on this machine, 2,000 Left presses
+took 520 ms over 5,000 flags, 1.14 s over 10,000, and 2.41 s over 20,000:
+linear in the draft for each press, about 1.2 ms per press at 20,000 flags.
+That stays inside the plan's 50 ms input-to-frame budget for any draft a
+person is likely to type, and it is the same shape of cost the reviewer
+found, one exponent lower.
+
+It is not fixed here. Removing it means giving `Composer` a persistent
+grapheme cursor, which changes the shape of a type that is currently plain
+cloneable data compared by value, and doing that in the middle of a review
+round is a worse trade than recording the number. It is in `report.md` as a
+follow-up with these measurements, so the responsiveness work in step 5 of
+the feature plan can decide it against real budgets rather than a guess.
+
+### Round 4 validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --no-fail-fast` | pass, 424 tests, 0 failed |
+| `cargo test -p gritt --test tui_pty` | pass, 6 tests |
+
+424 passing, up from 422: 2 tests added. No snapshot golden changed.
+
+`.agents/gritt-agent ticket chain-check --ticket TKT-0018 --base main`:
+
+```text
+NOTE: current branch: tkt-0018-03-tui-foundation
+NOTE: base branch `main` sha: 77aaa22cb1c5
+NOTE: changed files against `main`: 64
+tkt_chain_check ok (0 warning(s))
+```
+
 ## Remaining follow-up
 
 The `Picker::window` helper is now unused by the picker renderer, which
