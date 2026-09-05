@@ -266,3 +266,197 @@ tickets:
     skills:
       - tkt
       - tkt-exec-chain
+  - id: TKT-0015
+    namespace: griiettner
+    title: Build an OpenCode-inspired full-screen agent TUI with generic MCP harness support
+    status: planning
+    owner: griiettner
+    priority: normal
+    created: 2026-09-04
+    updated: 2026-09-04
+    artifacts:
+      concept: .agents/tasks/griiettner/TKT-0001-0025/TKT-0015/concept.md
+      plan: .agents/tasks/griiettner/TKT-0001-0025/TKT-0015/plan.md
+      task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0015/task.md
+    dependencies:
+      - TKT-0014
+    areas:
+      - crates/gritt-core
+      - crates/gritt-provider
+      - crates/gritt-harness
+      - crates/gritt
+      - docs
+      - .agents/plans
+    skills:
+      - tkt
+      - tkt-exec-chain
+      - dev-harness
+      - dev-provider
+      - codebase-design
+      - tdd
+      - write-plan
+  - id: TKT-0016
+    namespace: griiettner
+    title: Define model, effort, session-draft, and provider setup contracts
+    status: ready
+    owner: griiettner
+    priority: normal
+    created: 2026-09-04
+    updated: 2026-09-04
+    artifacts:
+      task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0016/task.md
+    dependencies: []
+    areas:
+      - crates/gritt-core
+      - crates/gritt-provider
+      - crates/gritt-harness
+      - crates/gritt
+      - docs
+      - .agents/plans
+    skills:
+      - tkt
+      - tkt-exec-chain
+      - dev-harness
+      - dev-provider
+      - codebase-design
+      - tdd
+      - write-plan
+  - id: TKT-0017
+    namespace: griiettner
+    title: Implement generic .mcp.json MCP runtime and harness tool dispatch
+    status: planning
+    owner: griiettner
+    priority: normal
+    created: 2026-09-04
+    updated: 2026-09-04
+    artifacts:
+      task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0017/task.md
+    dependencies:
+      - TKT-0016
+    areas:
+      - crates/gritt-core
+      - crates/gritt-provider
+      - crates/gritt-harness
+      - crates/gritt
+      - docs
+      - .agents/plans
+    skills:
+      - tkt
+      - tkt-exec-chain
+      - dev-harness
+      - dev-provider
+      - codebase-design
+      - tdd
+      - write-plan
+  - id: TKT-0018
+    namespace: griiettner
+    title: Build the full-screen home, composer, commands, and picker UI
+    status: planning
+    owner: griiettner
+    priority: normal
+    created: 2026-09-04
+    updated: 2026-09-04
+    artifacts:
+      task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0018/task.md
+    dependencies:
+      - TKT-0017
+    areas:
+      - crates/gritt-core
+      - crates/gritt-provider
+      - crates/gritt-harness
+      - crates/gritt
+      - docs
+      - .agents/plans
+    skills:
+      - tkt
+      - tkt-exec-chain
+      - dev-harness
+      - dev-provider
+      - codebase-design
+      - tdd
+      - write-plan
+  - id: TKT-0019
+    namespace: griiettner
+    title: Integrate conversation sidebar, sessions, MCP status, and responsive runtime
+    status: planning
+    owner: griiettner
+    priority: normal
+    created: 2026-09-04
+    updated: 2026-09-04
+    artifacts:
+      task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0019/task.md
+    dependencies:
+      - TKT-0018
+    areas:
+      - crates/gritt-core
+      - crates/gritt-provider
+      - crates/gritt-harness
+      - crates/gritt
+      - docs
+      - .agents/plans
+    skills:
+      - tkt
+      - tkt-exec-chain
+      - dev-harness
+      - dev-provider
+      - codebase-design
+      - tdd
+      - write-plan
+  - id: TKT-0020
+    namespace: griiettner
+    title: Complete documentation, performance benchmarks, and integrated TUI hardening
+    status: planning
+    owner: griiettner
+    priority: normal
+    created: 2026-09-04
+    updated: 2026-09-04
+    artifacts:
+      task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0020/task.md
+    dependencies:
+      - TKT-0019
+    areas:
+      - crates/gritt-core
+      - crates/gritt-provider
+      - crates/gritt-harness
+      - crates/gritt
+      - docs
+      - .agents/plans
+    skills:
+      - tkt
+      - tkt-exec-chain
+      - dev-harness
+      - dev-provider
+      - codebase-design
+      - tdd
+      - write-plan
+  - id: TKT-0021
+    namespace: griiettner
+    title: Review integrated OpenCode-inspired agent TUI and MCP harness chain
+    status: planning
+    owner: griiettner
+    priority: normal
+    created: 2026-09-04
+    updated: 2026-09-04
+    artifacts:
+      task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0021/task.md
+    dependencies:
+      - TKT-0016
+      - TKT-0017
+      - TKT-0018
+      - TKT-0019
+      - TKT-0020
+    areas:
+      - crates/gritt-core
+      - crates/gritt-provider
+      - crates/gritt-harness
+      - crates/gritt
+      - docs
+      - .agents/plans
+    skills:
+      - tkt
+      - tkt-exec-chain
+      - dev-harness
+      - dev-provider
+      - codebase-design
+      - tdd
+      - write-plan
