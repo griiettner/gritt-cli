@@ -22,7 +22,7 @@ use gritt_harness::modes::repl::{line_prompter, run_repl, CancelSlot, LineInput}
 use gritt_harness::store::{resolve_location, Store, StoreTrustStore};
 use gritt_harness::telemetry::Telemetry;
 use gritt_harness::tools::Workspace;
-use gritt_harness::tui::run_tui;
+use gritt_harness::tui::{run_fixture, run_tui, FixtureScreen};
 use gritt_provider::models::{ModelCache, ModelCatalog};
 use gritt_provider::ReqwestTransport;
 
@@ -97,6 +97,12 @@ enum Command {
     Tui {
         #[command(flatten)]
         session: SessionArgs,
+        /// Open a labelled fixture screen for design review: `home` or
+        /// `conversation`. Nothing is opened: no session, no provider
+        /// request, and no MCP server. Every value on screen is invented
+        /// and the interface says so.
+        #[arg(long, value_name = "SCREEN")]
+        fixture: Option<String>,
     },
     /// Inspect and approve the workspace's MCP servers.
     Mcp {
@@ -669,7 +675,19 @@ async fn run_tui_mode(
     workspace: &Path,
     database: Option<&Path>,
     args: &SessionArgs,
+    fixture: Option<&str>,
 ) -> Result<ExitCode> {
+    // The fixture walkthrough short-circuits before any store, catalog,
+    // control plane, or MCP runtime is built.
+    if let Some(name) = fixture {
+        let screen = FixtureScreen::parse(name).ok_or_else(|| {
+            Error::config(format!(
+                "unknown fixture screen `{name}`; use `home` or `conversation`"
+            ))
+        })?;
+        run_fixture(screen).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let connector = connector_flag(args)?;
     warn_approval_flags(args, connector);
     let mut builder = builder(workspace, database, args).await?;
@@ -1027,7 +1045,7 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         Some(Command::KeySet { profile }) => key_set(&workspace, &profile),
         Some(Command::Config) => show_config(&workspace),
-        None => run_tui_mode(&workspace, database, &SessionArgs::default()).await,
+        None => run_tui_mode(&workspace, database, &SessionArgs::default(), None).await,
         Some(Command::Run {
             prompt,
             session,
@@ -1036,7 +1054,9 @@ async fn main() -> ExitCode {
         Some(Command::Repl { session, verbose }) => {
             run_repl_mode(&workspace, database, &session, verbose).await
         }
-        Some(Command::Tui { session }) => run_tui_mode(&workspace, database, &session).await,
+        Some(Command::Tui { session, fixture }) => {
+            run_tui_mode(&workspace, database, &session, fixture.as_deref()).await
+        }
         Some(Command::Mcp { command }) => mcp_command(&workspace, database, command).await,
         Some(Command::Session { command }) => session_command(&workspace, database, command).await,
         Some(Command::Connectors) => connectors_command(&workspace, database).await,
