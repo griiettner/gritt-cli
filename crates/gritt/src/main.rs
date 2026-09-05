@@ -702,46 +702,53 @@ async fn run_tui_mode(
     // process groups: without this they would survive it.
     let slot: CancelSlot = Arc::new(Mutex::new(None));
     let _ = install_ctrl_c(Arc::clone(&slot), mcp.clone());
-    // Neither the model list nor the MCP servers are waited for here. The
-    // plan's launch budget is a usable composer independent of provider and
-    // MCP readiness, and an unreachable endpoint or a server that never
-    // answers `initialize` would otherwise hold a blank terminal for its
-    // whole deadline. Both are started in the background; the full-screen
-    // mode loads catalogs on demand and subscribes to MCP lifecycle, so
-    // each result arrives as a message and is drawn when it lands
-    // (TKT-0020).
-    if connector.is_none() {
+    // The MCP servers are never waited for here, and the model list is
+    // waited for only when this run resolves a model before the first
+    // frame. The plan's launch budget is a usable composer independent of
+    // provider and MCP readiness, and an unreachable endpoint or a server
+    // that never answers `initialize` would otherwise hold a blank terminal
+    // for its whole deadline (TKT-0020).
+    //
+    // The exception is the eager path. `plane.open` resolves `--model`
+    // against the catalog and persists the result on the new session, so a
+    // catalog that has not arrived yet would let a retired id be stored
+    // unremapped, or an unknown one be accepted. That resolution has to see
+    // the list, so this run pays for it. The lazy path does not: it opens
+    // nothing until a prompt is submitted, and draft validation performs
+    // its own warm before it resolves anything.
+    let lazy = args.session.is_none() && matches!(connector, None | Some(ConnectorId::Native));
+    if connector.is_none() && !args.no_models {
         let warming = builder.clone();
         let selector = selector(args);
         let profile = args.profile.clone();
         let model = args.model.clone();
-        let skip = args.no_models;
-        tokio::spawn(async move {
-            if skip {
-                return;
-            }
-            // Deliberately silent: stderr belongs to the alternate screen
-            // now. A stale or missing list is reported inside the
-            // interface instead.
+        // Deliberately silent in both forms: stderr belongs to the
+        // alternate screen from here on, and a stale or missing list is
+        // reported inside the interface instead.
+        let warm = async move {
             if let Ok(profile) = warming
                 .session_profile(&selector, profile.as_deref(), model.as_deref())
                 .await
             {
                 let _ = warming.load_catalog(&profile).await;
             }
-        });
-    }
-    if runs_on_native(&builder, &selector(args), connector).await {
-        if let Some(runtime) = mcp.clone() {
-            tokio::spawn(async move {
-                // `start_mcp` reports each server on stderr, which the
-                // alternate screen owns from here on. The interface reads
-                // the same states from the lifecycle subscription.
-                let _ = runtime.open(&gritt_harness::CancellationToken::new()).await;
-            });
+        };
+        if lazy {
+            tokio::spawn(warm);
+        } else {
+            warm.await;
         }
     }
-    let result = tui_session(builder, args, connector).await;
+    // Handed to the interface rather than opened here: it starts the
+    // runtime in the background and reports a configuration failure as a
+    // notice, which stderr can no longer carry once the alternate screen is
+    // up.
+    let start_mcp = if runs_on_native(&builder, &selector(args), connector).await {
+        mcp.clone()
+    } else {
+        None
+    };
+    let result = tui_session(builder, args, connector, start_mcp).await;
     stop_mcp(&mcp).await;
     result
 }
@@ -758,6 +765,7 @@ async fn tui_session(
     builder: AgentBuilder,
     args: &SessionArgs,
     connector: Option<ConnectorId>,
+    start_mcp: Option<Arc<gritt_harness::mcp::McpRuntime>>,
 ) -> Result<ExitCode> {
     let plane = plane(builder)?;
     let mut draft = SessionDraft::default();
@@ -791,7 +799,7 @@ async fn tui_session(
                 .await?,
         )
     };
-    run_tui(plane, agent, draft).await?;
+    run_tui(plane, agent, draft, start_mcp).await?;
     Ok(ExitCode::SUCCESS)
 }
 
