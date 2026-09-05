@@ -445,3 +445,88 @@ Unchanged. Follow-up 1 now accounts for the memory plateau, the render-work
 margin, and an input-under-load figure that misses its budget outright rather
 than sitting on it. The human real-terminal walkthrough is still outstanding
 and is still the chain's to close.
+
+---
+
+# Round 4
+
+## Trigger
+
+Fourth reviewer verdict `needs-fix` on PR #12 at `7636a8d`: one confirmed
+Medium, plus two low optional items. The approval identity fix and the
+configuration isolation were accepted.
+
+## Finding 1: the completion timestamp was still the wrong one
+
+**What was wrong.** Round 3 fixed *which* frame completes a keystroke. It did
+not fix *when* that frame completes. The benchmark took `Instant::now()` after
+`step()` returned, but the frame is written near the top of `step`, and the
+step then waits in `select!`, handles an action, and drains the queue. All of
+that is scheduler time with the frame already on screen, and it was being
+charged to the keystroke. The round 3 draw-order test could not catch this,
+because it checks ordering rather than timing.
+
+**What landed.** `Step` carries `drew_at`, recorded inside `step` immediately
+after the draw completes, and the benchmark attributes both input and
+cancellation latency to that instant.
+
+**Deterministic coverage.**
+`a_step_records_when_its_frame_was_drawn_not_when_it_returned` owes a frame
+and leaves both queues empty, so the step draws and then waits out the 50 ms
+tick with nothing to do. It asserts the gap between `drew_at` and the moment
+`step` returns is at least 20 ms, which is exactly the interval that used to
+be counted against the keystroke. It runs on the real clock, because the
+point is to observe the gap.
+
+**Revised numbers.**
+
+| Measure | Round 3 (stopped too late) | Round 4 (corrected) |
+| --- | --- | --- |
+| Input to frame under load, p50 | 40.9 to 47.7 ms | **38.6 to 45.8 ms** |
+| Input to frame under load, p95 | 66.6 to 78.9 ms | **62.8 to 67.1 ms** |
+| Input to frame under load, max | 70 to 98 ms | **67.9 to 70.0 ms** |
+| Cancel under load | 21.6 to 49.7 ms | **19.7 to 52.2 ms** |
+
+The verdict is unchanged: input to frame under a saturating 1,000 deltas a
+second misses the 50 ms budget, now by about 1.3 times rather than 1.3 to
+1.6. Cancellation remains comfortably inside its 100 ms budget. Drain rate
+970/s, 19 fps, largest batch 52, queue empty at the end.
+
+## Optional items, both applied
+
+**The profile probe only checked for absent strings.** It now asserts the
+diagnostic actually ran, and asserts the affirmative result
+(`no profiles configured`) rather than only the absence of credential
+strings. That immediately earned its keep: the exit-status assertion caught
+the probe failing with a database lock error, because it shared the running
+fixture's session database. It now uses its own, and the previous version
+would have passed silently on a diagnostic that never produced any output.
+
+**The report quoted an obsolete 2.5 ms overshoot** in follow-up 1. It now
+carries the measured p95 range.
+
+## Validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --no-fail-fast` | 498 passed, 0 failed |
+| `cargo test --manifest-path .agents/cli/Cargo.toml` | 107 passed, 0 failed |
+| `cargo test -p gritt --test tui_pty` | 13 passed, 0 failed |
+| `GRITT_LIVE_MCP_TESTS=1 ... mcp_live_smoke` | 1 passed; `gritt` ready, 3 tools |
+| `GRITT_LIVE_CONNECTOR_TESTS=1 ... live` | 3 passed |
+| `GRITT_LIVE_TESTS=1 -p gritt-provider --test live` | 3 skipped honestly |
+| `GRITT_BENCH=1 ... --test tui_load` (release) | 1 passed |
+| `GRITT_BENCH=1 ... --test tui_responsiveness` (release) | 6 passed |
+| `GRITT_BENCH=1 ... --test tui_bench` (release) | 5 passed |
+
+Workspace tests moved from 497 to 498: the draw-timestamp guard.
+
+## Remaining follow-up
+
+Unchanged. Four rounds of review moved the input-to-frame figure three
+times without changing its verdict, and the cause named in follow-up 1 has
+been the same throughout: the whole transcript is rebuilt for every frame.
+The human real-terminal walkthrough is still outstanding and is still the
+chain's to close.

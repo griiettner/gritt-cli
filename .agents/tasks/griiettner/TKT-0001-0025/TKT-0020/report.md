@@ -41,12 +41,12 @@ exposed are fixed.
 Most of the plan's budgets are met. Two are not, and both are named rather
 than softened: the resident-memory plateau over a five-minute soak, and
 input-to-frame under a saturating 1,000 deltas a second, which misses the
-50 ms budget by 1.3 to 1.6 times. Both have the same cause,
+50 ms budget by about 1.3 times. Both have the same cause,
 the renderer materializing every transcript entry on each rebuild with no
 history paging, so memory tracks the transcript and a frame costs what the
 whole transcript costs. The full table and the measurement method are under
 [Benchmarks](#benchmarks); the numbers there come from the production
-scheduler, after three rounds of review corrected how they were obtained.
+scheduler, after four rounds of review corrected how they were obtained.
 
 Six fixes landed, all of them responsiveness, startup-correctness, or
 secret-accuracy defects the plan names as acceptance requirements, three of
@@ -270,12 +270,12 @@ above. There are three harnesses and they do not carry equal weight.
 | Typing, input to frame (idle transcript, micro) | p95 below 50 ms | p50 2.155 ms, **p95 2.271 ms**, n=500 | **MET** |
 | Picker navigation (micro) | p95 below 50 ms | p50 2.492 ms, **p95 2.660 ms**, n=500 | **MET** |
 | Scrolling (micro) | p95 below 50 ms | p50 2.171 ms, **p95 2.306 ms**, n=500 | **MET** |
-| Input to frame under 1,000 deltas/s (integrated) | p95 below 50 ms | p50 40.9 to 47.7 ms, **p95 66.6 to 78.9 ms over four runs**, max 70 to 98 ms | **NOT MET**, by 1.3 to 1.6x |
-| Sustained output, delta drain rate (integrated) | keep up with 1,000/s | **959 to 969/s** | **MET** |
+| Input to frame under 1,000 deltas/s (integrated) | p95 below 50 ms | p50 38.6 to 45.8 ms, **p95 62.8 to 67.1 ms over four runs**, max 67.9 to 70.0 ms | **NOT MET**, by about 1.3x |
+| Sustained output, delta drain rate (integrated) | keep up with 1,000/s | **970/s** | **MET** |
 | Sustained output, render work at 120x40 (micro) | p95 below 16 ms | p50 14.511 ms, **p95 15.083 ms**, n=686 | **MET**, by 0.9 ms |
-| Render cap under load (integrated) | 30 fps | **19 to 20 fps**, 203 frames in 10 s | **MET** |
+| Render cap under load (integrated) | 30 fps | **19 fps**, 193 frames in 10 s | **MET** |
 | Bounded queues under load (integrated) | bounded, nothing dropped | largest batch drained in one step **52**, final **0** | **MET** |
-| Cancel under load (integrated) | visible canceling state within 100 ms | **21.6 to 49.7 ms** from Escape queued to the first frame drawn after the turn's token fired | **MET** |
+| Cancel under load (integrated) | visible canceling state within 100 ms | **19.7 to 52.2 ms** from Escape queued to the first frame drawn after the turn's token fired | **MET** |
 | Idle CPU over 30 s | below 1% of one core | **0.2%** | **MET** |
 | Idle screen, no continuous full redraw | no redraw | **0 bytes** over 30 idle seconds | **MET** |
 | Resident memory plateau over a five-minute soak | a stable plateau | baseline 38,800 KiB, peak **762,336 KiB**; middle third 532,352 KiB, last third 762,336 KiB | **NOT MET** |
@@ -286,18 +286,24 @@ The integrated rows come from `Scheduler::step`, the loop's own iteration,
 driven against a `TestBackend` with input queued onto the same channel the
 key reader thread writes to. Input latency is timed from the moment a key is
 **queued**, so its scheduling wait is inside the number, and completed by
-the first frame drawn *after* the key was handled. That last part matters:
-`step` draws before it takes input, so the frame a step produces shows the
-state as of the previous step and cannot be credited with what the same step
-went on to handle. `a_step_draws_before_it_handles_input` guards that
-ordering. Cancellation is a real Escape delivered through the same channel
-while the stream is still producing, completed the same way.
+the first frame drawn *after* the key was handled, at the instant that frame
+was written.
 
-Two earlier versions of this report were rejected for measuring something
-else: the first reimplemented the scheduler, and the second credited input
-to a frame that preceded it. The numbers above are from the third
-measurement and are materially worse than the second's, which is the point
-of having been corrected.
+Both halves of that took a review round to get right. `step` draws before it
+takes input, so the frame a step produces shows the state as of the previous
+step and cannot be credited with what the same step went on to handle;
+`a_step_draws_before_it_handles_input` guards that. And a step keeps working
+after it draws, waiting in `select!` and then draining, so the completion
+instant is recorded inside `step` at the draw rather than by the caller when
+`step` returns; `a_step_records_when_its_frame_was_drawn_not_when_it_returned`
+guards that. Cancellation is a real Escape delivered through the same
+channel while the stream is still producing, completed the same way.
+
+Three earlier versions of this report were rejected for measuring something
+other than the product: the first reimplemented the scheduler, the second
+credited input to a frame that preceded it, and the third stopped the clock
+after the scheduler had gone on working. Each correction changed the number,
+which is the argument for having made them.
 
 ### What the loop fixes changed
 
@@ -331,11 +337,11 @@ why the queue grew.
 
 ### The two misses, stated specifically
 
-**Input to frame under sustained load: p95 between 66.6 and 78.9 ms across
-four runs, against a 50 ms budget.** A clear miss, 1.3 to 1.6 times over.
-The earlier figure of about 50 ms was an artefact of crediting a keystroke
-to a frame drawn before it was handled; corrected, the median alone is
-40.9 to 47.7 ms. One cycle is a coalesced drain
+**Input to frame under sustained load: p95 between 62.8 and 67.1 ms across
+four runs, against a 50 ms budget.** A clear miss, about 1.3 times over. The
+median alone, 38.6 to 45.8 ms, is most of the budget. One cycle is a
+coalesced drain of about fifty deltas plus a full-transcript frame, and a
+keystroke waits for the cycle in progress. One cycle is a coalesced drain
 of about fifty deltas plus one frame, and the frame is a full-transcript
 rebuild; a keypress waits for the cycle in progress. The load is 1,000 deltas
 per second, roughly ten to twenty times what a provider actually streams, and
@@ -554,8 +560,8 @@ exit status 0. The configured key string appeared nowhere in either stream.
   `Scheduler::step` rather than from a copy of it; the single `.mcp.json`
   entry has an honest result; full validation is green. Two of the plan's
   budgets are not met: the resident-memory plateau, and input-to-frame under
-  a sustained 1,000 deltas per second, which measures p95 between 66.6 and
-  78.9 ms against a 50 ms budget across four runs. Both have the same cause, named in follow-up 1. The plan's own
+  a sustained 1,000 deltas per second, which measures p95 between 62.8 and
+  67.1 ms against a 50 ms budget across four runs. Both have the same cause, named in follow-up 1. The plan's own
   acceptance criterion permits a recorded run that "identifies specific
   remaining performance gaps". **One verification is outstanding rather than
   failed: the real-terminal walkthrough by a human has not been performed.**
@@ -597,9 +603,10 @@ exit status 0. The configured key string appeared nowhere in either stream.
    every entry's wrapped lines on each rebuild and the app slices out the ~35
    visible ones; every delta invalidates the cache. It is now the cause of
    three separate misses and margins: the failed memory plateau, the
-   render-work figure sitting 0.9 ms inside a 16 ms budget, and the 2.5 ms
-   overshoot on input-to-frame under sustained load, because a full rebuild
-   is most of the cycle a keypress waits for. Fixing it needs a line index
+   render-work figure sitting 0.9 ms inside a 16 ms budget, and the
+   input-to-frame p95 of 62.8 to 67.1 ms against a 50 ms budget under
+   sustained load, because a full rebuild is most of the cycle a keypress
+   waits for. Fixing it needs a line index
    over entries so a rebuild can start at the first visible entry, and it will
    churn the 19 snapshot goldens. Highest-value remaining performance work by
    a wide margin.
