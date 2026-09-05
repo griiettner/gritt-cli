@@ -5,6 +5,7 @@
 //! `gritt_schema_migrations`. Product state uses a separate file by default
 //! so a running memory service cannot lock Gritt out (ADR-005).
 
+mod mcp_trust;
 mod session_store;
 
 use std::path::{Path, PathBuf};
@@ -13,13 +14,14 @@ use gritt_core::{Error, Result};
 use turso::{Builder, Connection};
 
 /// Ordered product migrations. Append; never edit an applied entry.
-pub const MIGRATIONS: [(&str, &str); 3] = [
+pub const MIGRATIONS: [(&str, &str); 4] = [
     ("0001_product_tables", include_str!("product_schema.sql")),
     ("0002_content_log", include_str!("content_log.sql")),
     (
         "0003_session_told_phase",
         include_str!("session_told_phase.sql"),
     ),
+    ("0004_mcp_trust", include_str!("mcp_trust.sql")),
 ];
 
 /// Tables and indexes owned by `gritt-agent`. The store must never touch
@@ -241,6 +243,8 @@ impl Store {
     }
 }
 
+pub use mcp_trust::StoreTrustStore;
+
 pub fn storage_error(error: impl std::fmt::Display) -> Error {
     Error::storage(error.to_string())
 }
@@ -273,19 +277,23 @@ mod tests {
         DatabaseLocation::Explicit(dir.path().join("test.db"))
     }
 
+    /// The migration names in ledger order, so a new migration does not
+    /// need these assertions edited by hand.
+    fn migration_names() -> Vec<String> {
+        MIGRATIONS
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect()
+    }
+
     #[tokio::test]
     async fn migrations_are_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let first = Store::open(temp_location(&dir)).await.unwrap();
         let applied = first.applied_migrations().await.unwrap();
-        assert_eq!(
-            applied,
-            vec![
-                "0001_product_tables".to_string(),
-                "0002_content_log".to_string(),
-                "0003_session_told_phase".to_string()
-            ]
-        );
+        // Compared against the ledger itself so adding a migration does not
+        // need this list edited in two places.
+        assert_eq!(applied, migration_names());
         drop(first);
         let second = Store::open(temp_location(&dir)).await.unwrap();
         assert_eq!(second.applied_migrations().await.unwrap(), applied);
@@ -313,14 +321,9 @@ mod tests {
                 .unwrap());
         }
         let store = Store::open(location).await.unwrap();
-        assert_eq!(
-            store.applied_migrations().await.unwrap(),
-            vec![
-                "0001_product_tables".to_string(),
-                "0002_content_log".to_string(),
-                "0003_session_told_phase".to_string()
-            ]
-        );
+        let mut applied = store.applied_migrations().await.unwrap();
+        applied.sort();
+        assert_eq!(applied, migration_names());
     }
 
     #[tokio::test]
