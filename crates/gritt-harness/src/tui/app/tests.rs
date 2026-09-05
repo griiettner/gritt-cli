@@ -10,7 +10,7 @@ use crate::tui::theme::{Theme, ThemeMode};
 use chrono::Utc;
 use gritt_core::event::EventSource;
 use gritt_core::policy::PolicyOutcome;
-use gritt_core::provider::ReasoningEffort;
+use gritt_core::provider::{Protocol, ReasoningEffort};
 use gritt_core::tool::{ToolCall, ToolCallId, ToolResult};
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -592,29 +592,47 @@ fn the_model_picker_offers_setup_for_a_profile_with_no_key_and_returns_to_it() {
 }
 
 #[test]
-fn the_setup_form_masks_the_key_and_writes_nothing_in_fixture_mode() {
+fn the_setup_form_masks_the_key_and_hands_it_over_exactly_once() {
     let mut app = fixture::home(Theme::new(ThemeMode::NoColor));
+    // The preset fills in the endpoint and protocol, so the form opens
+    // on the only field it still needs.
+    let preset = PRESETS.iter().find(|p| p.name == "openrouter").unwrap();
     app.overlays
-        .push(Overlay::Setup(SetupForm::for_profile("openrouter")));
-    // Tab to the key field and type.
-    app.on_key(key(KeyCode::Tab));
-    app.on_key(key(KeyCode::Tab));
+        .push(Overlay::Setup(SetupForm::for_preset(preset)));
     let Some(Overlay::Setup(form)) = app.top_overlay() else {
         unreachable!()
     };
     assert_eq!(form.field(), SetupField::Secret);
     assert!(form.field().is_secret());
     type_text(&mut app, "sk-never-echoed");
-    app.on_key(key(KeyCode::Enter));
+    let action = app.on_key(key(KeyCode::Enter));
+    assert_eq!(
+        action,
+        Action::SaveProfile,
+        "Enter asks the runtime to write"
+    );
     let Some(Overlay::Setup(form)) = app.top_overlay() else {
         unreachable!()
     };
     assert_eq!(form.secret_len(), "sk-never-echoed".len());
-    let outcome = form.outcome.clone().unwrap();
-    assert!(outcome.starts_with("fixture:"));
-    assert!(!outcome.contains("sk-never"));
-    // The value has no accessor, so it cannot reach the transcript.
+    assert_eq!(form.outcome.as_deref(), Some("saving…"));
+    // The value has no accessor and never reaches the transcript or the
+    // action; the runtime takes it once and the form is emptied.
     assert!(!format!("{:?}", app.entries).contains("sk-never"));
+    assert!(!format!("{action:?}").contains("sk-never"));
+    let submission = app.take_setup_submission().expect("a complete form");
+    assert_eq!(submission.profile.name, "openrouter");
+    assert_eq!(submission.profile.base_url, "https://openrouter.ai/api/v1");
+    assert_eq!(submission.profile.protocol, Protocol::ChatCompletions);
+    assert!(submission.secret.is_some());
+    let Some(Overlay::Setup(form)) = app.top_overlay() else {
+        unreachable!()
+    };
+    assert_eq!(
+        form.secret_len(),
+        0,
+        "the key left the form when it was taken"
+    );
 }
 
 #[test]

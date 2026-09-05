@@ -47,6 +47,10 @@ pub enum DraftOpen {
     },
 }
 
+/// Cloning shares every handle, which is what
+/// [`ControlPlane::reloaded`] and the asynchronous TUI work both need: a
+/// task holds its own handle without opening a second store or runtime.
+#[derive(Clone)]
 pub struct ControlPlane {
     pub builder: Arc<AgentBuilder>,
     native: Arc<NativeConnector>,
@@ -88,14 +92,25 @@ impl ControlPlane {
     /// Returns whether a reload happened. A service that cannot reload
     /// answers `false` rather than pretending.
     pub fn reload_config(&mut self) -> bool {
-        let Some(config) = self.setup.reload_config() else {
-            return false;
-        };
+        match self.reloaded() {
+            Some(plane) => {
+                *self = plane;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The same reload as a new value, for a caller that shares this plane
+    /// behind an `Arc` and replaces the handle rather than mutating it.
+    pub fn reloaded(&self) -> Option<ControlPlane> {
+        let config = self.setup.reload_config()?;
+        let mut plane = self.clone();
         let mut builder = (*self.builder).clone();
         builder.config = config;
-        self.builder = Arc::new(builder);
-        self.native = Arc::new(NativeConnector::new(Arc::clone(&self.builder)));
-        true
+        plane.builder = Arc::new(builder);
+        plane.native = Arc::new(NativeConnector::new(Arc::clone(&plane.builder)));
+        Some(plane)
     }
 
     /// Every configured profile with credential availability, never a

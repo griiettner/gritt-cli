@@ -13,9 +13,11 @@ use gritt_core::connector::ConnectorId;
 use gritt_core::event::{
     ApprovalDecision, ApprovalRequest, Event, EventKind, SessionStatus, Usage,
 };
-use gritt_core::mcp::McpServerSnapshot;
-use gritt_core::provider::{ModelInfo, Protocol, ReasoningEffort};
+use gritt_core::mcp::{McpServerSnapshot, McpServerState, TrustDecision};
+use gritt_core::provider::{ModelInfo, Protocol, ProviderProfile, ReasoningEffort};
+use gritt_core::secret::{Secret, SecretRef};
 use gritt_core::session::{Phase, Session, SessionId};
+use gritt_core::tool::native;
 use ratatui::text::Line;
 
 use super::command::{self, Command, Parsed};
@@ -23,7 +25,8 @@ use super::composer::Composer;
 use super::picker::{ListStatus, Picker, PickerRow};
 use super::sidebar::{self, SidebarModel, SidebarPlacement};
 use super::theme::Theme;
-use crate::draft::{CatalogState, SessionDraft};
+use crate::changes::{ChangedFiles, FileDiff};
+use crate::draft::{CatalogState, DraftError, DraftWarning, SessionDraft};
 use crate::modes::print::describe_call;
 use crate::policy::Decision;
 use crate::setup::{ConfigDestination, CredentialState, ProfileSummary};
@@ -120,7 +123,9 @@ pub struct StatusBar {
     pub effort: ReasoningEffort,
 }
 
-/// What the runtime should do after a key.
+/// What the runtime should do after a key. Everything asynchronous is a
+/// request here, never work the reducer does itself: the reducer stays
+/// synchronous and testable, and the loop keeps drawing while it runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     None,
@@ -131,6 +136,45 @@ pub enum Action {
     Resume(SessionId),
     Approve(ApprovalDecision),
     RefreshSessions,
+    /// Load a profile's model list. `selection` is the token the result
+    /// must still match; a later profile change makes it stale.
+    LoadCatalog {
+        profile: String,
+        selection: u64,
+    },
+    /// Persist the effort on the live native session.
+    SetEffort(ReasoningEffort),
+    /// Write the setup form through the injected `ProviderSetup`, then
+    /// reload the configuration. The values are read from the form with
+    /// [`App::take_setup_submission`] so no secret ever enters an action.
+    SaveProfile,
+    /// Leave the current session for a fresh draft. The session is kept.
+    NewSession,
+    /// A typed MCP runtime action from `/mcp`.
+    Mcp(McpRequest),
+    /// Re-read the MCP snapshots now, for the first `/mcp` open.
+    RefreshMcp,
+    /// Rescan workspace changes.
+    ScanChanges,
+    /// Open a read-only diff for a changed file.
+    OpenFileDiff(String),
+}
+
+/// What `/mcp` asks the runtime to do. The runtime calls the same typed
+/// API `gritt mcp trust` uses; nothing here is a parsed string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpRequest {
+    Decide {
+        server: String,
+        decision: TrustDecision,
+    },
+    Restart {
+        server: String,
+    },
+    Stop {
+        server: String,
+    },
+    ReloadAll,
 }
 
 /// An installed external agent as the connection dialog sees it. The
@@ -165,6 +209,54 @@ pub enum PickerKind {
     Effort,
     Sessions,
     Mcp,
+    /// The actions available on one MCP server, opened from `/mcp`.
+    McpActions,
+    /// The changed files the sidebar lists, opened from the sidebar.
+    Changes,
+}
+
+/// A supported provider preset: the endpoint and protocol Gritt already
+/// knows, so setting one up asks only for a key. The values match the
+/// shipped `config.toml` template; a provider that is not here is set up
+/// as a custom endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderPreset {
+    pub name: &'static str,
+    pub protocol: Protocol,
+    pub base_url: &'static str,
+}
+
+pub const PRESETS: [ProviderPreset; 4] = [
+    ProviderPreset {
+        name: "openrouter",
+        protocol: Protocol::ChatCompletions,
+        base_url: "https://openrouter.ai/api/v1",
+    },
+    ProviderPreset {
+        name: "openai",
+        protocol: Protocol::Responses,
+        base_url: "https://api.openai.com/v1",
+    },
+    ProviderPreset {
+        name: "anthropic",
+        protocol: Protocol::Messages,
+        base_url: "https://api.anthropic.com",
+    },
+    ProviderPreset {
+        name: "local",
+        protocol: Protocol::ChatCompletions,
+        base_url: "http://127.0.0.1:8080/v1",
+    },
+];
+
+/// The protocol a preset of this name speaks, defaulting to the widely
+/// compatible one for a custom endpoint.
+fn preset_protocol(name: &str) -> Protocol {
+    PRESETS
+        .iter()
+        .find(|preset| preset.name == name)
+        .map(|preset| preset.protocol)
+        .unwrap_or(Protocol::ChatCompletions)
 }
 
 /// Which field of the provider setup form has the cursor.
@@ -209,8 +301,14 @@ pub struct SetupForm {
     secret: Composer,
     pub field_index: usize,
     pub destination: ConfigDestination,
+    /// The wire protocol the profile speaks. Cycled with Ctrl-T, because
+    /// a preset sets it and a custom endpoint has to state it.
+    pub protocol: Protocol,
     /// The outcome line shown after an attempted save.
     pub outcome: Option<String>,
+    /// True while the write is in flight, so a second Enter cannot start
+    /// a second one.
+    pub saving: bool,
 }
 
 impl Default for SetupForm {
@@ -231,8 +329,20 @@ impl SetupForm {
             secret: Composer::new(),
             field_index: 1,
             destination: ConfigDestination::User,
+            protocol: preset_protocol(name),
             outcome: None,
+            saving: false,
         }
+    }
+
+    /// A form seeded from a supported preset: its endpoint and protocol
+    /// are filled in and only the key is missing.
+    pub fn for_preset(preset: &ProviderPreset) -> Self {
+        let mut form = SetupForm::for_profile(preset.name);
+        form.base_url = Composer::from_text(preset.base_url);
+        form.protocol = preset.protocol;
+        form.field_index = 3;
+        form
     }
 
     pub fn field(&self) -> SetupField {
@@ -262,6 +372,50 @@ impl SetupForm {
         self.field_index =
             (self.field_index + SetupField::ORDER.len() - 1) % SetupField::ORDER.len();
     }
+
+    /// The non-secret profile this form describes, or the field that is
+    /// still empty. The key is not part of it: it travels separately and
+    /// only to the keychain.
+    pub fn profile_spec(&self) -> Result<ProviderProfile, SetupField> {
+        let name = self.name.text().trim().to_owned();
+        if name.is_empty() {
+            return Err(SetupField::Name);
+        }
+        let base_url = self.base_url.text().trim().to_owned();
+        if base_url.is_empty() {
+            return Err(SetupField::BaseUrl);
+        }
+        let env_var = self.env_var.text().trim().to_owned();
+        if env_var.is_empty() {
+            return Err(SetupField::EnvVar);
+        }
+        Ok(ProviderProfile {
+            name: name.clone(),
+            protocol: self.protocol,
+            base_url,
+            key: SecretRef::for_profile(&name, &env_var),
+            aliases: Default::default(),
+        })
+    }
+
+    fn cycle_protocol(&mut self) {
+        self.protocol = match self.protocol {
+            Protocol::ChatCompletions => Protocol::Responses,
+            Protocol::Responses => Protocol::Messages,
+            Protocol::Messages => Protocol::ChatCompletions,
+        };
+    }
+}
+
+/// The profile spec and the key the setup form collected, handed to the
+/// runtime once. Taking it clears the key from the form, so a typed value
+/// exists in one place at a time and never in an `Action`.
+pub struct SetupSubmission {
+    pub profile: ProviderProfile,
+    /// `None` when the user left the key blank, which is allowed: the
+    /// variable may already be set in the environment.
+    pub secret: Option<Secret>,
+    pub destination: ConfigDestination,
 }
 
 /// A modal explanation with no choice to make beyond acknowledging it.
@@ -283,6 +437,13 @@ pub enum Overlay {
     Setup(SetupForm),
     Notice(Notice),
     Help {
+        scroll: usize,
+    },
+    /// A read-only diff for one changed file, opened from the sidebar.
+    /// Nothing here can write: the harness produced the text.
+    FileDiff {
+        path: String,
+        body: String,
         scroll: usize,
     },
     /// The narrow-terminal form of the sidebar. Closing it restores the
@@ -357,6 +518,31 @@ pub struct App {
     /// and model until a new session is started.
     pub session_pinned: bool,
     pub mcp: Vec<McpServerSnapshot>,
+    /// Bumped on every provider selection. An asynchronous catalog result
+    /// carries the token it started under and is dropped when it no
+    /// longer matches, so a slow list for the previous profile can never
+    /// land under the current one.
+    pub selection: u64,
+    /// What asynchronous work is in flight, shown near the composer. The
+    /// interface stays usable while it runs.
+    pub loading: Option<String>,
+    /// The live session, `None` before the first prompt opens one.
+    pub session_id: Option<SessionId>,
+    /// Set for a connector session: the agent owns its model, effort, and
+    /// permissions (ADR-010), so the native pickers are refused.
+    pub connector: Option<ConnectorId>,
+    /// The server `/mcp` opened an action list for.
+    pub mcp_target: Option<String>,
+    /// File writes seen this turn, by call id, promoted to the changed
+    /// list only when their result says the write succeeded.
+    pending_writes: std::collections::BTreeMap<String, String>,
+    /// Paths from successful native writes, for the runtime to record
+    /// against the workspace observer.
+    pub observed_writes: Vec<String>,
+    /// Listed prices per million tokens for the active model, when the
+    /// catalog reports them. Cost is shown only when both halves and the
+    /// reported usage exist, and it is always labelled an estimate.
+    pricing: Option<(f64, f64)>,
     assistant_open: bool,
     revision: u64,
     cache: RefCell<LayoutCache>,
@@ -408,6 +594,14 @@ impl App {
             catalog: ModelCatalogView::default(),
             session_pinned: false,
             mcp: Vec::new(),
+            selection: 0,
+            loading: None,
+            session_id: None,
+            connector: None,
+            mcp_target: None,
+            pricing: None,
+            pending_writes: std::collections::BTreeMap::new(),
+            observed_writes: Vec::new(),
             assistant_open: false,
             revision: 0,
             cache: RefCell::new(LayoutCache::default()),
@@ -593,12 +787,26 @@ impl App {
             }
             EventKind::ReasoningSummary { text } => self.push(EntryKind::Reasoning, text.clone()),
             EventKind::ToolCall { call } => {
+                // A write is remembered, not reported: only its result
+                // proves the file changed, and the plan forbids claiming
+                // a change Gritt did not observe succeeding.
+                if call.name == native::FILE_WRITE {
+                    if let Some(path) = call.arguments.get("path").and_then(|p| p.as_str()) {
+                        self.pending_writes
+                            .insert(call.id.0.clone(), path.to_owned());
+                    }
+                }
                 self.push(
                     EntryKind::Tool,
                     format!("-> {}", describe_call(&call.name, &call.arguments)),
                 );
             }
             EventKind::ToolResult { result } => {
+                if let Some(path) = self.pending_writes.remove(&result.call_id.0) {
+                    if !result.is_error {
+                        self.observed_writes.push(path);
+                    }
+                }
                 let first = result.output.lines().next().unwrap_or_default();
                 let mut entry = Entry::new(
                     EntryKind::Tool,
@@ -636,6 +844,14 @@ impl App {
                     Some(total.output_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0));
                 self.sidebar.usage.input_tokens = total.input_tokens;
                 self.sidebar.usage.output_tokens = total.output_tokens;
+                // The prompt tokens of the most recent request are the
+                // tokens that were in the model's context for it. The
+                // cumulative totals above are not, and the sidebar keeps
+                // the two apart.
+                if let Some(prompt) = usage.input_tokens {
+                    self.sidebar.usage.context_tokens = Some(prompt);
+                }
+                self.recompute_cost();
             }
             EventKind::StatusChanged { status } => {
                 self.status.connection = format!("{status:?}");
@@ -764,6 +980,29 @@ impl App {
             }
             rows.push(row);
         }
+        // A supported provider with no profile yet is offered as setup,
+        // so `/connect` works with nothing configured at all.
+        for preset in PRESETS.iter() {
+            if self.profiles.iter().any(|p| p.name == preset.name) {
+                continue;
+            }
+            rows.push(
+                PickerRow::new(
+                    format!("preset:{}", preset.name),
+                    format!("Set up {}…", preset.name),
+                )
+                .group("Add a provider")
+                .detail(preset.base_url.to_owned())
+                .badge(protocol_word(preset.protocol).to_owned())
+                .note("not configured yet"),
+            );
+        }
+        rows.push(
+            PickerRow::new("custom", "Custom endpoint…")
+                .group("Add a provider")
+                .detail("any OpenAI-compatible, Responses, or Messages endpoint")
+                .badge("custom"),
+        );
         Picker::new("Connect", rows)
             .with_hint("Selecting does not install software or start a sign-in")
     }
@@ -897,22 +1136,107 @@ impl App {
             .iter()
             .map(|server| {
                 let word = sidebar::mcp_state_word(&server.state);
-                let mut row = PickerRow::new(server.name.clone(), server.name.clone())
+                // Every row stays selectable, including a failed or
+                // unapproved one: approving and restarting are exactly
+                // what a user opens `/mcp` for.
+                PickerRow::new(server.name.clone(), server.name.clone())
                     .badge(word.to_owned())
                     .detail(if server.state.is_ready() {
                         format!("{} tools", server.tool_count)
                     } else {
                         String::new()
                     })
-                    .note(server.state.explain());
-                if !server.state.is_ready() {
-                    row = row.unavailable(word.to_owned());
-                }
-                row
+                    .note(server.state.explain())
             })
             .collect();
         Picker::new("MCP servers", rows)
-            .with_hint("Every configured entry is listed, whatever its state")
+            .with_hint("Enter opens the actions for a server; every configured entry is listed")
+    }
+
+    /// The actions available on one MCP server. Which ones apply depends
+    /// on its state, and an inapplicable one says why rather than being
+    /// hidden.
+    pub fn mcp_actions_picker(&self, server: &str) -> Picker {
+        let snapshot = self.mcp.iter().find(|entry| entry.name == server);
+        let state = snapshot.map(|entry| entry.state.clone());
+        let approved = !matches!(
+            state,
+            Some(McpServerState::AwaitingApproval) | Some(McpServerState::Denied) | None
+        );
+        let configured = !matches!(
+            state,
+            Some(McpServerState::Invalid { .. })
+                | Some(McpServerState::UnsupportedTransport { .. })
+                | None
+        );
+        let mut rows = Vec::new();
+        let mut row = PickerRow::new("approve", "Approve this server")
+            .detail("launch it now and remember this exact definition")
+            .badge("trust");
+        if !configured {
+            row = row.unavailable("this entry cannot run as configured");
+        } else if approved {
+            row = row.unavailable("already approved");
+        }
+        rows.push(row);
+        let mut row = PickerRow::new("deny", "Deny this server")
+            .detail("stop it now and refuse it until the decision is forgotten")
+            .badge("trust");
+        if !configured {
+            row = row.unavailable("this entry cannot run as configured");
+        }
+        rows.push(row);
+        let mut row = PickerRow::new("restart", "Restart")
+            .detail("close the connection and connect again")
+            .badge("lifecycle");
+        if !approved || !configured {
+            row = row.unavailable("approve it first");
+        }
+        rows.push(row);
+        let mut row = PickerRow::new("stop", "Stop")
+            .detail("end the connection; the entry stays listed as stopped")
+            .badge("lifecycle");
+        if !approved || !configured {
+            row = row.unavailable("this server is not running");
+        }
+        rows.push(row);
+        rows.push(
+            PickerRow::new("reload", "Reload .mcp.json")
+                .detail("validate the file and apply it to every server")
+                .badge("lifecycle"),
+        );
+        Picker::new(format!("MCP · {server}"), rows).with_hint(match &state {
+            Some(state) => state.explain().to_string(),
+            None => "this server is no longer configured".to_owned(),
+        })
+    }
+
+    /// The changed files the sidebar lists, as a searchable list. Enter
+    /// opens a read-only diff.
+    pub fn changes_picker(&self) -> Picker {
+        let rows: Vec<PickerRow> = self
+            .sidebar
+            .changed_files
+            .files()
+            .iter()
+            .map(|file| {
+                PickerRow::new(file.path.clone(), file.path.clone())
+                    .badge(file.status.label().to_owned())
+                    .note(if file.pre_existing {
+                        "already changed when this session opened".to_owned()
+                    } else {
+                        String::new()
+                    })
+            })
+            .collect();
+        let hint = match &self.sidebar.changed_files {
+            ChangedFiles::Unavailable { reason } => reason.clone(),
+            ChangedFiles::Observed { source, .. } => source
+                .caveat()
+                .unwrap_or("read-only: opening a file shows its diff")
+                .to_owned(),
+        };
+        Picker::new("Changed files", rows).with_hint(hint)
     }
 
     fn command_picker(&self) -> Picker {
@@ -937,6 +1261,10 @@ impl App {
             PickerKind::Effort => self.effort_picker(),
             PickerKind::Sessions => self.session_picker(),
             PickerKind::Mcp => self.mcp_picker(),
+            PickerKind::McpActions => {
+                self.mcp_actions_picker(self.mcp_target.clone().unwrap_or_default().as_str())
+            }
+            PickerKind::Changes => self.changes_picker(),
         };
         self.overlays.push(Overlay::Picker { kind, picker });
     }
@@ -978,6 +1306,16 @@ impl App {
             });
             return Action::None;
         }
+        // ADR-010: an external agent owns its model, effort, and
+        // permissions. The native pickers do not apply to its session and
+        // say so rather than pretending to change anything.
+        if let (Some(id), true) = (self.connector, is_native_setting(cmd)) {
+            self.notice = Some(format!(
+                "this session runs on {}; its model and effort are managed by the agent",
+                id.as_str()
+            ));
+            return Action::None;
+        }
         match cmd {
             Command::Connect => {
                 self.open_picker(PickerKind::Connect);
@@ -990,7 +1328,7 @@ impl App {
                     return Action::None;
                 }
                 self.open_picker(PickerKind::Models);
-                Action::None
+                self.request_catalog()
             }
             Command::Effort => {
                 self.open_picker(PickerKind::Effort);
@@ -1015,16 +1353,11 @@ impl App {
             }
             Command::New => {
                 // A fresh draft, not a deleted session: the transcript
-                // view is cleared and the composer draft is kept.
-                self.entries.clear();
-                self.revision += 1;
-                self.top = 0;
-                self.follow = true;
-                self.new_output = false;
-                self.session_pinned = false;
-                self.sidebar.reset();
+                // view is cleared and the composer draft is kept. The
+                // runtime releases the previous driver on the action.
+                self.start_new_draft();
                 self.notice = Some("new draft; the previous session is still listed".into());
-                Action::None
+                Action::NewSession
             }
             Command::Details => {
                 self.tool_details = !self.tool_details;
@@ -1036,8 +1369,9 @@ impl App {
                 Action::None
             }
             Command::Mcp => {
+                self.mcp_target = None;
                 self.open_picker(PickerKind::Mcp);
-                Action::None
+                Action::RefreshMcp
             }
             Command::Help => {
                 self.overlays.push(Overlay::Help { scroll: 0 });
@@ -1259,6 +1593,16 @@ impl App {
                 }
                 Action::None
             }
+            Some(Overlay::FileDiff { scroll, .. }) => {
+                match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => *scroll += 1,
+                    KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                    KeyCode::PageDown => *scroll += 10,
+                    KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+                    _ => {}
+                }
+                Action::None
+            }
             Some(Overlay::Drawer { scroll, .. }) => {
                 match key.code {
                     KeyCode::Down | KeyCode::Char('j') => *scroll += 1,
@@ -1296,17 +1640,41 @@ impl App {
             KeyCode::Backspace => form.current().backspace(),
             KeyCode::Left => form.current().move_left(false),
             KeyCode::Right => form.current().move_right(false),
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                form.cycle_protocol()
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // The project file is never the default: writing a
+                // profile there changes the workspace for everyone.
+                form.destination = match form.destination {
+                    ConfigDestination::User => ConfigDestination::Project,
+                    ConfigDestination::Project => ConfigDestination::User,
+                };
+            }
             KeyCode::Enter => {
-                if form.field() == SetupField::Secret {
-                    // Fixture mode: nothing is written. The real writes
-                    // are the injected `ProviderSetup` service.
-                    let name = form.name.text().to_owned();
-                    form.outcome = Some(format!(
-                        "fixture: nothing was written. A real run would save `{name}` \
-                         to the user config and the key to the keychain."
-                    ));
-                } else {
+                if form.field() != SetupField::Secret {
                     form.next_field();
+                    return Action::None;
+                }
+                if form.saving {
+                    return Action::None;
+                }
+                match form.profile_spec() {
+                    Ok(_) => {
+                        form.saving = true;
+                        form.outcome = Some("saving…".to_owned());
+                        // A fixture run has no setup service; the runtime
+                        // answers with the read-only outcome and the form
+                        // shows it, so nothing here claims a write.
+                        return Action::SaveProfile;
+                    }
+                    Err(missing) => {
+                        form.field_index = SetupField::ORDER
+                            .iter()
+                            .position(|field| *field == missing)
+                            .unwrap_or(0);
+                        form.outcome = Some(format!("the {} is required", missing.label()));
+                    }
                 }
             }
             _ => {}
@@ -1359,9 +1727,24 @@ impl App {
             }
             PickerKind::Connect => {
                 self.overlays.pop();
+                if let Some(name) = id.strip_prefix("preset:") {
+                    // A supported provider that is not configured yet:
+                    // setup opens with its endpoint and protocol filled in.
+                    if let Some(preset) = PRESETS.iter().find(|preset| preset.name == name) {
+                        self.overlays
+                            .push(Overlay::Setup(SetupForm::for_preset(preset)));
+                    }
+                    return Action::None;
+                }
+                if id == "custom" {
+                    self.overlays
+                        .push(Overlay::Setup(SetupForm::for_profile("")));
+                    return Action::None;
+                }
                 if let Some(profile) = id.strip_prefix("profile:") {
                     self.select_profile(profile);
                     self.open_picker(PickerKind::Models);
+                    return self.request_catalog();
                 } else if let Some(agent) = id.strip_prefix("agent:") {
                     self.overlays.push(Overlay::Notice(Notice {
                         title: agent.to_string(),
@@ -1390,12 +1773,21 @@ impl App {
             }
             PickerKind::Effort => {
                 self.overlays.pop();
-                if let Ok(effort) = id.parse::<ReasoningEffort>() {
-                    self.draft.effort = Some(effort);
-                    self.status.effort = effort;
-                    self.sidebar.model.effort = Some(effort.as_str().to_owned());
+                match id.parse::<ReasoningEffort>() {
+                    Ok(effort) => {
+                        self.draft.effort = Some(effort);
+                        self.status.effort = effort;
+                        self.sidebar.model.effort = Some(effort.as_str().to_owned());
+                        // Effort is a session setting and can change
+                        // between turns, so a live session persists it
+                        // rather than waiting for a new one.
+                        if self.session_id.is_some() {
+                            return Action::SetEffort(effort);
+                        }
+                        Action::None
+                    }
+                    Err(_) => Action::None,
                 }
-                Action::None
             }
             PickerKind::Sessions => {
                 self.overlays.pop();
@@ -1406,7 +1798,54 @@ impl App {
                 }
                 Action::Resume(SessionId(id))
             }
-            PickerKind::Mcp => Action::None,
+            PickerKind::Mcp => {
+                self.mcp_target = Some(id);
+                self.open_picker(PickerKind::McpActions);
+                Action::None
+            }
+            PickerKind::McpActions => {
+                let Some(server) = self.mcp_target.clone() else {
+                    self.overlays.pop();
+                    return Action::None;
+                };
+                self.overlays.pop();
+                match id.as_str() {
+                    "approve" => Action::Mcp(McpRequest::Decide {
+                        server,
+                        decision: TrustDecision::Approved,
+                    }),
+                    "deny" => Action::Mcp(McpRequest::Decide {
+                        server,
+                        decision: TrustDecision::Denied,
+                    }),
+                    "restart" => Action::Mcp(McpRequest::Restart { server }),
+                    "stop" => Action::Mcp(McpRequest::Stop { server }),
+                    "reload" => Action::Mcp(McpRequest::ReloadAll),
+                    _ => Action::None,
+                }
+            }
+            PickerKind::Changes => {
+                self.overlays.pop();
+                Action::OpenFileDiff(id)
+            }
+        }
+    }
+
+    /// Asks the runtime for the selected profile's model list when the
+    /// list on screen is not that profile's. The token travels with the
+    /// request so a late answer for a superseded profile is dropped.
+    fn request_catalog(&mut self) -> Action {
+        let Some(profile) = self.draft.profile.clone() else {
+            return Action::None;
+        };
+        if self.catalog.profile == profile && self.catalog.state.is_some() {
+            return Action::None;
+        }
+        self.catalog.profile = profile.clone();
+        self.catalog.loading = true;
+        Action::LoadCatalog {
+            profile,
+            selection: self.selection,
         }
     }
 
@@ -1421,7 +1860,9 @@ impl App {
             ));
         }
         if self.catalog.profile != profile {
-            // The previous profile's list is not this profile's list.
+            // The previous profile's list is not this profile's list, and
+            // a load already in flight for it must not land here.
+            self.selection += 1;
             self.catalog = ModelCatalogView {
                 profile: profile.to_owned(),
                 ..ModelCatalogView::default()
@@ -1545,8 +1986,9 @@ impl App {
                 Action::None
             }
             (KeyCode::Esc, _) => {
-                // Nothing is open here: Escape cancels a running turn.
-                if self.running {
+                // Nothing is open here: Escape cancels a running turn, or
+                // the asynchronous work the loading line is showing.
+                if self.running || self.loading.is_some() {
                     Action::Cancel
                 } else {
                     self.notice = None;
@@ -1570,6 +2012,13 @@ impl App {
                 if shift || alt {
                     self.composer.insert_newline();
                     return Action::None;
+                }
+                // The sidebar's changed files open as the same searchable
+                // list every other selection uses, so reaching one needs
+                // no key that would otherwise type into the composer.
+                if self.focus == Focus::Sidebar {
+                    self.open_picker(PickerKind::Changes);
+                    return Action::ScanChanges;
                 }
                 self.submit()
             }
@@ -1751,7 +2200,272 @@ impl App {
         (start, lines[start..end].to_vec())
     }
 
+    // -- what the runtime hands back ------------------------------------
+
+    /// `/new`: clears the presentation and the session identity, keeping
+    /// the composer draft and the provider/model choices so the next
+    /// prompt opens a session on the same selection.
+    pub fn start_new_draft(&mut self) {
+        self.entries.clear();
+        self.revision += 1;
+        self.top = 0;
+        self.follow = true;
+        self.new_output = false;
+        self.session_pinned = false;
+        self.session_id = None;
+        self.connector = None;
+        self.running = false;
+        self.pending = None;
+        self.pending_writes.clear();
+        self.observed_writes.clear();
+        self.status.session.clear();
+        self.status.usage = Usage::default();
+        // The sidebar's generation moves here, so anything still in
+        // flight for the session just left is refused when it lands.
+        self.sidebar.reset();
+        self.draft.name = None;
+    }
+
+    /// A profile's model list arrived. `selection` is the token the load
+    /// started under: a list for a profile the user has already moved on
+    /// from is dropped instead of replacing the current one.
+    ///
+    /// Returns whether the result was accepted, which is what the
+    /// late-result tests assert on.
+    pub fn apply_catalog(
+        &mut self,
+        selection: u64,
+        profile: &str,
+        models: Vec<ModelInfo>,
+        state: CatalogState,
+    ) -> bool {
+        if selection != self.selection || self.draft.profile.as_deref() != Some(profile) {
+            return false;
+        }
+        self.catalog = ModelCatalogView {
+            profile: profile.to_owned(),
+            models,
+            state: Some(state),
+            loading: false,
+        };
+        // The model may no longer be offered by the list that just
+        // arrived, and the effort may no longer be supported by it.
+        self.revalidate_effort();
+        self.refresh_open_picker();
+        true
+    }
+
+    /// A catalog load failed outright (a storage or configuration error
+    /// rather than a provider refusal). The picker shows the reason and
+    /// stops claiming to be loading.
+    pub fn catalog_failed(&mut self, selection: u64, profile: &str, reason: String) -> bool {
+        if selection != self.selection || self.draft.profile.as_deref() != Some(profile) {
+            return false;
+        }
+        self.catalog.loading = false;
+        self.catalog.state = Some(CatalogState::RefreshFailed { reason });
+        self.refresh_open_picker();
+        true
+    }
+
+    /// Live MCP state from the runtime's subscription. The sidebar shows
+    /// every configured entry; `/mcp` rebuilds in place so a list the
+    /// user is looking at changes under them rather than going stale.
+    pub fn apply_mcp(&mut self, snapshots: Vec<McpServerSnapshot>) {
+        self.mcp = snapshots;
+        self.sidebar.integrations.mcp = Some(self.mcp.clone());
+        self.sidebar.integrations.mcp_owner = self.connector.map(|id| id.as_str().to_owned());
+        self.refresh_open_picker();
+    }
+
+    /// A workspace change scan landed. `generation` is the sidebar
+    /// generation the scan started under; a scan for the previous session
+    /// is dropped.
+    pub fn apply_changes(&mut self, generation: u64, changes: ChangedFiles) -> bool {
+        if !self.sidebar.accepts(generation) {
+            return false;
+        }
+        self.sidebar.changed_files = changes;
+        self.refresh_open_picker();
+        true
+    }
+
+    /// Paths from successful native writes since the last call, for the
+    /// runtime to record against the workspace observer.
+    pub fn take_observed_writes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.observed_writes)
+    }
+
+    /// Shows a read-only diff, or the reason there is none.
+    pub fn show_file_diff(&mut self, diff: FileDiff) {
+        match diff {
+            FileDiff::Text { path, body } => self.overlays.push(Overlay::FileDiff {
+                path,
+                body,
+                scroll: 0,
+            }),
+            FileDiff::Unavailable { path, reason } => self.overlays.push(Overlay::Notice(Notice {
+                title: path,
+                body: reason,
+                is_error: true,
+            })),
+        }
+    }
+
+    /// The setup form's values, taken once. The key leaves the form here
+    /// and is not kept anywhere else.
+    pub fn take_setup_submission(&mut self) -> Option<SetupSubmission> {
+        let Some(Overlay::Setup(form)) = self
+            .overlays
+            .iter_mut()
+            .rev()
+            .find(|overlay| matches!(overlay, Overlay::Setup(_)))
+        else {
+            return None;
+        };
+        let profile = form.profile_spec().ok()?;
+        let typed = form.secret.text().to_owned();
+        form.secret.clear();
+        Some(SetupSubmission {
+            profile,
+            secret: (!typed.is_empty()).then(|| Secret::new(typed)),
+            destination: form.destination,
+        })
+    }
+
+    /// The outcome of a setup write, shown on the form. `close` follows a
+    /// success: the flow returns to the picker underneath with its search
+    /// and the composer draft intact.
+    pub fn setup_outcome(&mut self, message: String, close: bool) {
+        let position = self
+            .overlays
+            .iter()
+            .rposition(|overlay| matches!(overlay, Overlay::Setup(_)));
+        let Some(position) = position else { return };
+        if close {
+            self.overlays.remove(position);
+            self.notice = Some(message);
+            return;
+        }
+        if let Overlay::Setup(form) = &mut self.overlays[position] {
+            form.saving = false;
+            form.outcome = Some(message);
+        }
+    }
+
+    /// A draft that could not open. The draft is kept, so correcting one
+    /// field and submitting again is all it takes.
+    pub fn show_draft_errors(&mut self, errors: &[DraftError]) {
+        self.running = false;
+        let Some(error) = errors.first() else { return };
+        let (title, body) = describe_draft_error(error);
+        self.overlays.push(Overlay::Notice(Notice {
+            title,
+            body,
+            is_error: true,
+        }));
+    }
+
+    pub fn show_draft_warnings(&mut self, warnings: &[DraftWarning]) {
+        for warning in warnings {
+            let text = match warning {
+                DraftWarning::ModelNotInCatalog { profile, model } => {
+                    format!("{model} is not in {profile}'s list; its capabilities are unreported")
+                }
+                DraftWarning::DeprecatedModelRemapped { from, to } => {
+                    format!("{from} is deprecated; using {to}")
+                }
+            };
+            self.push(EntryKind::System, text);
+        }
+    }
+
+    /// The catalog's figures for the active model. Both are optional and
+    /// an absent one leaves its section unavailable rather than zero.
+    pub fn set_model_facts(&mut self, model: Option<&ModelInfo>) {
+        let capabilities = model.map(|model| &model.capabilities);
+        self.sidebar.usage.context_limit = capabilities.and_then(|c| c.context_length);
+        self.pricing = capabilities.and_then(|c| {
+            match (c.input_price_per_million, c.output_price_per_million) {
+                (Some(input), Some(output)) => Some((input, output)),
+                _ => None,
+            }
+        });
+        self.recompute_cost();
+    }
+
+    /// The session cost estimate, only when reported usage and listed
+    /// prices for this model both exist. Never a billed amount.
+    fn recompute_cost(&mut self) {
+        let Some((input_price, output_price)) = self.pricing else {
+            self.sidebar.cost = Default::default();
+            return;
+        };
+        let usage = &self.sidebar.usage;
+        let (Some(input), Some(output)) = (usage.input_tokens, usage.output_tokens) else {
+            self.sidebar.cost = Default::default();
+            return;
+        };
+        let estimate = (input as f64 / 1_000_000.0) * input_price
+            + (output as f64 / 1_000_000.0) * output_price;
+        self.sidebar.cost.estimate_usd = Some(estimate);
+        self.sidebar.cost.scope = Some("this session, at listed prices".to_owned());
+    }
+
+    /// Puts a failed submission back: the prompt returns to the composer
+    /// and the entry it produced leaves the transcript, so a rejected
+    /// draft costs nothing typed.
+    pub fn undo_submission(&mut self, prompt: &str) {
+        if self
+            .entries
+            .last()
+            .is_some_and(|entry| entry.kind == EntryKind::User && entry.text == sanitize(prompt))
+        {
+            self.entries.pop();
+            self.revision += 1;
+        }
+        self.running = false;
+        self.restore_draft(prompt);
+    }
+
+    /// The effort the live driver reports, which is the effective one.
+    /// `None` is a connector session, where the agent owns it.
+    pub fn set_effective_effort(&mut self, effort: Option<ReasoningEffort>) {
+        match effort {
+            Some(effort) => {
+                self.status.effort = effort;
+                self.sidebar.model.effort = Some(effort.as_str().to_owned());
+                self.draft.effort = Some(effort);
+            }
+            None => self.sidebar.model.effort = None,
+        }
+    }
+
+    /// Rebuilds the rows of the picker on screen from current state, so
+    /// an asynchronous result fills in the list the user is looking at.
+    fn refresh_open_picker(&mut self) {
+        let Some(kind) = self.overlays.last().and_then(Overlay::picker_kind) else {
+            return;
+        };
+        let rows = match kind {
+            PickerKind::Models => self.model_picker(),
+            PickerKind::Effort => self.effort_picker(),
+            PickerKind::Connect => self.connection_picker(),
+            PickerKind::Mcp => self.mcp_picker(),
+            PickerKind::McpActions => {
+                self.mcp_actions_picker(self.mcp_target.clone().unwrap_or_default().as_str())
+            }
+            PickerKind::Changes => self.changes_picker(),
+            PickerKind::Commands | PickerKind::Sessions => return,
+        };
+        let rows = rows.rows().to_vec();
+        if let Some(Overlay::Picker { picker, .. }) = self.overlays.last_mut() {
+            picker.replace_rows(rows);
+        }
+    }
+
     pub fn set_session(&mut self, session: &Session) {
+        self.session_id = Some(session.id.clone());
         self.status.session = session.name.clone();
         self.status.workspace = session.workspace.display().to_string();
         self.status.phase = match session.phase {
@@ -1774,8 +2488,15 @@ impl App {
                 self.sidebar.model.model = Some(model.clone());
                 self.sidebar.model.effort = Some(effort.as_str().to_owned());
                 self.sidebar.model.managed_by_agent = false;
+                self.connector = None;
+                // A session with stored history is pinned to the provider
+                // and model its transcript was produced under.
+                self.draft.profile = Some(provider_profile.clone());
+                self.draft.model = Some(model.clone());
+                self.draft.effort = Some(*effort);
             }
             gritt_core::session::SessionKind::Connector { id } => {
+                self.connector = Some(*id);
                 self.status.profile = id.as_str().to_owned();
                 self.status.model.clear();
                 self.sidebar.model.backend = Some(id.as_str().to_owned());
@@ -1800,6 +2521,77 @@ fn changes_settings(command: Command) -> bool {
             | Command::Code
             | Command::New
     )
+}
+
+/// Settings the native provider owns. A connector session refuses these
+/// because the external agent owns its own model, effort, and permissions.
+fn is_native_setting(command: Command) -> bool {
+    matches!(
+        command,
+        Command::Connect | Command::Models | Command::Effort
+    )
+}
+
+/// A typed draft rejection as a modal explanation. The interface never
+/// parses an error string; it matches on the value the control plane
+/// returned.
+pub fn describe_draft_error(error: &DraftError) -> (String, String) {
+    match error {
+        DraftError::MissingProfile => (
+            "Choose a provider".into(),
+            "No provider is selected and no default is configured. /connect lists the \
+             configured profiles and offers to set up a new one."
+                .into(),
+        ),
+        DraftError::UnknownProfile { profile } => (
+            "Unknown provider".into(),
+            format!("`{profile}` is not in the configuration. /connect lists what is."),
+        ),
+        DraftError::MissingModel => (
+            "Choose a model".into(),
+            "No model is selected and no default is configured. /models lists the \
+             selected provider's catalog."
+                .into(),
+        ),
+        DraftError::ModelOutsideProfile {
+            model,
+            model_profile,
+            profile,
+        } => (
+            "That model belongs to another provider".into(),
+            format!("{model} resolves under {model_profile}, not {profile}. Choose a model from {profile}'s list, or change the provider first."),
+        ),
+        DraftError::ModelResolution { model, message } => (
+            "That model could not be resolved".into(),
+            format!("{model}: {message}"),
+        ),
+        DraftError::EffortUnsupported {
+            model,
+            effort,
+            reason,
+            ..
+        } => (
+            "That effort is not supported here".into(),
+            format!("{model} has no safe mapping for {effort}: {}. Effort returns to the model default.", reason.describe()),
+        ),
+        DraftError::SessionPinned {
+            name,
+            profile,
+            model,
+            ..
+        } => (
+            "Changing the model needs a new session".into(),
+            format!("`{name}` is pinned to {model} on {profile}. Gritt cannot move its stored transcript and continuation state. Run /new to start a session on the new choice; this one stays in /sessions and your composer draft is kept."),
+        ),
+        DraftError::ConnectorSession { name, connector } => (
+            "That session runs on an agent".into(),
+            format!("`{name}` runs on {}, which manages its own model, effort, and permissions. The native pickers do not apply to it.", connector.as_str()),
+        ),
+        DraftError::OtherWorkspace { name, workspace } => (
+            "That session belongs to another workspace".into(),
+            format!("`{name}` was created in {}. Sessions do not move between workspaces.", workspace.display()),
+        ),
+    }
 }
 
 fn protocol_word(protocol: Protocol) -> &'static str {

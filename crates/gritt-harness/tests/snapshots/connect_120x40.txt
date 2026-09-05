@@ -31,12 +31,12 @@
                       │    version unknown  — install this agent to select it                    │E.md
                       │    auth state not reported · Managed by agent                            │ied (pre-existing)
                       │                                                                          │
-                      │                                                                          │tions
-                      │                                                                          │ocal-memory ready
-                      │                                                                          │ls
-                      │                                                                          │ocal-memory starting
-                      │                                                                          │cting and negotiatin
-                      │                                                                          │ve… awaiting approva
+                      │Add a provider                                                            │tions
+                      │  Set up local…                                        [chat completions] │ocal-memory ready
+                      │    http://127.0.0.1:8080/v1                                              │ls
+                      │    not configured yet                                                    │ocal-memory starting
+                      │  Custom endpoint…                                               [custom] │cting and negotiatin
+                      │    any OpenAI-compatible, Responses, or Messages endpoint                │ve… awaiting approva
                       ╰ type to filter · Enter selects · Esc closes ─────────────────────────────╯ng for approval to r
  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │Ask Gritt to do something…                                                                                          │
