@@ -463,3 +463,82 @@ were already implemented in the worktree when work resumed; findings 5 and 6,
 every regression, and the validation were completed here. One file was briefly
 reverted by mistake during recovery and restored from the stash object, then
 de-duplicated against the interrupted session's version.
+
+---
+
+# 2026-09-05 Round 4 review fixes
+
+## Trigger
+
+The fourth review returned `needs-fix` with three confirmed defects: one High
+and two Medium. Round-3 fixes 2, 3, 5, and 7 were confirmed. The remaining
+three were the last narrow edges of finding groups already worked twice: two
+more windows in launch ownership, an eviction bound on the cancellation
+record, and a framing case the SSE budget still disagreed with the parser on.
+
+## Changes per finding
+
+**1. High — launch ownership through queued starts and stale cleanup.** Two
+windows remained. `connect_inner` spawned the process and only then asked
+whether shutdown had begun, so a launch refused during shutdown had already
+created a child and then awaited its cleanup unregistered. And `start`
+unregistered a stale result before closing it, so between those two steps the
+launch map could be empty while the child was still going away. Ownership is
+now reserved before anything is spawned: the slot is claimed first and holds
+`None` until the connection exists, a launch that starts during shutdown is
+refused before any process is created, and a spawn that fails releases the
+slot at once. A stale result keeps its slot until its close has finished.
+Two regressions: eight servers against a concurrency limit of two, with
+shutdown landing while some are queued and others mid-handshake, asserting
+every started child is gone as shutdown returns and that nothing started
+afterwards; and a result whose entry was stopped mid-handshake, asserting its
+child is gone before `start` returns. Restoring the old ordering fails the
+second.
+
+**2. Medium — a cancellation could be forgotten before its write.** The
+record was a fixed ring of 1,024 ids shared by the whole connection, and
+cancelled admission waiters whose requests never reached the queue consumed
+slots in it, so heavy concurrent use could evict an earlier queued call's
+cancellation and let it onto the wire. The record is no longer shared: the
+flag travels on the request command itself, so it cannot be evicted by
+unrelated traffic and it is released when the command is. That removes the
+bookkeeping rather than resizing it. The regression cancels a queued call,
+then floods the connection with 1,500 later cancellations while the writer is
+blocked, and asserts the first call still never reaches the server.
+
+**3. Medium — bare-CR framing was rejected.** The budget counted a lone `\r`
+as ordinary content while the provider's SSE parser treats it as a line
+ending, so a CR-framed stream looked like one event that never ended and many
+small valid events would fail the event bound. The budget now applies the
+parser's own rule: a line ends at `\n`, `\r`, or `\r\n`, and a blank line ends
+an event, with the carriage-return state carried across chunk boundaries.
+Tests mirror the LF and CRLF ones: CR framing within a chunk, split across
+chunks, and fifty CR-framed events arriving both as one burst and byte by
+byte.
+
+## Optional follow-up applied
+
+`stalled_auxiliary_posts_cannot_accumulate` now also asserts that an ordinary
+call still succeeds while all the stalled auxiliary work is parked, which is
+what distinguishes bounded admission from work merely queued behind a
+semaphore, and it polls for the endpoint to drain rather than sampling
+mid-flight. The endpoint answers one connection at a time, so the burst and
+its stall were shortened to keep the test quick.
+
+## Validation
+
+- `cargo fmt --all --check`: pass.
+- `cargo clippy --workspace --all-targets -- -D warnings`: pass.
+- `cargo test --workspace --no-fail-fast`: pass, 329 tests, 0 failed, over
+  three consecutive runs.
+- `GRITT_LIVE_MCP_TESTS=1 cargo test -p gritt-harness --test mcp_live_smoke`:
+  pass. The single configured entry, `gritt`, is ready on protocol
+  `2025-06-18` with 3 tools. No tool was called.
+
+Five tests were added and one strengthened: three in `mcp_runtime.rs` and two
+unit tests for CR framing.
+
+Two of the new regressions were checked against the unfixed code: restoring
+the unregister-before-close ordering fails the stale-cleanup test, and
+neutralising the pre-write cancellation check fails the queued-cancellation
+test.
