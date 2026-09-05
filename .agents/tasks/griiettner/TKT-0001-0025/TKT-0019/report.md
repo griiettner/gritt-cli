@@ -251,9 +251,9 @@ Run from `/Users/griiettner/Projects/grittflow/gritt-cli-tkt-0019`:
 | --- | --- |
 | `cargo fmt --all --check` | pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | pass |
-| `cargo test -p gritt-harness` | pass, 292 tests over 10 targets |
+| `cargo test -p gritt-harness` | pass, 293 tests over 10 targets |
 | `cargo test -p gritt --test tui_pty` | pass, 10 tests |
-| `cargo test --workspace --no-fail-fast` | pass, 447 tests, 0 failed |
+| `cargo test --workspace --no-fail-fast` | pass, 458 tests, 0 failed |
 | `GRITT_LIVE_MCP_TESTS=1 cargo test -p gritt-harness --test mcp_live_smoke` | pass, 1 test, after the note below |
 
 The live smoke check failed on its first run in this worktree with
