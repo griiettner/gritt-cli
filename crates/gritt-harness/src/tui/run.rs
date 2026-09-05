@@ -94,6 +94,11 @@ enum UiMsg {
         operation: u64,
         result: Result<()>,
     },
+    /// The workspace MCP runtime failed to open at startup, before any
+    /// entry could be published. Without this the subscription delivers an
+    /// empty list and the interface says no servers are configured, which
+    /// is indistinguishable from a workspace that really has none.
+    McpStartupFailed(String),
     /// A redacted definition for a first-use launch approval.
     McpApproval {
         operation: u64,
@@ -153,6 +158,18 @@ impl Ui for ChannelUi {
         Box::pin(async move { receiver.await.unwrap_or(ApprovalDecision::Denied) })
     }
 }
+
+/// The redraw cap. The plan asks for smooth updates at 30 fps rather than a
+/// frame per event, which is wasted work when a stream produces faster than
+/// a terminal can usefully show.
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
+/// How many queued messages one iteration may handle before drawing again.
+///
+/// Draining without a ceiling would let a fast producer hold the loop and
+/// starve the key reader. This bounds the work between frames, not the
+/// queue: whatever is left is handled on the next iteration.
+const MAX_COALESCED_MESSAGES: usize = 4_096;
 
 /// Reads terminal events on a thread until `stop` is set.
 fn spawn_key_reader(stop: Arc<AtomicBool>) -> mpsc::UnboundedReceiver<TerminalEvent> {
@@ -553,14 +570,20 @@ async fn adopt(app: &mut App, plane: &ControlPlane, agent: &dyn Driver) -> Resul
 /// opens on a draft and creates the session when the first prompt is
 /// submitted. Native and connector sessions share the loop, the approval
 /// view, and the transcript.
+/// `start_mcp` is the workspace MCP runtime to open, when this run is on
+/// the native path. It is opened in the background rather than awaited, so
+/// a server that never answers `initialize` cannot hold the first frame,
+/// and a failure to open it is reported in the interface instead of on
+/// stderr, which the alternate screen owns (TKT-0020).
 pub async fn run_tui(
     plane: ControlPlane,
     agent: Option<Box<dyn Driver>>,
     draft: SessionDraft,
+    start_mcp: Option<Arc<crate::mcp::McpRuntime>>,
 ) -> Result<()> {
     let theme = theme_from_env();
     let mut terminal = enter()?;
-    let result = event_loop(plane, agent, draft, &mut terminal, theme).await;
+    let result = event_loop(plane, agent, draft, &mut terminal, theme, start_mcp).await;
     leave();
     result
 }
@@ -571,6 +594,7 @@ async fn event_loop(
     draft: SessionDraft,
     terminal: &mut ratatui::DefaultTerminal,
     theme: Theme,
+    start_mcp: Option<Arc<crate::mcp::McpRuntime>>,
 ) -> Result<()> {
     let mut app = App::new(StatusBar::default(), theme);
     app.draft = draft;
@@ -611,6 +635,7 @@ async fn event_loop(
     probe_agents(&runtime);
     load_profiles(&runtime);
     subscribe_mcp(&runtime);
+    open_mcp(&runtime, start_mcp);
     let mut handle: Option<CancelHandle> = None;
     let mut responder: Option<oneshot::Sender<ApprovalDecision>> = None;
     let stop = Arc::new(AtomicBool::new(false));
@@ -622,18 +647,23 @@ async fn event_loop(
     // idle session therefore draws nothing at all, which is what the plan's
     // idle budget asks for (TKT-0020).
     let mut dirty = true;
+    let mut last_draw = tokio::time::Instant::now() - FRAME_INTERVAL;
     loop {
-        if dirty {
+        let due = last_draw + FRAME_INTERVAL;
+        if dirty && tokio::time::Instant::now() >= due {
             terminal
                 .draw(|frame| draw(frame, &app))
                 .map_err(|error| Error::config(format!("draw failed: {error}")))?;
             dirty = false;
+            last_draw = tokio::time::Instant::now();
         }
         let action = tokio::select! {
-            Some(msg) = ui_rx.recv() => {
-                dirty = true;
-                on_message(&mut app, &mut runtime, &mut idle_agent, &mut handle, &mut responder, msg).await?
-            }
+            // Input first, deliberately. Under a stream the message branch
+            // is always ready, and an unbiased `select!` would put a
+            // keypress behind a random share of the backlog. A person
+            // cannot type fast enough to starve the queue, and the
+            // coalescing drain below runs on every iteration regardless.
+            biased;
             Some(event) = keys.recv() => {
                 dirty = true;
                 match event {
@@ -651,6 +681,14 @@ async fn event_loop(
                     _ => Action::None,
                 }
             }
+            // A frame that is owed but capped. Without this branch the
+            // loop would sit in `recv` until the next message or tick and
+            // leave a stale screen up for as long as that took.
+            _ = tokio::time::sleep_until(due), if dirty => Action::None,
+            Some(msg) = ui_rx.recv() => {
+                dirty = true;
+                on_message(&mut app, &mut runtime, &mut idle_agent, &mut handle, &mut responder, msg).await?
+            }
             _ = tick.tick() => Action::None,
         };
         on_action(
@@ -662,6 +700,41 @@ async fn event_loop(
             action,
         )
         .await?;
+        // Coalescing. One message per frame cannot keep up with a stream: a
+        // turn emits a text delta per token through this same channel, so
+        // drawing after each one caps throughput at the frame rate and lets
+        // the queue grow without bound. Measured before this landed, the
+        // loop drained 69 messages a second against 1,000 produced and
+        // finished holding 8,862 (TKT-0020).
+        //
+        // Everything already waiting is handled before the next draw, in
+        // order, by the same handler. Nothing is dropped: no approval, tool
+        // result, or final event is skipped, only the intermediate frames
+        // between them.
+        let mut coalesced = 0usize;
+        while coalesced < MAX_COALESCED_MESSAGES && !app.quit {
+            let Ok(msg) = ui_rx.try_recv() else { break };
+            coalesced += 1;
+            dirty = true;
+            let action = on_message(
+                &mut app,
+                &mut runtime,
+                &mut idle_agent,
+                &mut handle,
+                &mut responder,
+                msg,
+            )
+            .await?;
+            on_action(
+                &mut app,
+                &mut runtime,
+                &mut idle_agent,
+                &mut handle,
+                &mut responder,
+                action,
+            )
+            .await?;
+        }
         if app.quit {
             break;
         }
@@ -755,6 +828,23 @@ fn probe_agents(runtime: &Runtime) {
     let tx = runtime.tx.clone();
     runtime.spawn_detached(async move {
         let _ = tx.send(UiMsg::Agents(agent_summaries(&plane).await));
+    });
+}
+
+/// Starts the workspace MCP runtime without blocking the first frame.
+///
+/// Approved servers launch, and every state change arrives through the
+/// subscription. A failure to read or parse `.mcp.json` happens before any
+/// entry is published, so it would otherwise be invisible: the subscription
+/// would deliver an empty list and the sidebar would say no servers are
+/// configured. That case becomes a message instead.
+fn open_mcp(runtime: &Runtime, mcp: Option<Arc<crate::mcp::McpRuntime>>) {
+    let Some(mcp) = mcp else { return };
+    let tx = runtime.tx.clone();
+    runtime.spawn_detached(async move {
+        if let Err(error) = mcp.open(&CancellationToken::new()).await {
+            let _ = tx.send(UiMsg::McpStartupFailed(error.message));
+        }
     });
 }
 
@@ -978,6 +1068,13 @@ async fn on_message(
             app.show_file_diff(diff);
         }
         UiMsg::Mcp(snapshots) => app.apply_mcp(snapshots),
+        UiMsg::McpStartupFailed(reason) => {
+            // The reason is a configuration error: parse failures and
+            // credential-shaped refusals name the field or the variable and
+            // never its value (ADR-008), so it is shown as it is.
+            app.push(EntryKind::Error, format!("MCP configuration: {reason}"));
+            app.notice = Some(format!("MCP configuration: {reason}"));
+        }
         UiMsg::McpOutcome { operation, result } => {
             let current = runtime
                 .mcp
@@ -1493,6 +1590,147 @@ async fn resume_by_id(plane: &ControlPlane, id: &str) -> Result<DraftOpen> {
     plane
         .open_draft(SessionDraft::default().with_name(session.name))
         .await
+}
+
+/// A seam over the real loop's state and handlers, for the responsiveness
+/// benchmark (TKT-0020).
+///
+/// The microbenchmarks in `tests/tui_responsiveness.rs` drive the reducer
+/// and the renderer directly, which measures what a frame costs but not
+/// what the loop does. The loop receives **one** message per wakeup, and
+/// streaming output arrives on the same unbounded channel as every other
+/// completion, so batching, queue depth, and input scheduling under load
+/// are properties of this file rather than of `App`. Nothing outside the
+/// crate can reach them, because `on_message`, `on_action`, and `Runtime`
+/// are private and must stay that way.
+///
+/// This exposes exactly enough to drive them from an integration test that
+/// can also spawn real MCP fixture processes: push a message the way the
+/// product pushes it, handle exactly one, press a key, and read the real
+/// queue depth. It adds no behavior. Every method forwards to the same
+/// function the loop calls.
+///
+/// Not part of the supported API.
+#[doc(hidden)]
+pub struct LoopHarness {
+    app: App,
+    runtime: Runtime,
+    idle: Option<Box<dyn Driver>>,
+    handle: Option<CancelHandle>,
+    responder: Option<oneshot::Sender<ApprovalDecision>>,
+    rx: mpsc::UnboundedReceiver<UiMsg>,
+    tx: mpsc::UnboundedSender<UiMsg>,
+}
+
+#[doc(hidden)]
+impl LoopHarness {
+    /// The loop's state as `event_loop` builds it, minus the terminal.
+    pub fn new(plane: ControlPlane, workspace: &std::path::Path, app: App) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let runtime = Runtime {
+            plane: Arc::new(plane),
+            changes: Arc::new(WorkspaceChanges::new(workspace)),
+            tx: tx.clone(),
+            work: None,
+            work_active: None,
+            open_work: None,
+            operations: 0,
+            pending_open: None,
+            mcp: None,
+        };
+        Self {
+            app,
+            runtime,
+            idle: None,
+            handle: None,
+            responder: None,
+            rx,
+            tx,
+        }
+    }
+
+    pub fn app(&self) -> &App {
+        &self.app
+    }
+
+    pub fn app_mut(&mut self) -> &mut App {
+        &mut self.app
+    }
+
+    /// The production `Ui` a turn streams through. A producer holding this
+    /// sends exactly what a real turn sends, on the channel the real loop
+    /// drains.
+    pub fn channel_ui(&self, generation: u64) -> Box<dyn Ui> {
+        Box::new(ChannelUi {
+            tx: self.tx.clone(),
+            generation,
+        })
+    }
+
+    /// Messages waiting to be handled. This is the queue the plan asks to
+    /// be bounded, read from the channel itself rather than modelled.
+    pub fn queue_depth(&self) -> usize {
+        self.rx.len()
+    }
+
+    /// One wakeup: take a single message, handle it, and handle whatever
+    /// action it produced. Returns false when the queue is empty.
+    ///
+    /// One message per call is the point. The loop's `select!` takes one
+    /// and draws; it does not drain.
+    pub async fn pump_one(&mut self) -> bool {
+        let Ok(msg) = self.rx.try_recv() else {
+            return false;
+        };
+        let action = on_message(
+            &mut self.app,
+            &mut self.runtime,
+            &mut self.idle,
+            &mut self.handle,
+            &mut self.responder,
+            msg,
+        )
+        .await
+        .expect("on_message");
+        self.act(action).await;
+        true
+    }
+
+    /// A key, through the reducer and then the loop's action handler.
+    pub async fn press(&mut self, key: crossterm::event::KeyEvent) {
+        let action = self.app.on_key(key);
+        self.act(action).await;
+    }
+
+    pub async fn act(&mut self, action: Action) {
+        on_action(
+            &mut self.app,
+            &mut self.runtime,
+            &mut self.idle,
+            &mut self.handle,
+            &mut self.responder,
+            action,
+        )
+        .await
+        .expect("on_action");
+    }
+
+    /// Starts the real MCP lifecycle subscription, the way `event_loop`
+    /// does, so snapshots arrive as messages on the same queue.
+    pub fn subscribe_mcp(&mut self) {
+        subscribe_mcp(&self.runtime);
+    }
+
+    /// Installs a driver so a cancel has a running turn to act on.
+    pub fn set_driver(&mut self, driver: Box<dyn Driver>) {
+        self.handle = Some(driver.handle());
+        self.idle = Some(driver);
+    }
+
+    /// Whether the loop still holds a cancellable turn.
+    pub fn has_driver(&self) -> bool {
+        self.idle.is_some()
+    }
 }
 
 #[cfg(test)]

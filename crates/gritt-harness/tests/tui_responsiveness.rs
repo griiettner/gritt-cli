@@ -1,12 +1,24 @@
-//! Deterministic responsiveness harness for the full-screen mode (TKT-0020).
+//! Reducer and renderer **microbenchmarks** for the full-screen mode
+//! (TKT-0020).
 //!
-//! The feature plan makes responsiveness an acceptance requirement and names
-//! the scenario: a 10,000-message transcript, 1,000 incoming text deltas per
-//! second, several active MCP servers plus one hung server, a 1 MiB tool
-//! result, cancellation under load, and history paging. This file is that
-//! scenario, driven through `App::on_key`, `App::on_event`, and `render::draw`
-//! against a `TestBackend`, so the numbers come from the same code the binary
-//! runs and not from a mock.
+//! Read this first: every measurement here isolates one piece. Each case
+//! drives `App::on_key`, `App::on_event`, or `render::draw` against a
+//! `TestBackend` and reports what that piece costs on its own. None of them
+//! is the production load path, and none of their numbers may be quoted as
+//! evidence about it.
+//!
+//! In particular, the sustained-output case below models the loop by draining
+//! its own synthetic backlog before each draw. The real loop takes one
+//! message per wakeup from an unbounded channel that carries streaming output
+//! alongside every other completion, and it coalesces and caps frames itself.
+//! Queue depth, drain rate, and how long a keypress waits behind a stream are
+//! properties of `tui/run.rs`, not of `App`, and are measured in
+//! `tests/tui_load.rs` against the real handlers. Where the two disagree,
+//! `tui_load.rs` is the one that describes the product.
+//!
+//! What these are good for: attributing a regression. When the integrated
+//! numbers move, these say whether the reducer, the layout cache, or the
+//! renderer moved with them.
 //!
 //! Two modes:
 //!
@@ -349,14 +361,14 @@ fn verdict(name: &str, measured: Duration, budget: Duration) {
 
 // -- 2. sustained output ----------------------------------------------
 
-/// 1,000 text deltas per second into a loaded transcript.
+/// Render work per frame while a transcript is being appended to.
 ///
-/// Render work per frame is the plan's 16 ms figure at 120x40. The backlog
-/// number beside it is the queue evidence: deltas are produced at the plan's
-/// rate and drained by the same loop that draws, so a backlog that grows
-/// without bound is a queue that is not bounded.
+/// This is the plan's 16 ms figure at 120x40 and nothing more. The "backlog"
+/// it computes is synthetic: it is drained before every draw, which is not
+/// what the loop does, so the number beside it is **not** queue evidence.
+/// Real queue depth and drain rate are in `tests/tui_load.rs`.
 #[test]
-fn sustained_output_render_work_and_queue_depth() {
+fn render_work_per_frame_while_appending_output() {
     let mut app = app();
     let mut terminal = terminal();
     fill_transcript(&mut app, transcript_messages());
@@ -364,7 +376,7 @@ fn sustained_output_render_work_and_queue_depth() {
 
     let seconds = if recording() { 10 } else { 2 };
     let per_second = 1_000usize;
-    let mut render = Series::new("render work at 120x40");
+    let mut render = Series::new("render work at 120x40 (micro)");
     let mut backlog_peak = 0usize;
     let mut delivered = 0usize;
     let start = Instant::now();
