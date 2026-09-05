@@ -18,6 +18,8 @@ pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
 pub enum Method {
     Get,
     Post,
+    /// Used by MCP's Streamable HTTP transport to end a session.
+    Delete,
 }
 
 /// A header value. Secrets keep their redaction through Debug.
@@ -56,6 +58,15 @@ pub struct HttpRequest {
 }
 
 impl HttpRequest {
+    pub fn delete(url: impl Into<String>) -> Self {
+        Self {
+            method: Method::Delete,
+            url: url.into(),
+            headers: Vec::new(),
+            body: None,
+        }
+    }
+
     pub fn get(url: impl Into<String>) -> Self {
         Self {
             method: Method::Get,
@@ -100,12 +111,24 @@ impl HttpRequest {
 pub struct HttpResponse {
     pub status: u16,
     pub content_type: Option<String>,
+    /// Response headers with lower-cased names. Protocols that carry state
+    /// in a header, such as MCP's `Mcp-Session-Id`, read it from here.
+    pub headers: Vec<(String, String)>,
     pub body: ByteStream,
 }
 
 impl HttpResponse {
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
+    }
+
+    /// The first value of `name`, which is matched case-insensitively.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.as_str())
     }
 
     /// Collects the whole body. Only for non-streaming responses such as
@@ -149,6 +172,7 @@ impl HttpTransport for ReqwestTransport {
             let mut builder = match request.method {
                 Method::Get => self.client.get(&request.url),
                 Method::Post => self.client.post(&request.url),
+                Method::Delete => self.client.delete(&request.url),
             };
             for (name, value) in &request.headers {
                 builder = builder.header(name.as_str(), value.expose());
@@ -166,12 +190,23 @@ impl HttpTransport for ReqwestTransport {
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
+            let headers = response
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_ascii_lowercase(), value.to_owned()))
+                })
+                .collect();
             let body = response.bytes_stream().map(|chunk| {
                 chunk.map_err(|error| Error::provider(None, redact_reqwest_error(&error)))
             });
             Ok(HttpResponse {
                 status,
                 content_type,
+                headers,
                 body: Box::pin(body),
             })
         })
@@ -203,6 +238,7 @@ fn redact_reqwest_error(error: &reqwest::Error) -> String {
 pub struct FixtureResponse {
     pub status: u16,
     pub content_type: Option<String>,
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
@@ -211,6 +247,7 @@ impl FixtureResponse {
         Self {
             status: 200,
             content_type: Some("text/event-stream".into()),
+            headers: Vec::new(),
             body: body.into(),
         }
     }
@@ -219,8 +256,15 @@ impl FixtureResponse {
         Self {
             status,
             content_type: Some("application/json".into()),
+            headers: Vec::new(),
             body: body.into(),
         }
+    }
+
+    /// Adds a response header, for protocols that read one back.
+    pub fn header(mut self, name: &str, value: impl Into<String>) -> Self {
+        self.headers.push((name.to_ascii_lowercase(), value.into()));
+        self
     }
 }
 
@@ -277,6 +321,7 @@ impl HttpTransport for FixtureTransport {
             Ok(HttpResponse {
                 status: response.status,
                 content_type: response.content_type,
+                headers: response.headers,
                 body: Box::pin(stream::iter(chunks)),
             })
         })
