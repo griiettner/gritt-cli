@@ -51,11 +51,18 @@ enum UiMsg {
     /// requested under. A token that no longer matches is a late result
     /// for a provider the user has already left.
     Catalog {
+        /// The request this answers. `selection` says which provider was
+        /// chosen; this says which load was asked for, which is what
+        /// decides whether it still owns the slot.
+        operation: u64,
         selection: u64,
         profile: String,
         result: Result<ProfileCatalog>,
     },
-    Sessions(Vec<Session>),
+    Sessions {
+        operation: u64,
+        sessions: Vec<Session>,
+    },
     /// The installed agents, probed off the terminal event path because
     /// probing runs external processes.
     Agents(Vec<AgentSummary>),
@@ -74,7 +81,10 @@ enum UiMsg {
         generation: u64,
         changes: ChangedFiles,
     },
-    Diff(FileDiff),
+    Diff {
+        operation: u64,
+        diff: FileDiff,
+    },
     /// Live MCP state, from the runtime's subscription rather than a poll.
     Mcp(Vec<McpServerSnapshot>),
     McpOutcome {
@@ -86,6 +96,7 @@ enum UiMsg {
     },
     /// A redacted definition for a first-use launch approval.
     McpApproval {
+        operation: u64,
         server: String,
         definition: String,
     },
@@ -99,6 +110,7 @@ enum UiMsg {
         profiles: Vec<crate::setup::ProfileSummary>,
     },
     Setup {
+        operation: u64,
         message: String,
         /// True when the write succeeded and the form should close.
         close: bool,
@@ -285,9 +297,13 @@ struct Runtime {
     /// it, and Escape aborts it, so the loading line always describes work
     /// that is really running.
     work: Option<JoinHandle<()>>,
-    /// Which kind of work `work` is, so superseding or cancelling it ends
-    /// the right label rather than clearing every kind at once.
-    work_kind: Option<Work>,
+    /// What `work` is: its kind and the request it belongs to.
+    ///
+    /// The identity is the pair, not the kind. Matching on the kind alone
+    /// let an older queued response retire a newer request of the same
+    /// kind — discarding the newer one's cancellation handle while it was
+    /// still running.
+    work_active: Option<ActiveWork>,
     /// The task behind a session change, kept apart from `work`.
     ///
     /// A session change owns a reservation: the driver being replaced is
@@ -317,6 +333,13 @@ struct McpOperation {
     cancel: CancellationToken,
 }
 
+/// The ordinary background request that owns the shared slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveWork {
+    kind: Work,
+    operation: u64,
+}
+
 impl Runtime {
     /// Reserves the next operation id.
     fn next_operation(&mut self) -> u64 {
@@ -334,18 +357,29 @@ impl Runtime {
     }
 
     /// Replaces the background request, aborting whatever it superseded.
-    /// Records that ordinary work of this kind has finished.
+    /// Answers whether this completion is the request that owns the slot,
+    /// and retires it when it is.
     ///
-    /// Ending the label and retiring the slot's ownership are one step, so
-    /// a completed request cannot leave its kind installed as the owner.
-    /// A stale owner is what let a later request end the label of an MCP
-    /// launch that was still running.
-    fn finish_work(&mut self, app: &mut App, kind: Work) {
-        app.end_work(kind);
-        if self.work_kind == Some(kind) {
-            self.work_kind = None;
-            self.work = None;
+    /// One decision covers both halves on purpose: retiring the ownership
+    /// and applying the result must agree, and every handler asks this
+    /// before it does either. `false` means the completion is stale —
+    /// superseded, or cancelled — so nothing is retired and nothing is
+    /// shown.
+    ///
+    /// The identity is the kind *and* the operation. On kind alone, an
+    /// older queued response retired the newer request of the same kind
+    /// and threw away its cancellation handle, leaving work that Escape
+    /// and `/new` could no longer stop.
+    #[must_use]
+    fn finish_work(&mut self, app: &mut App, kind: Work, operation: u64) -> bool {
+        let active = ActiveWork { kind, operation };
+        if self.work_active != Some(active) {
+            return false;
         }
+        app.end_work(kind);
+        self.work_active = None;
+        self.work = None;
+        true
     }
 
     /// Gives up the session change in flight and clears everything that
@@ -373,16 +407,17 @@ impl Runtime {
         &mut self,
         app: &mut App,
         kind: Work,
+        operation: u64,
         label: impl Into<String>,
         future: impl std::future::Future<Output = ()> + Send + 'static,
     ) {
-        if let Some(previous) = self.work_kind.take() {
-            app.end_work(previous);
+        if let Some(previous) = self.work_active.take() {
+            app.end_work(previous.kind);
         }
         if let Some(previous) = self.work.take() {
             previous.abort();
         }
-        self.work_kind = Some(kind);
+        self.work_active = Some(ActiveWork { kind, operation });
         app.begin_work(kind, label);
         self.work = Some(tokio::spawn(future));
     }
@@ -409,11 +444,11 @@ impl Runtime {
             app.end_work(Work::Mcp);
             cancelled = true;
         }
-        if let Some(kind) = self.work_kind.take() {
+        if let Some(previous) = self.work_active.take() {
             if let Some(work) = self.work.take() {
                 work.abort();
             }
-            app.end_work(kind);
+            app.end_work(previous.kind);
             cancelled = true;
         }
         cancelled
@@ -548,7 +583,7 @@ async fn event_loop(
         changes: Arc::new(WorkspaceChanges::new(app.status.workspace.clone())),
         tx: ui_tx.clone(),
         work: None,
-        work_kind: None,
+        work_active: None,
         open_work: None,
         operations: 0,
         pending_open: None,
@@ -806,11 +841,14 @@ async fn on_message(
             }
         }
         UiMsg::Catalog {
+            operation,
             selection,
             profile,
             result,
         } => {
-            runtime.finish_work(app, Work::Catalog);
+            if !runtime.finish_work(app, Work::Catalog, operation) {
+                return Ok(Action::None);
+            }
             match result {
                 Ok(catalog) => {
                     app.apply_catalog(selection, &profile, catalog.models, catalog.state);
@@ -820,8 +858,13 @@ async fn on_message(
                 }
             }
         }
-        UiMsg::Sessions(sessions) => {
-            runtime.finish_work(app, Work::Sessions);
+        UiMsg::Sessions {
+            operation,
+            sessions,
+        } => {
+            if !runtime.finish_work(app, Work::Sessions, operation) {
+                return Ok(Action::None);
+            }
             app.load_sessions(sessions);
         }
         UiMsg::Agents(agents) => {
@@ -904,8 +947,13 @@ async fn on_message(
         } => {
             app.apply_changes(generation, changes);
         }
-        UiMsg::Diff(diff) => {
-            runtime.finish_work(app, Work::Diff);
+        UiMsg::Diff { operation, diff } => {
+            // A diff that was superseded or cancelled may not open an
+            // overlay: by now the reader has moved on, possibly to another
+            // session entirely.
+            if !runtime.finish_work(app, Work::Diff, operation) {
+                return Ok(Action::None);
+            }
             app.show_file_diff(diff);
         }
         UiMsg::Mcp(snapshots) => app.apply_mcp(snapshots),
@@ -926,8 +974,14 @@ async fn on_message(
                 app.notice = Some(error.message);
             }
         }
-        UiMsg::McpApproval { server, definition } => {
-            runtime.finish_work(app, Work::McpDefinition);
+        UiMsg::McpApproval {
+            operation,
+            server,
+            definition,
+        } => {
+            if !runtime.finish_work(app, Work::McpDefinition, operation) {
+                return Ok(Action::None);
+            }
             // The definition was asked for when nothing was running. If a
             // turn or another approval started while it was being read,
             // showing it now would let the answer authorize a launch
@@ -955,8 +1009,14 @@ async fn on_message(
             app.profiles = profiles;
             app.refresh_connection_picker();
         }
-        UiMsg::Setup { message, close } => {
-            runtime.finish_work(app, Work::Setup);
+        UiMsg::Setup {
+            operation,
+            message,
+            close,
+        } => {
+            if !runtime.finish_work(app, Work::Setup, operation) {
+                return Ok(Action::None);
+            }
             return Ok(app.setup_outcome(message, close));
         }
     }
@@ -1063,10 +1123,20 @@ async fn on_action(
         Action::RefreshSessions => {
             let plane = Arc::clone(&runtime.plane);
             let tx = runtime.tx.clone();
-            runtime.spawn(app, Work::Sessions, "loading sessions", async move {
-                let sessions = plane.builder.store.list().await.unwrap_or_default();
-                let _ = tx.send(UiMsg::Sessions(sessions));
-            });
+            let operation = runtime.next_operation();
+            runtime.spawn(
+                app,
+                Work::Sessions,
+                operation,
+                "loading sessions",
+                async move {
+                    let sessions = plane.builder.store.list().await.unwrap_or_default();
+                    let _ = tx.send(UiMsg::Sessions {
+                        operation,
+                        sessions,
+                    });
+                },
+            );
         }
         Action::Resume(id) => {
             if handle.is_some() || runtime.pending_open.is_some() {
@@ -1142,9 +1212,11 @@ async fn on_action(
             let plane = Arc::clone(&runtime.plane);
             let tx = runtime.tx.clone();
             let label = format!("loading {profile} models");
-            runtime.spawn(app, Work::Catalog, label, async move {
+            let operation = runtime.next_operation();
+            runtime.spawn(app, Work::Catalog, operation, label, async move {
                 let result = plane.catalog(&profile).await;
                 let _ = tx.send(UiMsg::Catalog {
+                    operation,
                     selection,
                     profile,
                     result,
@@ -1182,37 +1254,48 @@ async fn on_action(
             // system calls. `keyring::Entry::get_password()` in particular
             // can block for as long as the operating system wants, so none
             // of it runs on the loop.
-            runtime.spawn(app, Work::Setup, "saving the profile", async move {
-                let outcome = tokio::task::spawn_blocking(move || {
-                    let (message, ok) =
-                        crate::setup::apply_setup(plane.setup().as_ref(), submission);
-                    if !ok {
-                        return (message, false, None);
-                    }
-                    let reloaded = plane.reloaded();
-                    let profiles = match &reloaded {
-                        Some(plane) => plane.profile_summaries(),
-                        None => plane.profile_summaries(),
+            let operation = runtime.next_operation();
+            runtime.spawn(
+                app,
+                Work::Setup,
+                operation,
+                "saving the profile",
+                async move {
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        let (message, ok) =
+                            crate::setup::apply_setup(plane.setup().as_ref(), submission);
+                        if !ok {
+                            return (message, false, None);
+                        }
+                        let reloaded = plane.reloaded();
+                        let profiles = match &reloaded {
+                            Some(plane) => plane.profile_summaries(),
+                            None => plane.profile_summaries(),
+                        };
+                        (message, true, Some((reloaded, profiles)))
+                    })
+                    .await;
+                    let (message, close, reloaded) = match outcome {
+                        Ok(outcome) => outcome,
+                        Err(_) => ("the setup task did not finish".to_owned(), false, None),
                     };
-                    (message, true, Some((reloaded, profiles)))
-                })
-                .await;
-                let (message, close, reloaded) = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(_) => ("the setup task did not finish".to_owned(), false, None),
-                };
-                if let Some((plane, profiles)) = reloaded {
-                    if let Some(plane) = plane {
-                        let _ = tx.send(UiMsg::Reloaded {
-                            plane: Box::new(plane),
-                            profiles,
-                        });
-                    } else {
-                        let _ = tx.send(UiMsg::Profiles(profiles));
+                    if let Some((plane, profiles)) = reloaded {
+                        if let Some(plane) = plane {
+                            let _ = tx.send(UiMsg::Reloaded {
+                                plane: Box::new(plane),
+                                profiles,
+                            });
+                        } else {
+                            let _ = tx.send(UiMsg::Profiles(profiles));
+                        }
                     }
-                }
-                let _ = tx.send(UiMsg::Setup { message, close });
-            });
+                    let _ = tx.send(UiMsg::Setup {
+                        operation,
+                        message,
+                        close,
+                    });
+                },
+            );
         }
         Action::NewSession => {
             // The previous session is not deleted; its driver is released
@@ -1233,16 +1316,22 @@ async fn on_action(
             if let McpRequest::RequestApproval { server } = request {
                 // Fetching the definition changes nothing; it only asks
                 // what approving would run.
+                let operation = runtime.next_operation();
                 runtime.spawn(
                     app,
                     Work::McpDefinition,
+                    operation,
                     "reading the server definition",
                     async move {
                         let definition = mcp
                             .definition_summary(&server)
                             .await
                             .unwrap_or_else(|| "this entry cannot run as configured".to_owned());
-                        let _ = tx.send(UiMsg::McpApproval { server, definition });
+                        let _ = tx.send(UiMsg::McpApproval {
+                            operation,
+                            server,
+                            definition,
+                        });
                     },
                 );
                 return Ok(());
@@ -1295,9 +1384,10 @@ async fn on_action(
         Action::OpenFileDiff(path) => {
             let changes = Arc::clone(&runtime.changes);
             let tx = runtime.tx.clone();
-            runtime.spawn(app, Work::Diff, "reading the diff", async move {
+            let operation = runtime.next_operation();
+            runtime.spawn(app, Work::Diff, operation, "reading the diff", async move {
                 let diff = changes.diff(&path).await;
-                let _ = tx.send(UiMsg::Diff(diff));
+                let _ = tx.send(UiMsg::Diff { operation, diff });
             });
         }
         Action::RefreshMcp => {
@@ -1530,7 +1620,7 @@ mod tests {
             changes: Arc::new(WorkspaceChanges::new(dir.path())),
             tx,
             work: None,
-            work_kind: None,
+            work_active: None,
             open_work: None,
             operations: 0,
             pending_open: None,
@@ -1797,7 +1887,16 @@ mod tests {
 
         // The real sequence `/sessions` produces.
         h.act(Action::RefreshSessions).await;
-        h.message(UiMsg::Sessions(Vec::new())).await;
+        let sessions_op = h
+            .runtime
+            .work_active
+            .expect("the session list owns the slot")
+            .operation;
+        h.message(UiMsg::Sessions {
+            operation: sessions_op,
+            sessions: Vec::new(),
+        })
+        .await;
 
         assert!(
             h.runtime.pending_open.is_some(),
@@ -1885,7 +1984,16 @@ mod tests {
         let mut h = harness().await;
         // The turn starts while the definition is being read.
         h.app.running = true;
+        let definition_op = h.runtime.next_operation();
+        h.runtime.spawn(
+            &mut h.app,
+            Work::McpDefinition,
+            definition_op,
+            "reading the server definition",
+            async {},
+        );
         h.message(UiMsg::McpApproval {
+            operation: definition_op,
             server: "probe".into(),
             definition: "run: /usr/bin/probe".into(),
         })
@@ -2013,7 +2121,13 @@ mod tests {
         h.app.begin_work(Work::Mcp, "applying the MCP change");
 
         // The catalog answers. It clears its own label and nothing else.
+        let catalog_op = h
+            .runtime
+            .work_active
+            .expect("the catalog owns the slot")
+            .operation;
         h.message(UiMsg::Catalog {
+            operation: catalog_op,
             selection: h.app.selection,
             profile: "openrouter".into(),
             result: Err(gritt_core::Error::config("no")),
@@ -2054,18 +2168,24 @@ mod tests {
     async fn an_approved_launch_stays_cancellable_across_a_catalog_request() {
         let mut h = harness().await;
         // The definition read is ordinary work and owns the shared slot.
-        h.app
-            .begin_work(Work::McpDefinition, "reading the server definition");
-        h.runtime.work_kind = Some(Work::McpDefinition);
+        let definition_op = h.runtime.next_operation();
+        h.runtime.spawn(
+            &mut h.app,
+            Work::McpDefinition,
+            definition_op,
+            "reading the server definition",
+            async {},
+        );
         // It answers, which must retire its ownership as well as its label.
         h.message(UiMsg::McpApproval {
+            operation: definition_op,
             server: "probe".into(),
             definition: "run: /usr/bin/probe".into(),
         })
         .await;
         assert!(!h.app.is_working_on(Work::McpDefinition));
         assert!(
-            h.runtime.work_kind.is_none(),
+            h.runtime.work_active.is_none(),
             "a finished request stayed installed as the owner of the slot"
         );
         assert!(h.app.pending.is_some(), "no approval overlay was shown");
@@ -2085,7 +2205,13 @@ mod tests {
             selection: h.app.selection,
         })
         .await;
+        let catalog_op = h
+            .runtime
+            .work_active
+            .expect("the catalog owns the slot")
+            .operation;
         h.message(UiMsg::Catalog {
+            operation: catalog_op,
             selection: h.app.selection,
             profile: "openrouter".into(),
             result: Err(gritt_core::Error::config("no")),
@@ -2109,5 +2235,83 @@ mod tests {
         assert!(token.is_cancelled(), "the launch was never told to stop");
         assert!(h.runtime.mcp.is_none());
         assert!(!h.app.is_busy());
+    }
+    /// Round 5: an older queued response must not retire a newer request
+    /// of the same kind, and a cancelled request must not open its result
+    /// later.
+    ///
+    /// The reported sequence, deterministically: diff A queues its result,
+    /// diff B starts before it is handled, A's completion arrives, then
+    /// `/new`. B has to stay cancellable through A's completion, and
+    /// neither diff may open an overlay over the fresh draft.
+    #[tokio::test]
+    async fn a_queued_diff_cannot_retire_the_one_that_replaced_it() {
+        let mut h = harness().await;
+
+        // Diff A owns the slot and its result is on its way.
+        h.act(Action::OpenFileDiff("a.txt".into())).await;
+        let a = h
+            .runtime
+            .work_active
+            .expect("diff A owns the slot")
+            .operation;
+
+        // Diff B supersedes it before A's response is handled.
+        h.act(Action::OpenFileDiff("b.txt".into())).await;
+        let b = h
+            .runtime
+            .work_active
+            .expect("diff B owns the slot")
+            .operation;
+        assert_ne!(a, b);
+        assert!(h.app.is_working_on(Work::Diff));
+
+        // A's queued completion arrives. It is not the request that owns
+        // the slot, so it changes nothing and shows nothing.
+        h.message(UiMsg::Diff {
+            operation: a,
+            diff: crate::changes::FileDiff::Text {
+                path: "a.txt".into(),
+                body: "@@ -1 +1 @@\n-old\n+new\n".into(),
+            },
+        })
+        .await;
+        assert!(
+            h.app.overlays.is_empty(),
+            "a superseded diff opened its overlay"
+        );
+        assert_eq!(
+            h.runtime.work_active.map(|active| active.operation),
+            Some(b),
+            "an older completion retired the request that replaced it"
+        );
+        assert!(
+            h.app.is_working_on(Work::Diff),
+            "an older completion ended the live request's label"
+        );
+
+        // `/new` must be able to cancel B.
+        h.act(Action::NewSession).await;
+        assert!(
+            h.runtime.work_active.is_none(),
+            "the live diff survived /new"
+        );
+        assert!(!h.app.is_working_on(Work::Diff));
+        assert!(!h.app.is_busy());
+
+        // And B's own result, arriving afterwards, cannot open a diff over
+        // the fresh draft.
+        h.message(UiMsg::Diff {
+            operation: b,
+            diff: crate::changes::FileDiff::Text {
+                path: "b.txt".into(),
+                body: "@@ -1 +1 @@\n-old\n+new\n".into(),
+            },
+        })
+        .await;
+        assert!(
+            h.app.overlays.is_empty(),
+            "a cancelled diff opened its overlay over the new draft"
+        );
     }
 }
