@@ -12,6 +12,7 @@ use futures::StreamExt;
 use gritt_core::connector::{Connector, ConnectorInfo, TaskRequest};
 use gritt_core::event::{ApprovalDecision, Event, EventKind, EventSource, SessionStatus, Usage};
 use gritt_core::policy::PolicyOutcome;
+use gritt_core::provider::ReasoningEffort;
 use gritt_core::secret::Secret;
 use gritt_core::session::{BoxFuture, Phase, Session, SessionStore};
 use gritt_core::{Error, ErrorKind, Result};
@@ -19,7 +20,7 @@ use gritt_provider::adapter::{redact_text, redact_value};
 use gritt_provider::CancellationToken;
 
 use crate::agent::{persisted_projection, ApprovalMode, CancelHandle, TurnOutcome, TurnStatus, Ui};
-use crate::driver::{Driver, DriverInfo};
+use crate::driver::{Driver, DriverInfo, EffortOutcome};
 use crate::policy::Decision;
 use crate::store::Store;
 use crate::telemetry::Telemetry;
@@ -458,6 +459,15 @@ impl Driver for ConnectorSession {
         ui: &'a mut dyn Ui,
     ) -> BoxFuture<'a, Result<TurnOutcome>> {
         Box::pin(ConnectorSession::run_turn(self, prompt, ui))
+    }
+
+    fn effort(&self) -> Option<ReasoningEffort> {
+        None
+    }
+
+    fn set_effort(&mut self, _effort: ReasoningEffort) -> BoxFuture<'_, Result<EffortOutcome>> {
+        let id = self.connector.id();
+        Box::pin(async move { Ok(EffortOutcome::ManagedByConnector { id }) })
     }
 
     fn info(&self) -> DriverInfo {

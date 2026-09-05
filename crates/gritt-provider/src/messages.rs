@@ -86,6 +86,9 @@ impl MessagesAdapter {
             if !state.tools.is_empty() {
                 body["tools"] = serde_json::Value::Array(state.tools.clone());
             }
+            // Only the legacy switch reaches the wire: an explicit effort
+            // has no mapping that is safe for every Anthropic model, so
+            // `send` refuses it before anything is built (see `effort`).
             if state.options.reasoning == Some(true) {
                 body["thinking"] = serde_json::json!({
                     "type": "enabled",

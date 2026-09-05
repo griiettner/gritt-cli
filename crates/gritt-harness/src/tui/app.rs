@@ -493,6 +493,7 @@ impl App {
             gritt_core::session::SessionKind::Native {
                 provider_profile,
                 model,
+                ..
             } => {
                 self.status.profile = provider_profile.clone();
                 self.status.model = model.clone();
@@ -634,6 +635,7 @@ mod tests {
             kind: gritt_core::session::SessionKind::Native {
                 provider_profile: "p".into(),
                 model: "m".into(),
+                effort: Default::default(),
             },
             phase: Phase::Coding,
             workspace: "/ws".into(),

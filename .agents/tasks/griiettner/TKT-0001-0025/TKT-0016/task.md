@@ -3,7 +3,7 @@ id: TKT-0016
 namespace: griiettner
 title: Define model, effort, session-draft, and provider setup contracts
 artifact: task
-status: ready
+status: done
 owner: griiettner
 created: 2026-09-04
 updated: 2026-09-04

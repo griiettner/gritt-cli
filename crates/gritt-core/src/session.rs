@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::connector::ConnectorId;
 use crate::event::Event;
+use crate::provider::ReasoningEffort;
 use crate::Result;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -19,9 +20,14 @@ pub struct SessionId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionKind {
+    /// Pinned to a profile and model for its whole life. Effort is the one
+    /// native setting that changes between turns; it defaults to `Auto` for
+    /// sessions stored before the field existed.
     Native {
         provider_profile: String,
         model: String,
+        #[serde(default)]
+        effort: ReasoningEffort,
     },
     Connector {
         id: ConnectorId,
@@ -33,6 +39,17 @@ pub enum SessionKind {
 pub enum Phase {
     Planning,
     Coding,
+}
+
+impl SessionKind {
+    /// The native effort, `None` for a connector session (managed by the
+    /// external agent).
+    pub fn effort(&self) -> Option<ReasoningEffort> {
+        match self {
+            SessionKind::Native { effort, .. } => Some(*effort),
+            SessionKind::Connector { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,4 +94,48 @@ pub trait SessionStore: Send + Sync {
     ) -> BoxFuture<'_, Result<()>>;
     fn load_continuation(&self, id: &SessionId)
         -> BoxFuture<'_, Result<Option<ContinuationState>>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connector::ConnectorId;
+
+    #[test]
+    fn native_sessions_stored_without_effort_load_as_auto() {
+        let old = serde_json::json!({
+            "kind": "native", "provider_profile": "openrouter", "model": "openai/gpt-5-nano"
+        });
+        let kind: SessionKind = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            kind,
+            SessionKind::Native {
+                provider_profile: "openrouter".into(),
+                model: "openai/gpt-5-nano".into(),
+                effort: ReasoningEffort::Auto,
+            }
+        );
+        assert_eq!(kind.effort(), Some(ReasoningEffort::Auto));
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["effort"], "auto");
+        assert_eq!(serde_json::from_value::<SessionKind>(json).unwrap(), kind);
+    }
+
+    #[test]
+    fn explicit_effort_round_trips_and_connectors_have_none() {
+        let native = SessionKind::Native {
+            provider_profile: "openai".into(),
+            model: "gpt-5-nano".into(),
+            effort: ReasoningEffort::High,
+        };
+        let text = serde_json::to_string(&native).unwrap();
+        assert!(text.contains("\"effort\":\"high\""));
+        assert_eq!(serde_json::from_str::<SessionKind>(&text).unwrap(), native);
+        let connector = SessionKind::Connector {
+            id: ConnectorId::Codex,
+        };
+        assert_eq!(connector.effort(), None);
+        let text = serde_json::to_string(&connector).unwrap();
+        assert!(!text.contains("effort"));
+    }
 }

@@ -5,6 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use gritt_core::event::Event;
+use gritt_core::provider::ReasoningEffort;
 use gritt_core::session::{
     BoxFuture, ContinuationState, Phase, Session, SessionId, SessionKind, SessionStore,
 };
@@ -62,6 +63,43 @@ impl Store {
             .execute(
                 "UPDATE gritt_sessions SET phase = ?1, updated_at = ?2 WHERE id = ?3",
                 turso::params![phase_name(phase), Utc::now().to_rfc3339(), id.0.clone()],
+            )
+            .await
+            .map_err(storage_error)?;
+        Ok(())
+    }
+
+    /// Updates a native session's effort and bumps `updated_at`. A
+    /// connector session has no native effort and is refused.
+    pub async fn set_native_effort(&self, id: &SessionId, effort: ReasoningEffort) -> Result<()> {
+        let session = self
+            .get(id)
+            .await?
+            .ok_or_else(|| Error::storage(format!("no session with id `{}`", id.0)))?;
+        let kind = match session.kind {
+            SessionKind::Native {
+                provider_profile,
+                model,
+                ..
+            } => SessionKind::Native {
+                provider_profile,
+                model,
+                effort,
+            },
+            SessionKind::Connector { id } => {
+                return Err(Error::config(format!(
+                    "session `{}` runs on connector {}, which manages its own effort",
+                    session.name,
+                    id.as_str()
+                )));
+            }
+        };
+        let kind =
+            serde_json::to_string(&kind).map_err(|error| Error::storage(error.to_string()))?;
+        self.connection()
+            .execute(
+                "UPDATE gritt_sessions SET kind = ?1, updated_at = ?2 WHERE id = ?3",
+                turso::params![kind, Utc::now().to_rfc3339(), id.0.clone()],
             )
             .await
             .map_err(storage_error)?;
@@ -395,6 +433,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rows_stored_before_effort_existed_load_as_auto() {
+        let (_dir, store) = store().await;
+        let now = Utc::now().to_rfc3339();
+        store
+            .connection()
+            .execute(
+                &format!("INSERT INTO gritt_sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
+                turso::params![
+                    "old",
+                    "old-name",
+                    r#"{"kind":"native","provider_profile":"openrouter","model":"openai/gpt-5-nano"}"#,
+                    "planning",
+                    "/tmp/ws",
+                    Option::<String>::None,
+                    now.clone(),
+                    now
+                ],
+            )
+            .await
+            .unwrap();
+        let session = store.get(&SessionId("old".into())).await.unwrap().unwrap();
+        assert_eq!(session.kind.effort(), Some(ReasoningEffort::Auto));
+    }
+
+    #[tokio::test]
     async fn native_and_connector_sessions_round_trip() {
         let (_dir, store) = store().await;
         let native = session(
@@ -402,6 +465,7 @@ mod tests {
             SessionKind::Native {
                 provider_profile: "openrouter".into(),
                 model: "openai/gpt-5-nano".into(),
+                effort: ReasoningEffort::Auto,
             },
         );
         let connector = session(
@@ -477,6 +541,19 @@ mod tests {
             store.get(&native.id).await.unwrap().unwrap().phase,
             Phase::Coding
         );
+        store
+            .set_native_effort(&native.id, ReasoningEffort::High)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&native.id).await.unwrap().unwrap().kind.effort(),
+            Some(ReasoningEffort::High)
+        );
+        let refused = store
+            .set_native_effort(&connector.id, ReasoningEffort::Low)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind, gritt_core::ErrorKind::Config);
         assert_eq!(store.told_phase(&native.id).await.unwrap(), None);
         store
             .set_told_phase(&native.id, Some(Phase::Planning))

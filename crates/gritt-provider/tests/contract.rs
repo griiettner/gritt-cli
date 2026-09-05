@@ -901,3 +901,275 @@ async fn a_dropped_unpolled_stream_leaves_no_warning_after_a_messages_refusal() 
         "stale capability warning from the unpolled stream leaked into the continuation"
     );
 }
+
+#[tokio::test]
+async fn explicit_effort_reaches_each_protocol_in_its_own_shape() {
+    use gritt_core::provider::ReasoningEffort;
+
+    // Responses documents `reasoning.effort`; no list evidence is needed.
+    let (context, transport, _) = make_context(
+        Protocol::Responses,
+        vec![sse(Protocol::Responses, "stream-text.sse")],
+        32,
+    );
+    let adapter = adapter_for(context);
+    let mut request = prompt(Protocol::Responses, false);
+    request.options.effort = ReasoningEffort::High;
+    collect(adapter.send(request).await.unwrap()).await;
+    let body = transport.requests()[0].body_json().unwrap();
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["reasoning"]["summary"], "auto");
+
+    // Chat Completions sends the OpenRouter form once the list reports
+    // reasoning support for the model.
+    let (context, transport, _) = make_context_with(
+        Protocol::ChatCompletions,
+        vec![sse(Protocol::ChatCompletions, "stream-text.sse")],
+        32,
+        Arc::new(FixedCapabilities(ModelCapabilities {
+            reasoning: Some(true),
+            ..Default::default()
+        })),
+    );
+    let adapter = adapter_for(context);
+    let mut request = prompt(Protocol::ChatCompletions, false);
+    request.options.effort = ReasoningEffort::Low;
+    collect(adapter.send(request).await.unwrap()).await;
+    let body = transport.requests()[0].body_json().unwrap();
+    assert_eq!(body["reasoning"], serde_json::json!({ "effort": "low" }));
+
+    // `auto` sends nothing on every protocol.
+    for protocol in PROTOCOLS {
+        let (context, transport, _) = make_context_with(
+            protocol,
+            vec![sse(protocol, "stream-text.sse")],
+            32,
+            Arc::new(FixedCapabilities(ModelCapabilities {
+                reasoning: Some(true),
+                ..Default::default()
+            })),
+        );
+        let adapter = adapter_for(context);
+        let mut request = prompt(protocol, false);
+        request.options.effort = ReasoningEffort::Auto;
+        collect(adapter.send(request).await.unwrap()).await;
+        let body = transport.requests()[0].body_json().unwrap();
+        assert!(body.get("reasoning").is_none(), "{protocol:?}");
+        assert!(body.get("thinking").is_none(), "{protocol:?}");
+    }
+}
+
+#[tokio::test]
+async fn legacy_reasoning_switch_enables_the_provider_default_level_instead_of_medium() {
+    let (context, transport, _) = make_context(
+        Protocol::Responses,
+        vec![sse(Protocol::Responses, "stream-text.sse")],
+        32,
+    );
+    let adapter = adapter_for(context);
+    let mut request = prompt(Protocol::Responses, false);
+    request.options.reasoning = Some(true);
+    collect(adapter.send(request).await.unwrap()).await;
+    let body = transport.requests()[0].body_json().unwrap();
+    assert_eq!(body["reasoning"], serde_json::json!({ "summary": "auto" }));
+
+    let (context, transport, _) = make_context_with(
+        Protocol::ChatCompletions,
+        vec![sse(Protocol::ChatCompletions, "stream-text.sse")],
+        32,
+        Arc::new(FixedCapabilities(ModelCapabilities {
+            reasoning: Some(true),
+            ..Default::default()
+        })),
+    );
+    let adapter = adapter_for(context);
+    let mut request = prompt(Protocol::ChatCompletions, false);
+    request.options.reasoning = Some(true);
+    collect(adapter.send(request).await.unwrap()).await;
+    let body = transport.requests()[0].body_json().unwrap();
+    assert_eq!(body["reasoning"], serde_json::json!({ "enabled": true }));
+
+    let (context, transport, _) = make_context(
+        Protocol::Messages,
+        vec![sse(Protocol::Messages, "stream-text.sse")],
+        32,
+    );
+    let adapter = adapter_for(context);
+    let mut request = prompt(Protocol::Messages, false);
+    request.options.reasoning = Some(true);
+    collect(adapter.send(request).await.unwrap()).await;
+    let body = transport.requests()[0].body_json().unwrap();
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["thinking"]["budget_tokens"], 1024);
+}
+
+#[tokio::test]
+async fn explicit_effort_without_a_safe_mapping_is_refused_with_a_typed_reason() {
+    use gritt_core::provider::ReasoningEffort;
+
+    // Messages: refused by protocol even when the list reports reasoning.
+    let (context, transport, _) = make_context_with(
+        Protocol::Messages,
+        vec![],
+        16,
+        Arc::new(FixedCapabilities(ModelCapabilities {
+            reasoning: Some(true),
+            ..Default::default()
+        })),
+    );
+    let adapter = adapter_for(context);
+    let mut request = prompt(Protocol::Messages, false);
+    request.options.effort = ReasoningEffort::Medium;
+    let error = adapter.send(request).await.err().expect("refusal");
+    assert_eq!(error.kind, ErrorKind::UnsupportedCapability);
+    assert!(error.message.contains("Messages"));
+    let diagnostic = error.diagnostic.clone().unwrap();
+    assert_eq!(diagnostic["unsupported_effort"]["reason"], "protocol");
+    assert_eq!(diagnostic["effort"], "medium");
+    assert_eq!(transport.request_count(), 0);
+
+    // Chat Completions: refused when the list does not report reasoning.
+    let (context, transport, _) = make_context(Protocol::ChatCompletions, vec![], 16);
+    let adapter = adapter_for(context);
+    let mut request = prompt(Protocol::ChatCompletions, false);
+    request.options.effort = ReasoningEffort::High;
+    let error = adapter.send(request).await.err().expect("refusal");
+    assert_eq!(error.kind, ErrorKind::UnsupportedCapability);
+    assert_eq!(
+        error.diagnostic.unwrap()["unsupported_effort"]["reason"],
+        "reasoning_not_reported"
+    );
+    assert_eq!(transport.request_count(), 0);
+
+    // Any protocol: a level the list does not offer, or a model the list
+    // marks as non-reasoning, is refused before the request.
+    for protocol in [Protocol::Responses, Protocol::ChatCompletions] {
+        let (context, transport, _) = make_context_with(
+            protocol,
+            vec![],
+            16,
+            Arc::new(FixedCapabilities(ModelCapabilities {
+                reasoning: Some(true),
+                reasoning_efforts: Some(vec![ReasoningEffort::Low]),
+                ..Default::default()
+            })),
+        );
+        let adapter = adapter_for(context);
+        let mut request = prompt(protocol, false);
+        request.options.effort = ReasoningEffort::High;
+        let error = adapter.send(request).await.err().expect("refusal");
+        assert_eq!(error.kind, ErrorKind::UnsupportedCapability, "{protocol:?}");
+        assert_eq!(
+            error.diagnostic.unwrap()["unsupported_effort"]["reason"],
+            "level_not_offered"
+        );
+        assert_eq!(transport.request_count(), 0);
+    }
+    let (context, transport, _) = make_context_with(
+        Protocol::Responses,
+        vec![],
+        16,
+        Arc::new(FixedCapabilities(ModelCapabilities {
+            reasoning: Some(false),
+            ..Default::default()
+        })),
+    );
+    let adapter = adapter_for(context);
+    let mut request = prompt(Protocol::Responses, false);
+    request.options.effort = ReasoningEffort::Low;
+    let error = adapter.send(request).await.err().expect("refusal");
+    assert_eq!(error.kind, ErrorKind::UnsupportedCapability);
+    assert_eq!(transport.request_count(), 0);
+
+    // A contradictory request (effort with reasoning switched off) is a
+    // caller error on every protocol and never reaches the wire.
+    for protocol in PROTOCOLS {
+        let (context, transport, _) = make_context(protocol, vec![], 16);
+        let adapter = adapter_for(context);
+        let mut request = prompt(protocol, false);
+        request.options.reasoning = Some(false);
+        request.options.effort = ReasoningEffort::Low;
+        let error = adapter.send(request).await.err().expect("refusal");
+        assert_eq!(error.kind, ErrorKind::Config, "{protocol:?}");
+        assert_eq!(transport.request_count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn effort_survives_continuation_and_old_state_restores_as_auto() {
+    use gritt_core::provider::ReasoningEffort;
+    use gritt_core::session::ContinuationState;
+
+    let (context, transport, _) = make_context(
+        Protocol::Responses,
+        vec![
+            sse(Protocol::Responses, "stream-tool-call.sse"),
+            sse(Protocol::Responses, "stream-tool-result.sse"),
+        ],
+        32,
+    );
+    let adapter = adapter_for(context);
+    let mut request = prompt(Protocol::Responses, true);
+    request.options.effort = ReasoningEffort::High;
+    collect(adapter.send(request).await.unwrap()).await;
+    let state = adapter.continuation().await.unwrap().unwrap();
+    assert_eq!(state.state["options"]["effort"], "high");
+    collect(
+        adapter
+            .submit_tool_results(vec![ToolResult {
+                call_id: ToolCallId("call_1".into()),
+                name: "file_read".into(),
+                is_error: false,
+                output: "ok".into(),
+            }])
+            .await
+            .unwrap(),
+    )
+    .await;
+    let second = transport.requests()[1].body_json().unwrap();
+    assert_eq!(second["reasoning"]["effort"], "high");
+
+    // State written before the field existed still restores on every
+    // protocol.
+    let old_options =
+        serde_json::json!({ "max_tokens": null, "reasoning": null, "structured_output": null });
+    for (protocol, owner, state) in [
+        (
+            Protocol::Responses,
+            "responses",
+            serde_json::json!({
+                "previous_response_id": "resp_old", "model": "gpt-5-nano", "tools": [],
+                "options": old_options, "sequence": 3
+            }),
+        ),
+        (
+            Protocol::ChatCompletions,
+            "chat_completions",
+            serde_json::json!({
+                "messages": [{ "role": "user", "content": "hi" }], "model": "openai/gpt-5-nano",
+                "tools": [], "options": old_options, "sequence": 3
+            }),
+        ),
+        (
+            Protocol::Messages,
+            "messages",
+            serde_json::json!({
+                "system": null, "messages": [{ "role": "user", "content": "hi" }],
+                "model": "claude-sonnet-5", "tools": [], "options": old_options, "sequence": 3
+            }),
+        ),
+    ] {
+        let (context, _, _) = make_context(protocol, vec![], 32);
+        let fresh = adapter_for(context);
+        fresh
+            .restore(ContinuationState {
+                owner: owner.into(),
+                state,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{protocol:?}: {error}"));
+        let restored = fresh.continuation().await.unwrap().unwrap();
+        assert_eq!(restored.state["options"]["effort"], "auto", "{protocol:?}");
+        assert_eq!(restored.owner, owner);
+    }
+}

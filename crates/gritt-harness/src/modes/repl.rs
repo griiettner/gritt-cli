@@ -207,6 +207,7 @@ pub async fn run_repl<O: Write + Send, E: Write + Send>(
                             gritt_core::session::SessionKind::Native {
                                 provider_profile,
                                 model,
+                                ..
                             } => format!("{provider_profile}/{model}"),
                             gritt_core::session::SessionKind::Connector { id } =>
                                 id.as_str().to_owned(),
