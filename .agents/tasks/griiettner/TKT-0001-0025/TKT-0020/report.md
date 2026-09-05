@@ -40,13 +40,13 @@ exposed are fixed.
 
 Most of the plan's budgets are met. Two are not, and both are named rather
 than softened: the resident-memory plateau over a five-minute soak, and
-input-to-frame under a saturating 1,000 deltas a second, which sits at the
-50 ms budget and crosses it about as often as not. Both have the same cause,
+input-to-frame under a saturating 1,000 deltas a second, which misses the
+50 ms budget by 1.3 to 1.6 times. Both have the same cause,
 the renderer materializing every transcript entry on each rebuild with no
 history paging, so memory tracks the transcript and a frame costs what the
 whole transcript costs. The full table and the measurement method are under
 [Benchmarks](#benchmarks); the numbers there come from the production
-scheduler, after two rounds of review corrected how they were obtained.
+scheduler, after three rounds of review corrected how they were obtained.
 
 Six fixes landed, all of them responsiveness, startup-correctness, or
 secret-accuracy defects the plan names as acceptance requirements, three of
@@ -270,12 +270,12 @@ above. There are three harnesses and they do not carry equal weight.
 | Typing, input to frame (idle transcript, micro) | p95 below 50 ms | p50 2.155 ms, **p95 2.271 ms**, n=500 | **MET** |
 | Picker navigation (micro) | p95 below 50 ms | p50 2.492 ms, **p95 2.660 ms**, n=500 | **MET** |
 | Scrolling (micro) | p95 below 50 ms | p50 2.171 ms, **p95 2.306 ms**, n=500 | **MET** |
-| Input to frame under 1,000 deltas/s (integrated) | p95 below 50 ms | p50 19.8 to 29.4 ms, **p95 48.9 to 51.1 ms over six runs** | **NOT MET**, at the budget and over it more often than not |
-| Sustained output, delta drain rate (integrated) | keep up with 1,000/s | **954 to 969/s** | **MET** |
+| Input to frame under 1,000 deltas/s (integrated) | p95 below 50 ms | p50 40.9 to 47.7 ms, **p95 66.6 to 78.9 ms over four runs**, max 70 to 98 ms | **NOT MET**, by 1.3 to 1.6x |
+| Sustained output, delta drain rate (integrated) | keep up with 1,000/s | **959 to 969/s** | **MET** |
 | Sustained output, render work at 120x40 (micro) | p95 below 16 ms | p50 14.511 ms, **p95 15.083 ms**, n=686 | **MET**, by 0.9 ms |
-| Render cap under load (integrated) | 30 fps | **19 fps**, 192 frames in 10 s | **MET** |
+| Render cap under load (integrated) | 30 fps | **19 to 20 fps**, 203 frames in 10 s | **MET** |
 | Bounded queues under load (integrated) | bounded, nothing dropped | largest batch drained in one step **52**, final **0** | **MET** |
-| Cancel under load (integrated) | visible canceling state within 100 ms | **27.9 to 52.0 ms** from Escape queued to the frame after the turn's token fired | **MET** |
+| Cancel under load (integrated) | visible canceling state within 100 ms | **21.6 to 49.7 ms** from Escape queued to the first frame drawn after the turn's token fired | **MET** |
 | Idle CPU over 30 s | below 1% of one core | **0.2%** | **MET** |
 | Idle screen, no continuous full redraw | no redraw | **0 bytes** over 30 idle seconds | **MET** |
 | Resident memory plateau over a five-minute soak | a stable plateau | baseline 38,800 KiB, peak **762,336 KiB**; middle third 532,352 KiB, last third 762,336 KiB | **NOT MET** |
@@ -285,10 +285,19 @@ Two budgets are missed. Both are named below rather than softened.
 The integrated rows come from `Scheduler::step`, the loop's own iteration,
 driven against a `TestBackend` with input queued onto the same channel the
 key reader thread writes to. Input latency is timed from the moment a key is
-**queued**, so its scheduling wait is inside the number, and the
-cancellation is a real Escape delivered through that channel while the
-stream is still producing. An earlier version of this report measured a
-reimplementation of the scheduler and was rejected for it.
+**queued**, so its scheduling wait is inside the number, and completed by
+the first frame drawn *after* the key was handled. That last part matters:
+`step` draws before it takes input, so the frame a step produces shows the
+state as of the previous step and cannot be credited with what the same step
+went on to handle. `a_step_draws_before_it_handles_input` guards that
+ordering. Cancellation is a real Escape delivered through the same channel
+while the stream is still producing, completed the same way.
+
+Two earlier versions of this report were rejected for measuring something
+else: the first reimplemented the scheduler, and the second credited input
+to a frame that preceded it. The numbers above are from the third
+measurement and are materially worse than the second's, which is the point
+of having been corrected.
 
 ### What the loop fixes changed
 
@@ -322,9 +331,11 @@ why the queue grew.
 
 ### The two misses, stated specifically
 
-**Input to frame under sustained load: p95 between 48.9 and 51.1 ms across
-six runs, against a 50 ms budget.** It sits on the line, clearing it in two
-runs of six, so it is recorded as missed rather than met. One cycle is a coalesced drain
+**Input to frame under sustained load: p95 between 66.6 and 78.9 ms across
+four runs, against a 50 ms budget.** A clear miss, 1.3 to 1.6 times over.
+The earlier figure of about 50 ms was an artefact of crediting a keystroke
+to a frame drawn before it was handled; corrected, the median alone is
+40.9 to 47.7 ms. One cycle is a coalesced drain
 of about fifty deltas plus one frame, and the frame is a full-transcript
 rebuild; a keypress waits for the cycle in progress. The load is 1,000 deltas
 per second, roughly ten to twenty times what a provider actually streams, and
@@ -410,16 +421,22 @@ follow-up 2.
    before any entry was published, so the interface said no servers were
    configured. Opening moved into the interface, and a failure arrives as a
    message that shows the configuration error.
-6. **Approvals could be accepted before being displayed**
+6. **Approvals could be accepted before being displayed, and a second
+   approval could inherit the first's visibility**
    (`crates/gritt-harness/src/tui/run.rs`). Found in the second review, and
    introduced by fix 3: the frame cap could suppress the frame after an
    approval arrived, so a keystroke landing in that window approved a tool
    call or an MCP launch that was never drawn. The cap now yields to an
    undrawn approval, and a decision key is refused until the prompt has been
-   on screen once. Guarded by
-   `an_approval_is_drawn_before_a_decision_key_is_accepted`, which pauses the
-   clock so the cap is engaged deterministically and fails with the guard
-   removed.
+   on screen once. Visibility is tracked by the request's install identity
+   rather than by whether anything is pending, because one iteration can
+   answer A and install B during its drain, leaving `pending` `Some`
+   throughout: with a flag, B would have inherited A's visibility. Guarded
+   by `an_approval_is_drawn_before_a_decision_key_is_accepted` and
+   `a_second_approval_does_not_inherit_the_first_one_s_visibility`, both on
+   a paused clock so the cap is engaged deterministically, both verified to
+   fail with the guard removed, and both asserting the legitimate decision
+   still reaches its responder.
 7. **An overstated secret guarantee in a doc comment**
    (`crates/gritt-harness/src/mcp/mod.rs`). `definition_summary` claimed a
    value reaching an *argument* through `${TOKEN}` could not be echoed. It
@@ -537,8 +554,8 @@ exit status 0. The configured key string appeared nowhere in either stream.
   `Scheduler::step` rather than from a copy of it; the single `.mcp.json`
   entry has an honest result; full validation is green. Two of the plan's
   budgets are not met: the resident-memory plateau, and input-to-frame under
-  a sustained 1,000 deltas per second, which measures p95 between 49.5 and
-  51.1 ms against a 50 ms budget across five runs. Both have the same cause, named in follow-up 1. The plan's own
+  a sustained 1,000 deltas per second, which measures p95 between 66.6 and
+  78.9 ms against a 50 ms budget across four runs. Both have the same cause, named in follow-up 1. The plan's own
   acceptance criterion permits a recorded run that "identifies specific
   remaining performance gaps". **One verification is outstanding rather than
   failed: the real-terminal walkthrough by a human has not been performed.**

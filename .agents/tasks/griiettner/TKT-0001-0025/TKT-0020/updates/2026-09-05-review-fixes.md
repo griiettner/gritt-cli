@@ -336,3 +336,112 @@ Unchanged. Follow-up 1 now accounts for three separate results: the memory
 plateau, the render-work margin, and the input-under-load figure sitting on
 its budget. The human real-terminal walkthrough is still outstanding and is
 still the chain's to close.
+
+---
+
+# Round 3
+
+## Trigger
+
+Third reviewer verdict `needs-fix` on PR #12 at `c2548d5`: two High and one
+Medium, all confirmed. The pending-catalog fixture, the scheduler
+extraction, the discard guard for a drawn approval, and the dev-only tokio
+feature were all accepted.
+
+Both High findings were about the same kind of mistake in two places:
+tracking a proxy for the thing that matters instead of the thing itself.
+
+## Finding 1: a second approval could inherit the first one's visibility
+
+**What was wrong.** The guard added in round 2 tracked whether *an* approval
+had been drawn, not *which* one. A single iteration can answer A and install
+B during its coalescing drain, because the turn that receives A's decision
+enqueues B from another worker. `pending` is `Some` before and after, so the
+flag stayed set, the cap suppressed B's frame, and the next decision key
+answered a prompt that had never been drawn.
+
+**What landed.** `App` now stamps each installed request with a counter and
+exposes `pending_install()`; both install sites go through one method so a
+new request cannot be installed without a new identity. The scheduler holds
+`drawn_approval: Option<u64>` and compares identities, so a request that
+replaced an answered one is undrawn even though `pending` never became
+`None`.
+
+**Regressions.** `a_second_approval_does_not_inherit_the_first_one_s_visibility`
+drives one step that answers A and installs B, then queues the next
+decision key, on a paused clock. It asserts B is drawn on its own account
+and that A's decision reached A's responder. Verified to fail with identity
+replaced by presence: "B inherited A's visibility". Both approval tests now
+also assert the legitimate decision **is** delivered, so the guard cannot
+pass by swallowing the key instead of delaying it.
+
+## Finding 2: latency credited to a frame that preceded the input
+
+**What was wrong.** `step` draws before it takes input and drains messages,
+so the frame a step produces shows the state as of the end of the previous
+step. The benchmark credited every timestamp available when `step` returned
+to that step's frame, so a key consumed after the draw, or still queued,
+counted as displayed. The cancellation number had the same flaw.
+
+**What landed.** Attribution is now ordered against that fact: a drawn frame
+first completes whatever earlier steps handled, and only then is what this
+step handled recorded as waiting for a later frame. Typed keys are counted
+by what actually reached the composer, so the one-off Escape is never
+mistaken for one. `a_step_draws_before_it_handles_input` is the deterministic
+guard: it asserts a step that both draws and takes a key produces a frame
+**without** that key on it, and that the key was nonetheless applied.
+
+**Revised numbers.** The correction made the result substantially worse,
+which is why it mattered:
+
+| Measure | Round 2 (mis-attributed) | Round 3 (corrected) |
+| --- | --- | --- |
+| Input to frame under load, p50 | 19.8 to 29.4 ms | **40.9 to 47.7 ms** |
+| Input to frame under load, p95 | 48.9 to 51.1 ms, "on the line" | **66.6 to 78.9 ms, NOT MET by 1.3 to 1.6x** |
+| Cancel under load | 27.9 to 52.0 ms | **21.6 to 49.7 ms**, still MET |
+
+The budget is now missed clearly rather than marginally. The cause is
+unchanged and is follow-up 1: one cycle is a coalesced drain plus a
+full-transcript frame, and a keystroke waits for the cycle in progress.
+
+## Finding 3: idle startup still inherited the user configuration layer
+
+**What was wrong.** An empty project `config.toml` does not produce an empty
+configuration. The user layer is loaded underneath it and `merge` extends the
+profile map rather than replacing it, so a developer's own profiles still
+reached `profile_summaries` and its keychain calls, and user defaults could
+have invalidated the unconfigured-composer expectation.
+
+**What landed.** Every benchmark child now runs with `HOME` and the `XDG_*`
+directories pointed at a fresh empty temp directory, which is what
+`dirs::config_dir()` and `dirs::cache_dir()` are derived from, so the user
+config layer and the model cache are both out of the picture. The idle tests
+verify the result rather than assuming it: `assert_no_profiles_resolve` runs
+`gritt doctor` under the same environment and asserts no profile line
+appears, which is the evidence that nothing will reach the keychain.
+
+## Validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, no warnings |
+| `cargo test --workspace --no-fail-fast` | 497 passed, 0 failed |
+| `cargo test --manifest-path .agents/cli/Cargo.toml` | 107 passed, 0 failed |
+| `cargo test -p gritt --test tui_pty` | 13 passed, 0 failed |
+| `GRITT_LIVE_MCP_TESTS=1 ... mcp_live_smoke` | 1 passed; `gritt` ready, 3 tools |
+| `GRITT_LIVE_CONNECTOR_TESTS=1 ... live` | 3 passed |
+| `GRITT_LIVE_TESTS=1 -p gritt-provider --test live` | 3 skipped honestly |
+| `GRITT_BENCH=1 ... --test tui_load` (release) | 1 passed |
+| `GRITT_BENCH=1 ... --test tui_responsiveness` (release) | 6 passed |
+| `GRITT_BENCH=1 ... --test tui_bench` (release) | 5 passed |
+
+Workspace tests moved from 495 to 497: the second-approval transition and the
+draw-order guard.
+
+## Remaining follow-up
+
+Unchanged. Follow-up 1 now accounts for the memory plateau, the render-work
+margin, and an input-under-load figure that misses its budget outright rather
+than sitting on it. The human real-terminal walkthrough is still outstanding
+and is still the chain's to close.
