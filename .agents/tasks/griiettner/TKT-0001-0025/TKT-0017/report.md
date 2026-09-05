@@ -273,6 +273,12 @@ check guarantees: Gritt issues no `tools/call`. It does not and cannot
 promise a server writes nothing during its own startup — this one indexes its
 memory database when it starts, as the edge case below records.
 
+That entry also holds an exclusive lock on the worktree's memory database, so
+only one instance can run at a time and the check fails while another
+`gritt-agent mcp serve` holds it, including one started by a reviewer in the
+same worktree. That is an environment collision rather than a defect; rerun
+once the other process has exited.
+
 New tests, one per stated behavior. Core: a missing `mcpServers` object,
 malformed JSON that does not echo its content, an inferred stdio entry with
 verbatim arguments, isolation of a bad entry beside healthy ones,
@@ -290,7 +296,8 @@ the 4 native-session cases listed in the commit messages.
 
 ## Completion Gate
 
-- **Acceptance**: yes, after the review fixes recorded in the update below.
+- **Acceptance**: yes, after the two rounds of review fixes recorded in the
+  update below.
   Every configured entry has a state and a non-empty explanation; supported
   servers initialize and list tools; a turn calls the exact tool identity it
   was authorized for; a denied call never reaches a server, proven by a
@@ -308,7 +315,8 @@ the 4 native-session cases listed in the commit messages.
   fields on the shared HTTP transport and one new policy default are the
   durable contract changes; both are noted below.
 - **Validation**: every check above passed; nothing was skipped except the
-  pre-existing live provider tests, which need keys.
+  pre-existing live provider tests, which need keys. The final figures after
+  round 2 are 319 workspace tests over three consecutive runs.
 - **Security and safety**: the change adds process launching and network
   access, both gated. Reading the file authorizes nothing; a definition runs
   only after an explicit approval keyed to its fingerprint. Children get an
@@ -375,4 +383,10 @@ the 4 native-session cases listed in the commit messages.
   lifecycle results, frozen tool identity on dispatch, bounded writes and
   input, process-group cleanup past the direct child, owned HTTP request
   tasks, the HTTP initialization barrier and server-request answers, and
-  backend-driven MCP startup.
+  backend-driven MCP startup. Round 2, appended to the same file: credentials
+  scoped to a connection so a token rotation cannot expose a retained one,
+  shutdown owning in-flight initialization, signal cleanup on every launching
+  CLI path, generation-checked trust reads, cancellable queue admission, owned
+  HTTP notification and reply tasks, compliant server-request replies, input
+  limits without framing bypasses, and backend prediction aligned with
+  `ControlPlane::open`.

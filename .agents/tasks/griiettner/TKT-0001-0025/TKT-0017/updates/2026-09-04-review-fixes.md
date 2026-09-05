@@ -213,3 +213,138 @@ tests, one to core, and one to the binary.
 Unchanged from `report.md`, plus: there is still no lifecycle event
 subscription, so TKT-0019 polls `snapshots()`. Defining that delivery is the
 cheapest remaining improvement for the TUI step.
+
+---
+
+# 2026-09-05 Round 2 review fixes
+
+## Trigger
+
+The re-review of PR #9 returned `needs-fix` again: 3 High and 6 Medium, all
+confirmed. Findings 5 and 7 from round 1 were confirmed fixed; the other nine
+were partial. The theme was that round 1 fixed the named symptom but left the
+same class of hole one step further out: credentials were redacted but tied to
+the file rather than the connection, shutdown owned installed connections but
+not the ones still being built, and the CLI cleaned up two of its four
+launching paths.
+
+## Changes per finding
+
+**1. High — credentials belong to a connection, not to the file.** `load`
+replaced the whole redaction set while retaining a ready connection by raw
+fingerprint. Rotating `${TOKEN}` leaves the definition, and therefore the
+fingerprint, unchanged, so the process kept running with token A while only
+token B was redacted. `ServerRuntime` now carries the credentials its running
+connection was launched with; they retire with the connection. `call`,
+`refresh`, `discover`, and `mark_lost` all redact against the entry's own set
+rather than a global one, and `configured_secrets` became the per-definition
+`entry_secrets`. `rotating_a_token_keeps_redacting_what_the_running_server_
+still_holds` asserts the connection is retained, the process is not restarted,
+and the first token is still redacted out of both a result and an error.
+
+**2. High — shutdown owns initialization work.** A connection created inside
+an in-flight handshake existed only in that future, so shutdown could return
+while its child was alive and the signal handler would then call
+`process::exit`. Connections are now registered in `RuntimeState.launching`
+the moment they exist and released when the handshake resolves; shutdown sets
+a `closing` flag, closes the launching connections alongside the installed
+ones, and waits for the map to drain. A launch that starts after `closing` is
+closed instead of installed. `shutdown_during_startup_takes_the_children_with_
+it` runs one server that becomes ready and one that never answers, interrupts
+mid-handshake, and asserts both processes are gone by pid and that nothing was
+installed afterwards.
+
+**3. High — signal cleanup on every launching path.** TUI mode started MCP
+before raw mode with no handler installed, and `gritt mcp list` and `gritt mcp
+trust` had none at all. Both now install the cleanup-aware handler before the
+first launch. `interrupting_mcp_startup_leaves_no_server_running` in
+`crates/gritt/tests/e2e.rs` runs `gritt mcp trust` against a server that never
+speaks MCP, sends SIGINT during initialization, and asserts both a 130 exit
+and that the server process is gone. Without the handler the process dies by
+signal rather than exiting 130, so the test fails on the unfixed code.
+
+**4. Medium — stale trust reads.** `restart` and `decide` checked only the
+fingerprint after awaiting the trust store, and a concurrent denial or stop
+preserves the fingerprint. Both now capture the lifecycle generation before
+the await and refuse to apply an answer whose generation no longer matches.
+`a_lifecycle_change_during_a_slow_trust_read_wins` holds a trust read open
+with a paused store, stops the server underneath it, and asserts the stale
+approval is refused and the server stays stopped.
+
+**5. Medium — cancellable queue admission.** Admission now checks
+cancellation first and races the enqueue against the token, so a cancelled
+request cannot wait for capacity and then still be written. Giving up sends
+the abort before the notification and both use a short deadline, so
+cancellation is not delayed by its own bookkeeping. Both transports remember
+abandoned ids, so a request whose abort overtook it is dropped rather than
+sent. `a_blocked_writer_neither_hangs_callers_nor_shutdown` now makes the
+server go deaf only after it is ready, fills the pipe with 200 concurrent
+64 KiB calls, asserts they all come back as errors rather than hanging, and
+asserts shutdown is still prompt and the child gone.
+
+**6. Medium — all HTTP work is owned.** Notification POSTs and server-request
+replies were detached and invisible to shutdown. Both now go through
+`Endpoint::spawn_auxiliary`, which keeps the handle, and shutdown aborts and
+awaits them alongside the request tasks. Auxiliary POSTs have their own small
+semaphore, separate from the request budget, because a reply is produced while
+a request permit is held. `a_stalled_notification_cannot_hold_up_shutdown`
+cancels a call against an endpoint that accepts the cancellation notification
+and never answers it, then asserts shutdown still completes promptly.
+
+**7. Medium — compliant server-request replies.** Replies bypassed the POST
+helper and so omitted `Accept: application/json, text/event-stream`, which the
+transport requires on every client POST. They now go through the same helper
+as every other message. `a_server_request_is_answered_with_a_compliant_post`
+uses an endpoint that sends a `ping` on the discovery stream and records the
+reply, asserting the answer arrived and carried both content types, the
+session id, and the negotiated revision.
+
+**8. Medium — input limits without framing bypasses.** The stdio reader
+checked the cumulative length only on the branch with no newline, so a line
+could exceed the limit as long as its final chunk carried the terminator; the
+check now runs on both branches, with tests for a line crossing the limit in
+its terminating chunk and for one exactly at the limit. The SSE accounting
+moved into `SseBudget`, which checks before the parser is fed and computes
+what the parser still holds from the last event terminator in the chunk rather
+than resetting to zero whenever any event completed. Three unit tests cover an
+oversized event after earlier events completed, a single event larger than the
+bound, and a stream stopped by the stream bound rather than the event bound.
+
+**9. Medium — backend prediction matches session resolution.** An explicit
+connector flag bypassed the session lookup, so `--session existing-native
+--connector codex` predicted external and disabled MCP, while
+`ControlPlane::open` resolves that session as native and runs it. The session
+is now resolved first and its own kind decides; the flag only decides when
+there is no stored session. The unit expectation that encoded the opposite was
+replaced with one that states the rule and why.
+
+## Optional follow-up applied
+
+The stdio strict fixture now records that it received a *response* to the ping
+it sent, and the test asserts that marker. Sending a ping only showed the
+server asked; this shows the client answered.
+
+## Validation
+
+- `cargo fmt --all --check`: pass.
+- `cargo clippy --workspace --all-targets -- -D warnings`: pass. Three
+  `useless_vec` findings in the new budget tests were fixed before the final
+  run.
+- `cargo test --workspace --no-fail-fast`: pass, 319 tests, 0 failed, over
+  three consecutive runs.
+- `GRITT_LIVE_MCP_TESTS=1 cargo test -p gritt-harness --test mcp_live_smoke`:
+  pass. The one configured entry, `gritt`, is ready on protocol `2025-06-18`
+  with 3 tools. No tool was called.
+
+Thirteen tests were added or rewritten: six in `mcp_runtime.rs`, five unit
+tests across `mcp/stdio.rs` and `mcp/http.rs`, one in `crates/gritt/tests/
+e2e.rs`, and the strict-handshake assertion.
+
+## Notes for the record
+
+The live smoke check reads the workspace's own `.mcp.json`, whose single entry
+holds an exclusive lock on the worktree's memory database. Only one instance
+can run at a time, so the check fails while another `gritt-agent mcp serve`
+holds that lock, including one started by a reviewer in the same worktree.
+That is an environment collision, not a defect: rerun once the other process
+has exited.
