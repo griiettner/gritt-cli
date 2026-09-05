@@ -265,9 +265,9 @@ Run from `/Users/griiettner/Projects/grittflow/gritt-cli-tkt-0019`:
 | --- | --- |
 | `cargo fmt --all --check` | pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | pass |
-| `cargo test -p gritt-harness` | pass, 312 tests over 10 targets |
+| `cargo test -p gritt-harness` | pass, 313 tests over 10 targets |
 | `cargo test -p gritt --test tui_pty` | pass, 10 tests |
-| `cargo test --workspace --no-fail-fast` | pass, 477 tests, 0 failed |
+| `cargo test --workspace --no-fail-fast` | pass, 478 tests, 0 failed |
 | `GRITT_LIVE_MCP_TESTS=1 cargo test -p gritt-harness --test mcp_live_smoke` | pass, 1 test, after the note below |
 
 The live smoke check failed on its first run in this worktree with
@@ -279,7 +279,7 @@ files on a fresh worktree, measured here at 41 s before it answers
 check passed in 1.08 s. Wiring `McpRuntimeSettings` to `config.toml`
 remains TKT-0017's follow-up.
 
-New test counts: 22 reducer tests in `src/tui/app/tests.rs`, 10
+New test counts: 22 reducer tests in `src/tui/app/tests.rs`, 11
 runtime-handler tests in `src/tui/run.rs`, 11 in the new
 `tests/tui_integration.rs`, 4 PTY tests in `crates/gritt/tests/tui_pty.rs`,
 3 new snapshot screens at 5 sizes each, and 6 unit tests in
@@ -347,7 +347,7 @@ What a human should still check in a real terminal:
 
 ## Completion Gate
 
-- **Acceptance:** yes, after three rounds of review fixes. The first version was
+- **Acceptance:** yes, after four rounds of review fixes. The first version was
   overstated on three of these and the review was right: installed agents
   could not actually be selected, connector sessions could not resume, and
   late asynchronous work was only partly rejected — catalogs and scans
@@ -367,8 +367,13 @@ What a human should still check in a real terminal:
   turn completion awaited the workspace observer, so a busy blocking pool
   stopped drawing and key handling, and a single shared loading flag let
   an unrelated completion take away the ability to cancel a live MCP
-  action. Both are closed, both with tests that fail against the previous
-  code; see the update file.
+  action. Round 4 found the two the round-3 bookkeeping itself introduced:
+  a finished request stayed installed as the owner of the shared work
+  slot, which let a later request end a live MCP launch's label, and a
+  cancelled session change left its label behind to mask everything after
+  it. All closed, each with a test that fails against the previous code;
+  see the update file, whose closing note records what these four rounds
+  had in common.
 - **Scope:** yes. No new MCP protocol feature, no provider request
   mapping change, no LSP or skill execution, no visual redesign, and no
   user documentation. No cost or context figure whose source is unknown.

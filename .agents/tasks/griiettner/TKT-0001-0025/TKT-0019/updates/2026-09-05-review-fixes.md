@@ -321,3 +321,80 @@ flake did not recur in this round's runs.
 
 Unchanged. The manual terminal walkthrough by a human is still
 outstanding, and it is the chain's to close rather than this ticket's.
+
+---
+
+# Round 4
+
+## Trigger
+
+Fourth review of PR #11 at `7915a8d` returned `needs-fix` with two
+confirmed Medium findings. The round-3 observer fix and the
+catalog/restart regression were confirmed; both remaining defects are in
+the bookkeeping that round 3 introduced.
+
+## Changes per finding
+
+**1 — MCP approval left ownership that could disable launch
+cancellation.** `Runtime::spawn` ends the *previous* kind when it installs
+a new one, but nothing retired a kind when its request simply finished. A
+definition read left `work_kind` set, and because the read and the
+lifecycle action shared one `Work::Mcp`, the sequence read → approve →
+launch → `/models` ended the live launch's label as if it were the
+superseded request. After the catalog finished, `is_busy()` was false and
+Escape produced no cancellation while `runtime.mcp` was still active.
+
+Two changes, both required. `Runtime::finish_work` ends the label and
+retires the slot's ownership in one step, and every ordinary completion
+now goes through it, so a finished request cannot stay installed as owner.
+And a definition read is its own kind, `Work::McpDefinition`: it is an
+ordinary cancellable request, the lifecycle action that follows it is
+detached with its own token, and sharing one kind is what let the
+bookkeeping of the first reach the second.
+`an_approved_launch_stays_cancellable_across_a_catalog_request` drives the
+whole sequence including the definition read that the round-3 regression
+skipped.
+
+**2 — cancelling an open left a stale highest-priority label.** The
+reservation was removed without ending `Work::Open`, which is first in the
+display order, so "Opening…" or "resuming…" stayed on screen and masked
+every later request. Releasing a session change now goes through one door,
+`Runtime::release_pending_open`, which takes the reservation, aborts its
+task, clears `session_transition`, and ends the label together; cancel,
+`/new`, and the success path all use it. The one path that previously had
+no owner at all — a result whose reservation is current but whose session
+generation has moved — releases it there too, since nothing else would
+have. The lazy-open and resume cancellation tests now assert the busy
+entry disappears and `loading()` is empty.
+
+## Validation
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass, 0 errors |
+| `cargo test --workspace --no-fail-fast` | pass, 478 passed, 0 failed |
+| `cargo test -p gritt --test tui_pty` | pass, 10 passed |
+| `cargo test -p gritt-harness` | pass, 313 passed |
+| `GRITT_LIVE_MCP_TESTS=1 ... --test mcp_live_smoke` | pass, 1 passed |
+
+Both fixes were checked against the previous code by simulating it: the
+approval test fails with "a finished request stayed installed as the owner
+of the slot", and the lazy-open cancellation test fails with "the
+cancelled open left its label behind".
+
+## A note on the shape of these four rounds
+
+Every round after the first found the same kind of defect: two pieces of
+state that have to move together, moved separately. A reservation and its
+driver, a token and its operation, a label and the work it names, an owner
+and its completion. Each fix that only added a check left another pair
+un-paired. The ones that held are the ones that made the pairing
+structural — `release_pending_open`, `finish_work`, `begin_mcp` — so there
+is one door and no second place to forget. That is the note worth carrying
+into TKT-0020 and any later work on this loop.
+
+## Remaining follow-up
+
+Unchanged. The manual terminal walkthrough by a human is still
+outstanding and is the chain's to close.
