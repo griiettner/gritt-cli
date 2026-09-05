@@ -29,7 +29,7 @@ use crate::changes::{ChangedFiles, FileDiff};
 use crate::draft::{CatalogState, DraftError, DraftWarning, SessionDraft};
 use crate::modes::print::describe_call;
 use crate::policy::Decision;
-use crate::setup::{ConfigDestination, CredentialState, ProfileSummary};
+use crate::setup::{ConfigDestination, CredentialState, ProfileSummary, SetupSubmission};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -405,17 +405,6 @@ impl SetupForm {
             Protocol::Messages => Protocol::ChatCompletions,
         };
     }
-}
-
-/// The profile spec and the key the setup form collected, handed to the
-/// runtime once. Taking it clears the key from the form, so a typed value
-/// exists in one place at a time and never in an `Action`.
-pub struct SetupSubmission {
-    pub profile: ProviderProfile,
-    /// `None` when the user left the key blank, which is allowed: the
-    /// variable may already be set in the environment.
-    pub secret: Option<Secret>,
-    pub destination: ConfigDestination,
 }
 
 /// A modal explanation with no choice to make beyond acknowledging it.

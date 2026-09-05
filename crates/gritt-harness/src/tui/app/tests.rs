@@ -1087,3 +1087,432 @@ fn a_pending_approval_refuses_settings_commands_too() {
     assert!(app.overlays.is_empty());
     assert!(!app.settings_are_editable());
 }
+
+// -- TKT-0019: the live control-plane paths ---------------------------
+
+use crate::changes::{ChangeSource, ChangeStatus, ChangedFile, ChangedFiles};
+use crate::draft::DraftError;
+use gritt_core::mcp::{McpServerSnapshot, McpServerState, TrustDecision};
+use gritt_core::provider::{ModelCapabilities, ModelInfo};
+
+fn model(id: &str) -> ModelInfo {
+    ModelInfo {
+        id: id.into(),
+        display_name: None,
+        capabilities: ModelCapabilities {
+            context_length: Some(200_000),
+            reasoning: Some(true),
+            input_price_per_million: Some(2.0),
+            output_price_per_million: Some(8.0),
+            ..ModelCapabilities::default()
+        },
+        replaced_by: None,
+        deprecated: false,
+    }
+}
+
+fn snapshot(name: &str, state: McpServerState, tools: usize) -> McpServerSnapshot {
+    McpServerSnapshot {
+        name: name.into(),
+        state,
+        transport: None,
+        tool_count: tools,
+        tools: Vec::new(),
+        protocol_version: None,
+        server_version: None,
+        fingerprint: format!("fp-{name}"),
+    }
+}
+
+/// Selecting a provider clears the model that belonged to the previous
+/// one and asks for the new profile's list, and the list that arrives
+/// replaces the picker rows in place.
+#[test]
+fn changing_the_provider_resets_the_model_and_loads_the_new_catalog() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.session_pinned = false;
+    let before = app.selection;
+    app.select_profile("anthropic");
+    assert_eq!(app.draft.model, None, "the model outlived its provider");
+    assert!(app.selection > before, "the selection token did not move");
+    let action = app.dispatch(Command::Models, None);
+    let Action::LoadCatalog { profile, selection } = action else {
+        panic!("expected a catalog load, got {action:?}");
+    };
+    assert_eq!(profile, "anthropic");
+    assert!(app.catalog.loading);
+    assert!(app.apply_catalog(
+        selection,
+        "anthropic",
+        vec![model("claude-sonnet-5")],
+        CatalogState::Fresh {
+            fetched_at: Utc::now()
+        },
+    ));
+    assert!(!app.catalog.loading);
+    let Some(Overlay::Picker { picker, .. }) = app.top_overlay() else {
+        panic!("the model picker closed")
+    };
+    assert!(
+        picker.rows().iter().any(|row| row.id == "claude-sonnet-5"),
+        "the open picker did not take the list that arrived"
+    );
+}
+
+/// A list for a provider the user has already left may never land.
+#[test]
+fn a_late_catalog_for_the_previous_provider_is_rejected() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.session_pinned = false;
+    app.select_profile("anthropic");
+    let stale = app.selection;
+    app.select_profile("openrouter");
+    assert!(
+        !app.apply_catalog(
+            stale,
+            "anthropic",
+            vec![model("claude-sonnet-5")],
+            CatalogState::Fresh {
+                fetched_at: Utc::now()
+            },
+        ),
+        "a list for anthropic landed while openrouter was selected"
+    );
+    assert_eq!(app.catalog.profile, "openrouter");
+    assert!(app.catalog.models.is_empty());
+    // The current token still works, so nothing was broken by the refusal.
+    let current = app.selection;
+    assert!(app.apply_catalog(
+        current,
+        "openrouter",
+        vec![model("openai/gpt-5-nano")],
+        CatalogState::Skipped,
+    ));
+}
+
+/// Switching sessions moves the sidebar's generation, and a scan that
+/// started under the previous one is dropped rather than shown.
+#[test]
+fn a_workspace_scan_from_the_previous_session_is_rejected() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    let stale = app.sidebar.generation;
+    let observed = |path: &str| ChangedFiles::Observed {
+        source: ChangeSource::Git,
+        files: vec![ChangedFile {
+            path: path.into(),
+            status: ChangeStatus::Modified,
+            pre_existing: false,
+        }],
+    };
+    app.dispatch(Command::New, None);
+    assert!(
+        !app.apply_changes(stale, observed("from/the/old/session.rs")),
+        "a scan for the session just left was accepted"
+    );
+    assert_eq!(app.sidebar.changed_files.files().len(), 0);
+    let now = app.sidebar.generation;
+    assert!(app.apply_changes(now, observed("current.rs")));
+    assert_eq!(app.sidebar.changed_files.files()[0].path, "current.rs");
+}
+
+/// `/new` keeps the session and the draft, and asks the runtime to
+/// release the driver.
+#[test]
+fn new_releases_the_driver_without_deleting_the_session() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.session_id = Some(SessionId("s-1".into()));
+    type_text(&mut app, "a draft worth keeping");
+    let sessions = app.sessions.len();
+    let action = app.dispatch(Command::New, None);
+    assert_eq!(action, Action::NewSession);
+    assert_eq!(app.session_id, None, "the session identity survived /new");
+    assert_eq!(app.layout(), Layout::Home);
+    assert_eq!(app.composer.text(), "a draft worth keeping");
+    assert_eq!(app.sessions.len(), sessions, "/new deleted a session");
+    // The provider and model choices are kept, so the next prompt opens
+    // a session on the same selection.
+    assert_eq!(app.draft.profile.as_deref(), Some("openai"));
+    assert_eq!(app.draft.model.as_deref(), Some("openai/gpt-5-nano"));
+}
+
+/// A refused draft keeps the prompt and the draft; only an explanation
+/// is added.
+#[test]
+fn a_failed_apply_keeps_the_draft_and_shows_the_typed_error() {
+    let mut app = fixture::home(Theme::new(ThemeMode::NoColor));
+    type_text(&mut app, "explain the store module");
+    let action = app.on_key(key(KeyCode::Enter));
+    assert_eq!(action, Action::Submit("explain the store module".into()));
+    assert!(app.running);
+    // What the runtime does when `open_draft` answers `Rejected`.
+    app.undo_submission("explain the store module");
+    app.show_draft_errors(&[DraftError::MissingModel]);
+    assert!(!app.running);
+    assert_eq!(app.composer.text(), "explain the store module");
+    assert!(
+        app.entries.is_empty(),
+        "the refused prompt stayed in the transcript"
+    );
+    let Some(Overlay::Notice(notice)) = app.top_overlay() else {
+        panic!("no explanation was shown")
+    };
+    assert!(notice.is_error);
+    assert!(notice.body.contains("/models"), "{:?}", notice.body);
+}
+
+/// A resumed session is pinned to its stored provider, model, and effort,
+/// and changing the model explains that a new session is needed.
+#[test]
+fn a_resumed_session_is_pinned_and_keeps_the_composer_draft() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    assert!(app.session_pinned);
+    assert_eq!(app.draft.profile.as_deref(), Some("openai"));
+    assert_eq!(app.draft.model.as_deref(), Some("openai/gpt-5-nano"));
+    type_text(&mut app, "keep me");
+    app.select_model("openai/gpt-5-mini");
+    let Some(Overlay::Notice(notice)) = app.top_overlay() else {
+        panic!("changing the model on a pinned session said nothing")
+    };
+    assert!(notice.body.contains("/new"), "{:?}", notice.body);
+    assert_eq!(
+        app.draft.model.as_deref(),
+        Some("openai/gpt-5-nano"),
+        "the pinned model was changed anyway"
+    );
+    assert_eq!(app.composer.text(), "keep me");
+}
+
+/// A connector session does not expose the native pickers, and says why.
+#[test]
+fn a_connector_session_refuses_the_native_pickers() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.connector = Some(gritt_core::connector::ConnectorId::Codex);
+    for command in [Command::Connect, Command::Models, Command::Effort] {
+        let action = app.dispatch(command, None);
+        assert_eq!(action, Action::None, "{command:?} acted on a connector");
+        assert!(app.overlays.is_empty(), "{command:?} opened a picker");
+        let notice = app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("managed by the agent"), "{notice}");
+    }
+    // Phase and the transcript commands still work: they are Gritt's.
+    assert_eq!(
+        app.dispatch(Command::Plan, None),
+        Action::SetPhase(Phase::Planning)
+    );
+}
+
+/// `/mcp` shows every configured entry whatever its state, and its
+/// actions produce typed runtime requests.
+#[test]
+fn mcp_lists_every_state_and_offers_the_typed_actions() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.apply_mcp(vec![
+        snapshot("ready-one", McpServerState::Ready, 4),
+        snapshot("waiting", McpServerState::AwaitingApproval, 0),
+        snapshot(
+            "broken",
+            McpServerState::Failed {
+                reason: "the command exited".into(),
+            },
+            0,
+        ),
+        snapshot(
+            "bad-entry",
+            McpServerState::Invalid {
+                reason: "no command".into(),
+            },
+            0,
+        ),
+    ]);
+    assert_eq!(app.dispatch(Command::Mcp, None), Action::RefreshMcp);
+    let Some(Overlay::Picker { picker, .. }) = app.top_overlay() else {
+        panic!("/mcp opened nothing")
+    };
+    assert_eq!(picker.rows().len(), 4, "an entry was omitted");
+    // Every row is selectable: approving and restarting are what `/mcp`
+    // is for, and both apply to entries that are not running.
+    assert!(picker
+        .rows()
+        .iter()
+        .all(|row| row.availability.is_available()));
+
+    // Approve the one awaiting approval.
+    type_text(&mut app, "waiting");
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.top_overlay().and_then(Overlay::picker_kind),
+        Some(PickerKind::McpActions)
+    );
+    type_text(&mut app, "Approve");
+    let action = app.on_key(key(KeyCode::Enter));
+    assert_eq!(
+        action,
+        Action::Mcp(McpRequest::Decide {
+            server: "waiting".into(),
+            decision: TrustDecision::Approved,
+        })
+    );
+
+    // A failed server offers a restart; an invalid one does not.
+    app.dispatch(Command::Mcp, None);
+    type_text(&mut app, "broken");
+    app.on_key(key(KeyCode::Enter));
+    type_text(&mut app, "Restart");
+    assert_eq!(
+        app.on_key(key(KeyCode::Enter)),
+        Action::Mcp(McpRequest::Restart {
+            server: "broken".into()
+        })
+    );
+    let invalid = app.mcp_actions_picker("bad-entry");
+    let restart = invalid
+        .rows()
+        .iter()
+        .find(|row| row.id == "restart")
+        .unwrap();
+    assert!(!restart.availability.is_available());
+}
+
+/// A live MCP update rebuilds the list the user is looking at.
+#[test]
+fn a_live_mcp_update_reaches_the_open_overlay() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.apply_mcp(vec![snapshot("one", McpServerState::Starting, 0)]);
+    app.dispatch(Command::Mcp, None);
+    app.apply_mcp(vec![
+        snapshot("one", McpServerState::Ready, 7),
+        snapshot("two", McpServerState::AwaitingApproval, 0),
+    ]);
+    let Some(Overlay::Picker { picker, .. }) = app.top_overlay() else {
+        panic!("the overlay closed")
+    };
+    assert_eq!(picker.rows().len(), 2, "the open list did not update");
+    assert_eq!(picker.rows()[0].badge, "ready");
+}
+
+/// Selecting a changed file opens its read-only diff.
+#[test]
+fn a_changed_file_opens_a_read_only_diff() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.set_metrics(Metrics {
+        transcript_lines: 40,
+        transcript_height: 10,
+        terminal_width: 120,
+    });
+    app.focus = Focus::Sidebar;
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Action::ScanChanges);
+    assert_eq!(
+        app.top_overlay().and_then(Overlay::picker_kind),
+        Some(PickerKind::Changes)
+    );
+    type_text(&mut app, "README");
+    let action = app.on_key(key(KeyCode::Enter));
+    assert_eq!(action, Action::OpenFileDiff("README.md".into()));
+    app.show_file_diff(crate::changes::FileDiff::Text {
+        path: "README.md".into(),
+        body: "@@ -1 +1 @@\n-old\n+new\n".into(),
+    });
+    let Some(Overlay::FileDiff { path, .. }) = app.top_overlay() else {
+        panic!("no diff opened")
+    };
+    assert_eq!(path, "README.md");
+    // It scrolls and closes; there is no key here that could write.
+    app.on_key(key(KeyCode::Down));
+    let Some(Overlay::FileDiff { scroll, .. }) = app.top_overlay() else {
+        unreachable!()
+    };
+    assert_eq!(*scroll, 1);
+    app.on_key(key(KeyCode::Esc));
+    assert!(app.overlays.is_empty());
+}
+
+/// Effort on a live session is persisted through the driver, and on a
+/// draft it is only recorded until the session opens.
+#[test]
+fn effort_is_persisted_on_a_live_session_and_drafted_before_one() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.session_id = Some(SessionId("s-1".into()));
+    app.dispatch(Command::Effort, None);
+    type_text(&mut app, "high");
+    assert_eq!(
+        app.on_key(key(KeyCode::Enter)),
+        Action::SetEffort(ReasoningEffort::High)
+    );
+    let mut draft_only = fixture::home(Theme::new(ThemeMode::NoColor));
+    draft_only.select_profile("openai");
+    draft_only.catalog.models = vec![model("openai/gpt-5-nano")];
+    draft_only.select_model("openai/gpt-5-nano");
+    draft_only.dispatch(Command::Effort, None);
+    type_text(&mut draft_only, "high");
+    assert_eq!(draft_only.on_key(key(KeyCode::Enter)), Action::None);
+    assert_eq!(draft_only.draft.effort, Some(ReasoningEffort::High));
+}
+
+/// Cost and context occupancy are reported only from sources that exist.
+#[test]
+fn cost_and_context_come_from_reported_figures_or_stay_unavailable() {
+    let mut app = plain();
+    app.on_event(&event(EventKind::Usage {
+        usage: Usage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(500_000),
+            ..Usage::default()
+        },
+    }));
+    // No catalog figures yet: usage is known, cost and occupancy are not.
+    assert_eq!(app.sidebar.usage.input_tokens, Some(1_000_000));
+    assert_eq!(app.sidebar.cost.estimate_usd, None);
+    assert_eq!(app.sidebar.usage.occupancy(), None);
+    app.set_model_facts(Some(&model("m")));
+    // 1M in at $2 and 0.5M out at $8 is $6.
+    assert_eq!(app.sidebar.cost.estimate_usd, Some(6.0));
+    assert!(
+        app.sidebar.cost.scope.is_some(),
+        "the estimate has no scope"
+    );
+    // The prompt tokens of the last request are the context, not the
+    // cumulative total.
+    assert_eq!(app.sidebar.usage.context_tokens, Some(1_000_000));
+    assert_eq!(app.sidebar.usage.occupancy(), Some(5.0));
+}
+
+/// A successful native write becomes a changed-file observation; a failed
+/// one does not.
+#[test]
+fn only_a_successful_write_is_observed_as_a_change() {
+    let mut app = plain();
+    for (id, path, failed) in [("c1", "kept.rs", false), ("c2", "refused.rs", true)] {
+        app.on_event(&event(EventKind::ToolCall {
+            call: ToolCall {
+                id: ToolCallId(id.into()),
+                name: "file_write".into(),
+                arguments: serde_json::json!({ "path": path }),
+            },
+        }));
+        app.on_event(&event(EventKind::ToolResult {
+            result: ToolResult {
+                call_id: ToolCallId(id.into()),
+                name: "file_write".into(),
+                is_error: failed,
+                output: "done".into(),
+            },
+        }));
+    }
+    assert_eq!(app.take_observed_writes(), vec!["kept.rs".to_owned()]);
+    assert!(app.take_observed_writes().is_empty(), "taken twice");
+}
+
+/// Settings stay refused while a turn or an approval is active, and an
+/// asynchronous request is cancellable from the main view.
+#[test]
+fn settings_wait_for_a_turn_and_loading_is_cancellable() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    app.session_pinned = false;
+    app.running = true;
+    assert_eq!(app.dispatch(Command::Models, None), Action::None);
+    assert!(app.overlays.is_empty());
+    app.running = false;
+    app.loading = Some("loading openai models".into());
+    // Escape with nothing open cancels the work the loading line names.
+    assert_eq!(app.on_key(key(KeyCode::Esc)), Action::Cancel);
+}

@@ -776,10 +776,11 @@ async fn on_action(
             // Config and keychain writes are blocking file and system
             // calls; they never run on the loop.
             runtime.spawn(async move {
-                let message =
-                    tokio::task::spawn_blocking(move || write_profile(setup.as_ref(), submission))
-                        .await
-                        .unwrap_or_else(|_| ("the setup task did not finish".to_owned(), false));
+                let message = tokio::task::spawn_blocking(move || {
+                    crate::setup::apply_setup(setup.as_ref(), submission)
+                })
+                .await
+                .unwrap_or_else(|_| ("the setup task did not finish".to_owned(), false));
                 let _ = tx.send(UiMsg::Setup {
                     message: message.0,
                     close: message.1,
@@ -891,66 +892,4 @@ async fn resume_by_id(
     };
     draft.name = Some(session.name);
     plane.open_draft(draft).await
-}
-
-/// Writes a profile and, when one was typed, its key. Returns the line to
-/// show and whether the flow may close.
-fn write_profile(
-    setup: &dyn crate::setup::ProviderSetup,
-    submission: super::app::SetupSubmission,
-) -> (String, bool) {
-    use crate::setup::{CredentialStoreOutcome, ProfileSaveOutcome};
-    let saved = setup.save_profile(&submission.profile, submission.destination);
-    let (message, ok) = match saved {
-        ProfileSaveOutcome::Saved {
-            path, shadowed_by, ..
-        } => (
-            match shadowed_by {
-                Some(layer) => format!(
-                    "saved to {}, but a {:?} configuration already defines this profile and wins",
-                    path.display(),
-                    layer
-                ),
-                None => format!("saved to {}", path.display()),
-            },
-            true,
-        ),
-        ProfileSaveOutcome::Invalid { problem } => {
-            (format!("the profile is not valid: {problem:?}"), false)
-        }
-        ProfileSaveOutcome::Unavailable { reason } => (reason, false),
-        ProfileSaveOutcome::Failed { message } => (message, false),
-    };
-    if !ok {
-        return (message, false);
-    }
-    let Some(secret) = submission.secret else {
-        return (
-            format!(
-                "{message}; no key was typed, so {} must be set in the environment",
-                submission.profile.key.env_var_name
-            ),
-            true,
-        );
-    };
-    match setup.store_credential(&submission.profile, secret) {
-        CredentialStoreOutcome::Stored { .. } => {
-            (format!("{message}; the key went to the keychain"), true)
-        }
-        CredentialStoreOutcome::KeychainUnavailable {
-            env_var_name,
-            message: reason,
-            ..
-        } => (
-            format!(
-                "{message}, but the keychain is unavailable ({reason}). Export {env_var_name} instead."
-            ),
-            // The profile exists; only the key did not land. The flow
-            // closes so the profile is usable once the variable is set.
-            true,
-        ),
-        CredentialStoreOutcome::Unavailable { reason } => {
-            (format!("{message}, but no keychain writer is available: {reason}"), true)
-        }
-    }
 }
