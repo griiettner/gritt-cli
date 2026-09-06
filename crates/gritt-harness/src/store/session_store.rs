@@ -89,7 +89,7 @@ impl Store {
                 model,
                 effort,
             },
-            SessionKind::Connector { id } => {
+            SessionKind::Connector { id, .. } => {
                 return Err(Error::config(format!(
                     "session `{}` runs on connector {}, which manages its own effort",
                     session.name,
@@ -568,6 +568,7 @@ mod tests {
             "c1",
             SessionKind::Connector {
                 id: ConnectorId::Codex,
+                model: None,
             },
         );
         store.create(native.clone()).await.unwrap();
@@ -581,7 +582,8 @@ mod tests {
         assert_eq!(
             back.kind,
             SessionKind::Connector {
-                id: ConnectorId::Codex
+                id: ConnectorId::Codex,
+                model: None,
             }
         );
 

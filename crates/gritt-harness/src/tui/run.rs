@@ -10,7 +10,7 @@ use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event as TerminalEvent, KeyEventKind,
 };
 use crossterm::execute;
-use gritt_core::connector::AuthState;
+use gritt_core::connector::{AuthState, ConnectorId, ConnectorModelDiscovery};
 use gritt_core::event::{ApprovalDecision, ApprovalRequest, Event};
 use gritt_core::mcp::McpServerSnapshot;
 use gritt_core::session::{BoxFuture, Session, SessionStore};
@@ -58,6 +58,12 @@ enum UiMsg {
         selection: u64,
         profile: String,
         result: Result<ProfileCatalog>,
+    },
+    ConnectorCatalog {
+        operation: u64,
+        selection: u64,
+        connector: ConnectorId,
+        result: ConnectorModelDiscovery,
     },
     Sessions {
         operation: u64,
@@ -1171,6 +1177,17 @@ async fn on_message(
                 }
             }
         }
+        UiMsg::ConnectorCatalog {
+            operation,
+            selection,
+            connector,
+            result,
+        } => {
+            if !runtime.finish_work(app, Work::Catalog, operation) {
+                return Ok(Action::None);
+            }
+            app.apply_connector_catalog(selection, connector, result);
+        }
         UiMsg::Sessions {
             operation,
             sessions,
@@ -1546,20 +1563,19 @@ async fn on_action(
             let tx = runtime.tx.clone();
             let generation = app.sidebar.generation;
             let operation = runtime.next_operation();
+            let model = app.connector_model.clone();
             runtime.pending_open = Some(PendingOpen {
                 operation,
                 prompt: None,
                 previous: idle_agent.take(),
             });
             runtime.spawn_open(async move {
-                // An external agent owns its own model and effort, so this
-                // is the general control-plane operation, not a draft.
                 let result = plane
                     .open(
                         crate::agent::SessionSelector::New { name: None },
                         Some(id),
                         None,
-                        None,
+                        model.as_deref(),
                         None,
                     )
                     .await
@@ -1586,6 +1602,25 @@ async fn on_action(
                     operation,
                     selection,
                     profile,
+                    result,
+                });
+            });
+        }
+        Action::LoadConnectorCatalog {
+            connector,
+            selection,
+            refresh,
+        } => {
+            let plane = Arc::clone(&runtime.plane);
+            let tx = runtime.tx.clone();
+            let label = format!("loading {} models", connector.as_str());
+            let operation = runtime.next_operation();
+            runtime.spawn(app, Work::Catalog, operation, label, async move {
+                let result = plane.connector_models(connector, refresh).await;
+                let _ = tx.send(UiMsg::ConnectorCatalog {
+                    operation,
+                    selection,
+                    connector,
                     result,
                 });
             });

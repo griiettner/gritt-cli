@@ -82,6 +82,26 @@ key-redacted.
 A missing or broken external agent fails only its own sessions and never
 creates a session row. The native path is unaffected.
 
+## Models
+
+Print, REPL, and the full-screen UI share one control-plane operation that
+asks an installed agent for the models it currently exposes, then passes an
+explicit choice through that agent's documented `--model` flag.
+
+| Connector | List | Select |
+| --- | --- | --- |
+| Codex | `codex debug models` | `codex exec --model <id>` |
+| Claude Code | none documented (shown as unsupported) | `claude --model <id>` |
+| Cursor | `cursor-agent --list-models` | `cursor-agent --model <id>` |
+| OpenCode | `opencode models` | `opencode run --model <provider/id>` |
+
+`--model` on `gritt run`, `gritt repl`, and `gritt tui` is that explicit
+choice for a new connector session. A resumed session keeps the model
+stored with it. When listing fails, Gritt uses the last cached catalog and
+marks it stale rather than presenting it as current. A missing CLI,
+unsupported listing command, failed command, or unreadable output is a
+typed diagnostic and does not affect native sessions or other connectors.
+
 ## PTY fallback
 
 Machine-readable output is preferred. A connector listed under

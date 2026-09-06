@@ -31,6 +31,10 @@ pub enum SessionKind {
     },
     Connector {
         id: ConnectorId,
+        /// Explicit model chosen before this session started. Absent on
+        /// older rows and when the user left the CLI default in place.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
 }
 
@@ -216,9 +220,27 @@ mod tests {
         assert_eq!(serde_json::from_str::<SessionKind>(&text).unwrap(), native);
         let connector = SessionKind::Connector {
             id: ConnectorId::Codex,
+            model: None,
         };
         assert_eq!(connector.effort(), None);
         let text = serde_json::to_string(&connector).unwrap();
         assert!(!text.contains("effort"));
+        assert!(!text.contains("model"));
+        let old = serde_json::json!({ "kind": "connector", "id": "codex" });
+        let loaded: SessionKind = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            loaded,
+            SessionKind::Connector {
+                id: ConnectorId::Codex,
+                model: None,
+            }
+        );
+        let chosen = SessionKind::Connector {
+            id: ConnectorId::ClaudeCode,
+            model: Some("sonnet".into()),
+        };
+        let text = serde_json::to_string(&chosen).unwrap();
+        assert!(text.contains("\"model\":\"sonnet\""));
+        assert_eq!(serde_json::from_str::<SessionKind>(&text).unwrap(), chosen);
     }
 }

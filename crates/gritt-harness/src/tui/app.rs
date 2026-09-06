@@ -9,7 +9,7 @@
 use std::cell::{Cell, RefCell};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use gritt_core::connector::ConnectorId;
+use gritt_core::connector::{ConnectorId, ConnectorModel, ConnectorModelDiscovery};
 use gritt_core::event::{
     ApprovalDecision, ApprovalRequest, Event, EventKind, SessionStatus, Usage,
 };
@@ -143,6 +143,13 @@ pub enum Action {
         profile: String,
         selection: u64,
     },
+    /// Load an installed agent's model catalog. `refresh` bypasses the
+    /// short-lived cache.
+    LoadConnectorCatalog {
+        connector: ConnectorId,
+        selection: u64,
+        refresh: bool,
+    },
     /// Persist the effort on the live native session.
     SetEffort(ReasoningEffort),
     /// Write the setup form through the injected `ProviderSetup`, then
@@ -208,6 +215,15 @@ pub struct ModelCatalogView {
     pub models: Vec<ModelInfo>,
     pub state: Option<CatalogState>,
     /// A refresh is in flight.
+    pub loading: bool,
+}
+
+/// The catalog for the drafted connector, as the same picker shows it.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectorCatalogView {
+    pub connector: Option<ConnectorId>,
+    pub models: Vec<ConnectorModel>,
+    pub discovery: Option<ConnectorModelDiscovery>,
     pub loading: bool,
 }
 
@@ -624,6 +640,13 @@ pub struct App {
     /// Set for a connector session: the agent owns its model, effort, and
     /// permissions (ADR-010), so the native pickers are refused.
     pub connector: Option<ConnectorId>,
+    /// Connector chosen from `/connect` before a session exists. The model
+    /// picker loads this agent's catalog instead of a provider list.
+    pub connector_choice: Option<ConnectorId>,
+    /// Model chosen for that drafted connector. Kept off `draft.model` so
+    /// a native session after `/new` cannot open with a connector id.
+    pub connector_model: Option<String>,
+    pub connector_catalog: ConnectorCatalogView,
     /// The server `/mcp` opened an action list for.
     pub mcp_target: Option<String>,
     /// Set while the pending approval is an MCP server launch rather than
@@ -711,6 +734,9 @@ impl App {
             busy: std::collections::BTreeMap::new(),
             session_id: None,
             connector: None,
+            connector_choice: None,
+            connector_model: None,
+            connector_catalog: ConnectorCatalogView::default(),
             mcp_target: None,
             mcp_approval: None,
             session_transition: false,
@@ -1194,8 +1220,12 @@ impl App {
 
     /// The model picker for the drafted profile. A profile with no key
     /// gets a setup row, which is the `/models` to provider-setup round
-    /// trip.
+    /// trip. A drafted connector uses the same picker with that agent's
+    /// catalog.
     pub fn model_picker(&self) -> Picker {
+        if let Some(id) = self.connector_choice {
+            return self.connector_model_picker(id);
+        }
         let mut rows = Vec::new();
         let profile = self.draft.profile.clone().unwrap_or_default();
         if let Some(summary) = self.profiles.iter().find(|p| p.name == profile) {
@@ -1250,6 +1280,54 @@ impl App {
                 Some(state) => catalog_word(state).to_owned(),
                 None => "catalog not loaded".to_owned(),
             })
+            .with_status(status)
+    }
+
+    fn connector_model_picker(&self, id: ConnectorId) -> Picker {
+        let mut rows = vec![PickerRow::new("__default__", "Agent default")
+            .detail("the CLI chooses its own model")
+            .badge(id.as_str().to_owned())
+            .current(self.connector_model.is_none())];
+        for model in &self.connector_catalog.models {
+            let label = model
+                .display_label
+                .clone()
+                .unwrap_or_else(|| model.id.clone());
+            rows.push(
+                PickerRow::new(model.id.clone(), label)
+                    .detail(model.id.clone())
+                    .badge(id.as_str().to_owned())
+                    .current(self.connector_model.as_deref() == Some(model.id.as_str())),
+            );
+        }
+        let status = if self.connector_catalog.loading {
+            ListStatus::Loading {
+                what: format!("{} models", id.as_str()),
+            }
+        } else {
+            match &self.connector_catalog.discovery {
+                Some(ConnectorModelDiscovery::CachedStale { reason, .. }) => ListStatus::Failed {
+                    reason: reason.clone(),
+                    cached: true,
+                },
+                Some(ConnectorModelDiscovery::Unavailable { reason, .. })
+                | Some(ConnectorModelDiscovery::Unsupported { reason, .. })
+                | Some(ConnectorModelDiscovery::CommandFailure { reason, .. })
+                | Some(ConnectorModelDiscovery::MalformedOutput { reason, .. }) => {
+                    ListStatus::Failed {
+                        reason: reason.clone(),
+                        cached: false,
+                    }
+                }
+                _ => ListStatus::Ready,
+            }
+        };
+        let hint = match &self.connector_catalog.discovery {
+            Some(outcome) => outcome.describe(),
+            None => format!("{} catalog not loaded", id.as_str()),
+        };
+        Picker::new(format!("Models · {}", id.as_str()), rows)
+            .with_hint(hint)
             .with_status(status)
     }
 
@@ -1567,6 +1645,10 @@ impl App {
                 Action::None
             }
             Command::Models => {
+                if let Some(id) = self.connector_choice {
+                    self.open_picker(PickerKind::Models);
+                    return self.request_connector_catalog(id, false);
+                }
                 if self.draft.profile.is_none() {
                     self.notice = Some("choose a provider with /connect first".into());
                     self.open_picker(PickerKind::Connect);
@@ -2002,10 +2084,17 @@ impl App {
     }
 
     fn picker_key(&mut self, key: KeyEvent, ctrl: bool) -> Action {
-        let Some(Overlay::Picker { kind, picker }) = self.overlays.last_mut() else {
+        let Some(kind) = self.overlays.last().and_then(Overlay::picker_kind) else {
             return Action::None;
         };
-        let kind = *kind;
+        if ctrl && matches!(key.code, KeyCode::Char('r')) && kind == PickerKind::Models {
+            if let Some(id) = self.connector_choice {
+                return self.request_connector_catalog(id, true);
+            }
+        }
+        let Some(Overlay::Picker { picker, .. }) = self.overlays.last_mut() else {
+            return Action::None;
+        };
         match key.code {
             KeyCode::Down => picker.move_down(),
             KeyCode::Up => picker.move_up(),
@@ -2061,21 +2150,21 @@ impl App {
                     return Action::None;
                 }
                 if let Some(profile) = id.strip_prefix("profile:") {
+                    self.connector_choice = None;
+                    self.connector_model = None;
                     self.select_profile(profile);
+                    self.overlays.pop();
                     self.open_picker(PickerKind::Models);
                     return self.request_catalog();
                 } else if let Some(agent) = id.strip_prefix("agent:") {
-                    self.overlays.push(Overlay::Notice(Notice {
-                        title: agent.to_string(),
-                        body: format!(
-                            "{agent} runs its own harness. Gritt supervises it and relays its \
-                             approvals; its model and effort are managed by the agent and are \
-                             not set here.\n\nEnter starts a session on it. Escape returns \
-                             without starting anything."
-                        ),
-                        is_error: false,
-                        confirm: connector_id(agent),
-                    }));
+                    if let Some(connector) = connector_id(agent) {
+                        self.connector_choice = Some(connector);
+                        self.connector_model = None;
+                        self.overlays.pop();
+                        let action = self.request_connector_catalog(connector, false);
+                        self.open_picker(PickerKind::Models);
+                        return action;
+                    }
                 }
                 Action::None
             }
@@ -2089,6 +2178,14 @@ impl App {
                     return Action::None;
                 }
                 self.overlays.pop();
+                if let Some(connector) = self.connector_choice {
+                    if id == "__default__" {
+                        self.connector_model = None;
+                    } else {
+                        self.connector_model = Some(id);
+                    }
+                    return Action::SelectConnector(connector);
+                }
                 self.select_model(&id);
                 Action::None
             }
@@ -2184,6 +2281,46 @@ impl App {
             profile,
             selection: self.selection,
         }
+    }
+
+    fn request_connector_catalog(&mut self, id: ConnectorId, refresh: bool) -> Action {
+        self.selection = self.selection.wrapping_add(1);
+        self.connector_catalog.connector = Some(id);
+        self.connector_catalog.loading = true;
+        if refresh {
+            self.connector_catalog.discovery = None;
+        }
+        self.refresh_open_picker();
+        Action::LoadConnectorCatalog {
+            connector: id,
+            selection: self.selection,
+            refresh,
+        }
+    }
+
+    /// A connector catalog arrived. `selection` is the token the load
+    /// started under.
+    pub fn apply_connector_catalog(
+        &mut self,
+        selection: u64,
+        connector: ConnectorId,
+        discovery: ConnectorModelDiscovery,
+    ) -> bool {
+        if selection != self.selection || self.connector_choice != Some(connector) {
+            return false;
+        }
+        let models = discovery
+            .catalog()
+            .map(|catalog| catalog.models.clone())
+            .unwrap_or_default();
+        self.connector_catalog = ConnectorCatalogView {
+            connector: Some(connector),
+            models,
+            discovery: Some(discovery),
+            loading: false,
+        };
+        self.refresh_open_picker();
+        true
     }
 
     /// Whether a pinned session refuses this (provider, model) pair, and
@@ -2595,6 +2732,9 @@ impl App {
         self.session_pinned = false;
         self.session_id = None;
         self.connector = None;
+        self.connector_choice = None;
+        self.connector_model = None;
+        self.connector_catalog = ConnectorCatalogView::default();
         self.running = false;
         self.pending = None;
         self.mcp_approval = None;
@@ -2910,9 +3050,8 @@ impl App {
             PickerKind::Changes => self.changes_picker(),
             PickerKind::Commands | PickerKind::Sessions => return,
         };
-        let rows = rows.rows().to_vec();
         if let Some(Overlay::Picker { picker, .. }) = self.overlays.last_mut() {
-            picker.replace_rows(rows);
+            picker.replace_contents(rows);
         }
     }
 
@@ -2947,14 +3086,14 @@ impl App {
                 self.draft.model = Some(model.clone());
                 self.draft.effort = Some(*effort);
             }
-            gritt_core::session::SessionKind::Connector { id } => {
+            gritt_core::session::SessionKind::Connector { id, model } => {
                 self.connector = Some(*id);
                 self.status.profile = id.as_str().to_owned();
-                self.status.model.clear();
+                self.status.model = model.clone().unwrap_or_default();
                 self.sidebar.model.backend = Some(id.as_str().to_owned());
-                self.sidebar.model.model = None;
-                // ADR-010: the connector owns these, so the sidebar says
-                // so rather than showing Gritt's native values.
+                self.sidebar.model.model = model.clone();
+                // ADR-010: the connector owns effort and permissions. A
+                // model Gritt passed at launch is shown, not guessed.
                 self.sidebar.model.managed_by_agent = true;
             }
         }

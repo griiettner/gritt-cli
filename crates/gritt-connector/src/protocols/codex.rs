@@ -7,16 +7,45 @@
 
 use std::collections::HashMap;
 
-use gritt_core::connector::{AuthState, ConnectorCapabilities, ConnectorId, TaskRequest};
+use gritt_core::connector::{
+    AuthState, ConnectorCapabilities, ConnectorId, ConnectorModel, TaskRequest,
+};
 use gritt_core::event::{EventKind, SessionStatus, StopReason};
 use gritt_core::tool::native;
 use gritt_core::ErrorKind;
 
-use super::{number, render, text, tool_call, tool_result};
+use super::{model_flag, number, render, text, tool_call, tool_result, ModelParseError};
 use crate::health::ProbeOutput;
 use crate::supervise::{usage, Normalized, Normalizer, Protocol};
 
 pub struct Codex;
+
+/// `codex debug models` prints `{"models":[{"slug":"...","display_name":"..."}]}`.
+pub fn parse_codex_models(
+    stdout: &str,
+) -> std::result::Result<Vec<ConnectorModel>, ModelParseError> {
+    let body = stdout.trim();
+    let start = body.find('{').ok_or(ModelParseError::Malformed)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&body[start..]).map_err(|_| ModelParseError::Malformed)?;
+    let models = value
+        .get("models")
+        .and_then(|v| v.as_array())
+        .ok_or(ModelParseError::Malformed)?;
+    let mut out = Vec::new();
+    for model in models {
+        let id = text(model, "slug")
+            .or_else(|| text(model, "id"))
+            .or_else(|| text(model, "model"))
+            .ok_or(ModelParseError::Malformed)?;
+        if id.is_empty() {
+            return Err(ModelParseError::Malformed);
+        }
+        let display_label = text(model, "display_name").or_else(|| text(model, "displayName"));
+        out.push(ConnectorModel { id, display_label });
+    }
+    Ok(out)
+}
 
 impl Protocol for Codex {
     fn id(&self) -> ConnectorId {
@@ -53,6 +82,22 @@ impl Protocol for Codex {
         }
     }
 
+    fn model_list_args(&self, _refresh: bool) -> Option<Vec<String>> {
+        Some(vec!["debug".into(), "models".into()])
+    }
+
+    fn model_list_source(&self) -> &'static str {
+        "codex debug models"
+    }
+
+    fn parse_models(
+        &self,
+        stdout: &str,
+        _stderr: &str,
+    ) -> std::result::Result<Vec<ConnectorModel>, ModelParseError> {
+        parse_codex_models(stdout)
+    }
+
     fn task_args(&self, request: &TaskRequest, external_id: Option<&str>) -> Vec<String> {
         let mut args = vec!["exec".to_owned()];
         match external_id {
@@ -69,6 +114,7 @@ impl Protocol for Codex {
                 args.push(request.workspace.display().to_string());
             }
         }
+        args.extend(model_flag(request.model.as_deref()));
         args.push(request.prompt.clone());
         args
     }

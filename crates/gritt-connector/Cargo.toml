@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 gritt-core = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
+dirs = { workspace = true }
 futures = { workspace = true }
 portable-pty = { workspace = true }
 serde = { workspace = true }

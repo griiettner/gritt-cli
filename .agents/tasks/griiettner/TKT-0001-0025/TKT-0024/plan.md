@@ -3,7 +3,7 @@ id: TKT-0024
 namespace: griiettner
 title: Expose current models and selection for external connectors
 artifact: plan
-status: ready
+status: done
 owner: griiettner
 created: 2026-09-06
 updated: 2026-09-06

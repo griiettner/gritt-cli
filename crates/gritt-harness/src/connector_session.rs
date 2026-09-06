@@ -14,7 +14,7 @@ use gritt_core::event::{ApprovalDecision, Event, EventKind, EventSource, Session
 use gritt_core::policy::PolicyOutcome;
 use gritt_core::provider::ReasoningEffort;
 use gritt_core::secret::Secret;
-use gritt_core::session::{BoxFuture, Phase, Session, SessionStore};
+use gritt_core::session::{BoxFuture, Phase, Session, SessionKind, SessionStore};
 use gritt_core::{Error, ErrorKind, Result};
 use gritt_provider::adapter::{redact_text, redact_value};
 use gritt_provider::CancellationToken;
@@ -301,6 +301,10 @@ impl ConnectorSession {
             prompt: self.prompt_for(prompt),
             workspace: self.session.workspace.clone(),
             continuation: self.store.load_continuation(&self.session.id).await?,
+            model: match &self.session.kind {
+                SessionKind::Connector { model, .. } => model.clone(),
+                SessionKind::Native { .. } => None,
+            },
         };
         let connector = Arc::clone(&self.connector);
         let mut stream = match connector.start(request).await {
@@ -472,13 +476,20 @@ impl Driver for ConnectorSession {
     }
 
     fn info(&self) -> DriverInfo {
+        let model = match &self.session.kind {
+            SessionKind::Connector { model, .. } => model.clone().unwrap_or_default(),
+            SessionKind::Native { .. } => String::new(),
+        };
         DriverInfo {
             backend: self.connector.id().as_str().to_owned(),
-            detail: self
-                .info
-                .as_ref()
-                .and_then(|info| info.version.clone())
-                .unwrap_or_default(),
+            detail: if model.is_empty() {
+                self.info
+                    .as_ref()
+                    .and_then(|info| info.version.clone())
+                    .unwrap_or_default()
+            } else {
+                model
+            },
         }
     }
 }

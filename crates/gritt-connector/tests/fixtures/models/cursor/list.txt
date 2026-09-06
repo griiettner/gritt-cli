@@ -1,0 +1,4 @@
+Available models:
+gpt-5.5-medium (default)
+composer-2.5 (current)
+gpt-5.3-codex

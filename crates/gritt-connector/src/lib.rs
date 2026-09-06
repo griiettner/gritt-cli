@@ -12,19 +12,22 @@
 //! depends on `gritt-core` only.
 
 pub mod health;
+pub mod models;
 pub mod process;
 pub mod protocols;
 pub mod pty;
 pub mod redact;
 pub mod supervise;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use gritt_core::config::ConnectorSettings;
+use gritt_core::config::{ConnectorSettings, ModelListPolicy};
 use gritt_core::connector::{Connector, ConnectorId};
 use gritt_core::secret::Secret;
 use gritt_core::{Error, Result};
 
+pub use models::ConnectorModelCache;
 pub use supervise::{ExternalConnector, Normalized, Normalizer, Protocol, Timeouts};
 
 /// Credential values in this process's environment. External agents keep
@@ -118,21 +121,54 @@ pub fn default_connectors_with_secrets(
     settings: &ConnectorSettings,
     secrets: Vec<Secret>,
 ) -> Result<Vec<Arc<dyn Connector>>> {
+    default_connectors_configured(settings, secrets, None, ModelListPolicy::default())
+}
+
+/// The same set, with an on-disk model catalog cache when `cache_dir` is set.
+pub fn default_connectors_configured(
+    settings: &ConnectorSettings,
+    secrets: Vec<Secret>,
+    cache_dir: Option<PathBuf>,
+    policy: ModelListPolicy,
+) -> Result<Vec<Arc<dyn Connector>>> {
     validate_extra_args(settings, &secrets)?;
+    let cache = cache_dir.map(ConnectorModelCache::new);
+    fn finish<P: Protocol>(
+        connector: ExternalConnector<P>,
+        secrets: &[Secret],
+        cache: &Option<ConnectorModelCache>,
+        policy: &ModelListPolicy,
+    ) -> Arc<dyn Connector> {
+        let connector = connector.with_secrets(secrets.to_vec());
+        match cache {
+            Some(cache) => Arc::new(connector.with_model_cache(cache.clone(), policy.clone())),
+            None => Arc::new(connector),
+        }
+    }
     Ok(vec![
-        Arc::new(
-            ExternalConnector::new(protocols::codex::Codex, settings).with_secrets(secrets.clone()),
+        finish(
+            ExternalConnector::new(protocols::codex::Codex, settings),
+            &secrets,
+            &cache,
+            &policy,
         ),
-        Arc::new(
-            ExternalConnector::new(protocols::claude::ClaudeCode, settings)
-                .with_secrets(secrets.clone()),
+        finish(
+            ExternalConnector::new(protocols::claude::ClaudeCode, settings),
+            &secrets,
+            &cache,
+            &policy,
         ),
-        Arc::new(
-            ExternalConnector::new(protocols::cursor::Cursor, settings)
-                .with_secrets(secrets.clone()),
+        finish(
+            ExternalConnector::new(protocols::cursor::Cursor, settings),
+            &secrets,
+            &cache,
+            &policy,
         ),
-        Arc::new(
-            ExternalConnector::new(protocols::opencode::OpenCode, settings).with_secrets(secrets),
+        finish(
+            ExternalConnector::new(protocols::opencode::OpenCode, settings),
+            &secrets,
+            &cache,
+            &policy,
         ),
     ])
 }

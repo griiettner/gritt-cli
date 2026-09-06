@@ -1472,6 +1472,7 @@ name = "gritt-connector"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "dirs",
  "futures",
  "gritt-core",
  "portable-pty",

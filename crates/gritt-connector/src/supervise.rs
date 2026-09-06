@@ -14,8 +14,10 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use futures::Stream;
 use gritt_core::config::ConnectorSettings;
+use gritt_core::config::ModelListPolicy;
 use gritt_core::connector::{
     AuthState, Connector, ConnectorCapabilities, ConnectorId, ConnectorInfo, ConnectorInspection,
+    ConnectorModel, ConnectorModelCatalog, ConnectorModelDiscovery, ConnectorModelFreshness,
     TaskRequest, TaskState, Transport,
 };
 use gritt_core::event::{
@@ -28,7 +30,12 @@ use gritt_core::{Error, ErrorKind, Result};
 use tokio::sync::{mpsc, Notify};
 
 use crate::health::{find_executable, probe, version_at_least, version_token, ProbeOutput};
+use crate::models::{
+    attempted_recently, cache_is_fresh, catalog_from_cache, failed_since_fetch,
+    CachedConnectorModels, ConnectorModelCache,
+};
 use crate::process::{self, Launch, Line, Supervised};
+use crate::protocols::ModelParseError;
 use crate::redact::{cap, redact_text, redact_value};
 
 /// Longest raw line kept in a diagnostic.
@@ -142,6 +149,22 @@ pub trait Protocol: Send + Sync + 'static {
     /// thread when it is known and the agent supports it.
     fn task_args(&self, request: &TaskRequest, external_id: Option<&str>) -> Vec<String>;
     fn normalizer(&self) -> Box<dyn Normalizer>;
+    /// Documented model-list command, or `None` when the CLI has no
+    /// listing interface. `refresh` is for CLIs that document a distinct
+    /// refresh flag.
+    fn model_list_args(&self, _refresh: bool) -> Option<Vec<String>> {
+        None
+    }
+    fn model_list_source(&self) -> &'static str {
+        self.executable()
+    }
+    fn parse_models(
+        &self,
+        _stdout: &str,
+        _stderr: &str,
+    ) -> std::result::Result<Vec<ConnectorModel>, ModelParseError> {
+        Err(ModelParseError::Unsupported)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +226,7 @@ struct SessionState {
     last_error: Option<String>,
     pid: Option<u32>,
     workspace: PathBuf,
+    model: Option<String>,
 }
 
 type Sessions = Arc<Mutex<HashMap<SessionId, SessionState>>>;
@@ -229,6 +253,8 @@ pub struct ExternalConnector<P: Protocol> {
     timeouts: Timeouts,
     secrets: Vec<Secret>,
     sessions: Sessions,
+    model_cache: Option<ConnectorModelCache>,
+    model_policy: ModelListPolicy,
 }
 
 impl<P: Protocol> ExternalConnector<P> {
@@ -264,7 +290,17 @@ impl<P: Protocol> ExternalConnector<P> {
             timeouts: Timeouts::from_settings(settings),
             secrets: Vec::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            model_cache: None,
+            model_policy: ModelListPolicy::default(),
         }
+    }
+
+    /// Disk cache for discovered models. Absent means every fetch is live
+    /// and a failed refresh cannot fall back to a previous list.
+    pub fn with_model_cache(mut self, cache: ConnectorModelCache, policy: ModelListPolicy) -> Self {
+        self.model_cache = Some(cache);
+        self.model_policy = policy;
+        self
     }
 
     /// Registers key values to redact out of every event and diagnostic.
@@ -311,6 +347,129 @@ impl<P: Protocol> ExternalConnector<P> {
             owner: self.owner(),
             state: serde_json::json!({ "external_id": external_id }),
         })
+    }
+
+    async fn discover_models_inner(&self, refresh: bool) -> ConnectorModelDiscovery {
+        let id = self.protocol.id();
+        let Some(program) = &self.program else {
+            return ConnectorModelDiscovery::Unavailable {
+                connector: id,
+                reason: format!(
+                    "`{}` was not found on PATH and no executable is configured",
+                    self.protocol.executable()
+                ),
+            };
+        };
+        let Some(args) = self.protocol.model_list_args(refresh) else {
+            return ConnectorModelDiscovery::Unsupported {
+                connector: id,
+                reason: format!(
+                    "{} has no documented model listing command; pass --model to select one",
+                    self.protocol.executable()
+                ),
+            };
+        };
+        let source = self.protocol.model_list_source().to_owned();
+        let now = Utc::now();
+        let cached = self
+            .model_cache
+            .as_ref()
+            .and_then(|cache| cache.read(id).ok().flatten());
+        if !refresh {
+            if let Some(cached) = &cached {
+                // A failed refresh stamps last_attempt_at later than
+                // fetched_at. That list is stale until a refresh succeeds,
+                // even if fetched_at is still inside the freshness window.
+                if !failed_since_fetch(cached) && cache_is_fresh(cached, &self.model_policy, now) {
+                    if let Some(mut catalog) =
+                        catalog_from_cache(id, cached, ConnectorModelFreshness::Current)
+                    {
+                        catalog.source = source;
+                        return ConnectorModelDiscovery::Current { catalog };
+                    }
+                }
+                if attempted_recently(cached, &self.model_policy, now) {
+                    return stale_or_failure(
+                        id,
+                        cached,
+                        &self.model_policy,
+                        format!("{source} was retried recently and is still failing"),
+                    );
+                }
+            }
+        }
+        let fetched = probe(program, &args, self.timeouts.health).await;
+        match fetched {
+            Ok(output) if output.success => {
+                match self.protocol.parse_models(&output.stdout, &output.stderr) {
+                    Ok(models) => {
+                        let catalog = ConnectorModelCatalog {
+                            connector: id,
+                            models: models.clone(),
+                            source: source.clone(),
+                            fetched_at: now,
+                            freshness: ConnectorModelFreshness::Current,
+                        };
+                        if let Some(cache) = &self.model_cache {
+                            let _ = cache.write(
+                                id,
+                                &CachedConnectorModels {
+                                    fetched_at: Some(now),
+                                    last_attempt_at: Some(now),
+                                    source,
+                                    models,
+                                },
+                            );
+                        }
+                        ConnectorModelDiscovery::Current { catalog }
+                    }
+                    Err(ModelParseError::Unsupported) => ConnectorModelDiscovery::Unsupported {
+                        connector: id,
+                        reason: format!(
+                            "{} has no documented model listing command",
+                            self.protocol.executable()
+                        ),
+                    },
+                    Err(ModelParseError::Malformed) => {
+                        record_attempt(&self.model_cache, id, &cached, now);
+                        if let Some(cached) = &cached {
+                            return stale_or_failure(
+                                id,
+                                cached,
+                                &self.model_policy,
+                                format!("{source} returned a catalog that could not be parsed"),
+                            );
+                        }
+                        ConnectorModelDiscovery::MalformedOutput {
+                            connector: id,
+                            reason: format!("{source} returned a catalog that could not be parsed"),
+                        }
+                    }
+                }
+            }
+            Ok(_output) => {
+                record_attempt(&self.model_cache, id, &cached, now);
+                let reason = format!("{source} exited unsuccessfully");
+                if let Some(cached) = &cached {
+                    return stale_or_failure(id, cached, &self.model_policy, reason);
+                }
+                ConnectorModelDiscovery::CommandFailure {
+                    connector: id,
+                    reason,
+                }
+            }
+            Err(error) => {
+                record_attempt(&self.model_cache, id, &cached, now);
+                let reason = error.message;
+                if let Some(cached) = &cached {
+                    return stale_or_failure(id, cached, &self.model_policy, reason);
+                }
+                ConnectorModelDiscovery::CommandFailure {
+                    connector: id,
+                    reason,
+                }
+            }
+        }
     }
 
     fn not_installed(&self) -> Error {
@@ -363,6 +522,7 @@ impl<P: Protocol> ExternalConnector<P> {
                     last_error: None,
                     pid: None,
                     workspace: request.workspace.clone(),
+                    model: request.model.clone(),
                 });
             state.cancel = Arc::clone(&cancel);
             state.workspace = request.workspace.clone();
@@ -370,6 +530,9 @@ impl<P: Protocol> ExternalConnector<P> {
             state.last_error = None;
             if external_id.is_some() {
                 state.external_id = external_id.clone();
+            }
+            if request.model.is_some() {
+                state.model = request.model.clone();
             }
         }
         let supervised = match process::spawn(&launch).await {
@@ -428,6 +591,42 @@ impl<P: Protocol> ExternalConnector<P> {
             );
         });
         Ok(Box::pin(EventReceiver { rx }))
+    }
+}
+
+fn record_attempt(
+    cache: &Option<ConnectorModelCache>,
+    id: ConnectorId,
+    cached: &Option<CachedConnectorModels>,
+    now: chrono::DateTime<Utc>,
+) {
+    let Some(cache) = cache else {
+        return;
+    };
+    let mut next = cached.clone().unwrap_or(CachedConnectorModels {
+        fetched_at: None,
+        last_attempt_at: None,
+        source: String::new(),
+        models: Vec::new(),
+    });
+    next.last_attempt_at = Some(now);
+    let _ = cache.write(id, &next);
+}
+
+fn stale_or_failure(
+    id: ConnectorId,
+    cached: &CachedConnectorModels,
+    policy: &ModelListPolicy,
+    reason: String,
+) -> ConnectorModelDiscovery {
+    if policy.stale_fallback {
+        if let Some(catalog) = catalog_from_cache(id, cached, ConnectorModelFreshness::Stale) {
+            return ConnectorModelDiscovery::CachedStale { catalog, reason };
+        }
+    }
+    ConnectorModelDiscovery::CommandFailure {
+        connector: id,
+        reason,
     }
 }
 
@@ -860,6 +1059,10 @@ impl<P: Protocol> Connector for ExternalConnector<P> {
         })
     }
 
+    fn discover_models(&self, refresh: bool) -> BoxFuture<'_, ConnectorModelDiscovery> {
+        Box::pin(async move { self.discover_models_inner(refresh).await })
+    }
+
     fn start(&self, request: TaskRequest) -> BoxFuture<'_, Result<EventStream<'_>>> {
         Box::pin(async move {
             let external_id = self
@@ -921,7 +1124,7 @@ impl<P: Protocol> Connector for ExternalConnector<P> {
                     self.protocol.id().as_str()
                 )));
             }
-            let (external_id, input, workspace) = {
+            let (external_id, input, workspace, model) = {
                 let mut sessions = self.sessions.lock().expect("sessions");
                 let session = sessions
                     .get_mut(&session_id)
@@ -933,6 +1136,7 @@ impl<P: Protocol> Connector for ExternalConnector<P> {
                     session.external_id.clone(),
                     input,
                     session.workspace.clone(),
+                    session.model.clone(),
                 )
             };
             let request = TaskRequest {
@@ -940,6 +1144,7 @@ impl<P: Protocol> Connector for ExternalConnector<P> {
                 prompt: input,
                 workspace,
                 continuation: None,
+                model,
             };
             self.run(request, external_id).await
         })

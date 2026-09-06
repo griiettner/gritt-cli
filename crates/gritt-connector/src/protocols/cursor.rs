@@ -8,13 +8,16 @@
 
 use std::collections::HashMap;
 
-use gritt_core::connector::{AuthState, ConnectorCapabilities, ConnectorId, TaskRequest};
+use gritt_core::connector::{
+    AuthState, ConnectorCapabilities, ConnectorId, ConnectorModel, TaskRequest,
+};
 use gritt_core::event::{EventKind, SessionStatus, StopReason};
 use gritt_core::tool::native;
 use gritt_core::ErrorKind;
 
-use super::{number, render, text, tool_call, tool_result};
+use super::{model_flag, number, render, text, tool_call, tool_result, ModelParseError};
 use crate::health::ProbeOutput;
+use crate::models::strip_ansi;
 use crate::supervise::{Normalized, Normalizer, Protocol};
 
 pub struct Cursor;
@@ -66,13 +69,93 @@ impl Protocol for Cursor {
             args.push("--resume".into());
             args.push(id.to_owned());
         }
+        args.extend(model_flag(request.model.as_deref()));
         args.push(request.prompt.clone());
         args
+    }
+
+    fn model_list_args(&self, _refresh: bool) -> Option<Vec<String>> {
+        Some(vec!["--list-models".into()])
+    }
+
+    fn model_list_source(&self) -> &'static str {
+        "cursor-agent --list-models"
+    }
+
+    fn parse_models(
+        &self,
+        stdout: &str,
+        _stderr: &str,
+    ) -> std::result::Result<Vec<ConnectorModel>, ModelParseError> {
+        parse_cursor_models(stdout)
     }
 
     fn normalizer(&self) -> Box<dyn Normalizer> {
         Box::new(CursorNormalizer::default())
     }
+}
+
+/// `cursor-agent --list-models` prints one model per line. Markers such as
+/// `(default)` and `(current)` are labels, not part of the id.
+pub fn parse_cursor_models(
+    stdout: &str,
+) -> std::result::Result<Vec<ConnectorModel>, ModelParseError> {
+    let text = strip_ansi(stdout);
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("available")
+            || lower.starts_with("models")
+            || lower.starts_with("usage:")
+            || lower.starts_with("error")
+        {
+            continue;
+        }
+        let stripped = line.trim_start_matches(['*', '-', '•', '>']).trim();
+        let mut tokens = stripped.split_whitespace();
+        let Some(first) = tokens.next() else {
+            continue;
+        };
+        let id = first.trim_end_matches([':', ',']).to_owned();
+        if id.is_empty() || !looks_like_model_id(&id) {
+            continue;
+        }
+        let rest: Vec<&str> = tokens.collect();
+        let label = rest
+            .iter()
+            .filter(|token| {
+                let t = token.trim_matches(['(', ')']).to_ascii_lowercase();
+                t != "default" && t != "current" && t != "preview"
+            })
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push(ConnectorModel {
+            id,
+            display_label: (!label.is_empty()).then_some(label),
+        });
+    }
+    if out.is_empty() {
+        return Err(ModelParseError::Malformed);
+    }
+    Ok(out)
+}
+
+fn looks_like_model_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let rest_ok = id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/');
+    let has_separator =
+        id.contains('-') || id.contains('/') || id.contains('.') || id.contains('_');
+    (first.is_ascii_alphanumeric() || first == '_' || first == '.') && rest_ok && has_separator
 }
 
 #[derive(Default)]

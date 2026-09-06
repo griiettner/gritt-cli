@@ -1,0 +1,2 @@
+this is not a model catalog
+usage: cursor-agent --list-models

@@ -185,6 +185,17 @@ impl Picker {
         self.highlight_current();
     }
 
+    /// Replaces title, hint, status, and rows of a list the user is
+    /// already looking at. The query stays, and the highlight follows the
+    /// row it was on by id, or clamps into the new list when that row is
+    /// gone.
+    pub fn replace_contents(&mut self, next: Picker) {
+        self.title = next.title;
+        self.hint = next.hint;
+        self.status = next.status;
+        self.replace_rows(next.rows);
+    }
+
     /// Replaces the rows of a list the user is already looking at: the
     /// query stays, and the highlight follows the row it was on by id, or
     /// clamps into the new list when that row is gone.

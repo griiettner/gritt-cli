@@ -18,7 +18,9 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use gritt_core::connector::{AuthState, Connector, ConnectorId, ConnectorInfo, Transport};
+use gritt_core::connector::{
+    AuthState, Connector, ConnectorId, ConnectorInfo, ConnectorModelDiscovery, Transport,
+};
 use gritt_core::provider::{ModelInfo, Protocol};
 use gritt_core::secret::Secret;
 use gritt_core::session::{Phase, Session, SessionId, SessionKind, SessionStore};
@@ -63,6 +65,9 @@ pub struct Opened {
     pub driver: Box<dyn Driver>,
     pub warnings: Vec<DraftWarning>,
     pub catalog: Option<CatalogState>,
+    /// Present for a new connector session after discovery ran. A resumed
+    /// session keeps its stored model and does not discover again.
+    pub connector_models: Option<ConnectorModelDiscovery>,
 }
 
 /// Cloning shares every handle, which is what
@@ -159,6 +164,45 @@ impl ControlPlane {
         self.builder.warm_catalog(profile).await
     }
 
+    /// Discovers the models an installed connector currently exposes.
+    /// Native uses the provider catalog instead.
+    pub async fn connector_models(
+        &self,
+        id: ConnectorId,
+        refresh: bool,
+    ) -> ConnectorModelDiscovery {
+        if id == ConnectorId::Native {
+            return ConnectorModelDiscovery::Unsupported {
+                connector: id,
+                reason: "native sessions use the provider model catalog".into(),
+            };
+        }
+        match self.connector(id) {
+            Some(connector) => connector.discover_models(refresh).await,
+            None => ConnectorModelDiscovery::Unavailable {
+                connector: id,
+                reason: format!("{} is not available in this control plane", id.as_str()),
+            },
+        }
+    }
+
+    /// Status and catalog lines print and REPL show for a discovery
+    /// result. The TUI picker renders the same value.
+    pub fn connector_model_lines(discovery: &ConnectorModelDiscovery) -> Vec<String> {
+        let mut lines = vec![discovery.describe()];
+        if let Some(catalog) = discovery.catalog() {
+            for model in &catalog.models {
+                match &model.display_label {
+                    Some(label) if label != &model.id => {
+                        lines.push(format!("  {}  {label}", model.id));
+                    }
+                    _ => lines.push(format!("  {}", model.id)),
+                }
+            }
+        }
+        lines
+    }
+
     /// Warms the profile's list and returns it for the model picker.
     pub async fn catalog(&self, profile: &str) -> Result<ProfileCatalog> {
         let state = self.warm_catalog(profile).await?;
@@ -217,7 +261,7 @@ impl ControlPlane {
             effort: stored_effort,
         } = &session.kind
         else {
-            let SessionKind::Connector { id } = session.kind else {
+            let SessionKind::Connector { id, .. } = session.kind else {
                 unreachable!("session kinds are native or connector");
             };
             return rejected(DraftError::ConnectorSession {
@@ -442,6 +486,7 @@ impl ControlPlane {
             connector,
             StartupRequest::from_flags(profile, model, None),
             phase,
+            false,
         )
         .await
         .map(|opened| opened.driver)
@@ -449,18 +494,23 @@ impl ControlPlane {
 
     /// [`ControlPlane::open`] with the full startup request and the notes
     /// a new native session produced, for a mode that reports them.
+    /// `refresh_models` is forwarded to [`ControlPlane::connector_models`]
+    /// for a new connector session.
     pub async fn open_with(
         &self,
         selector: SessionSelector,
         connector: Option<ConnectorId>,
         request: StartupRequest,
         phase: Option<Phase>,
+        refresh_models: bool,
     ) -> Result<Opened> {
         let existing = self.builder.find_session(&selector, phase).await?;
         let existing_id = existing.as_ref().map(|session| session.id.clone());
         let session = match existing {
             Some(session) => {
-                if let (Some(wanted), SessionKind::Connector { id }) = (connector, &session.kind) {
+                if let (Some(wanted), SessionKind::Connector { id, .. }) =
+                    (connector, &session.kind)
+                {
                     if wanted != *id {
                         return Err(Error::config(format!(
                             "session `{}` runs on {}, not {}",
@@ -481,6 +531,7 @@ impl ControlPlane {
                         driver: Box::new(opened.agent),
                         warnings: opened.warnings,
                         catalog: opened.catalog,
+                        connector_models: None,
                     });
                 }
                 Some(id) => {
@@ -511,10 +562,16 @@ impl ControlPlane {
                     }
                     let now = Utc::now();
                     let session_id = SessionId(uuid::Uuid::new_v4().to_string());
+                    let model = request
+                        .model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned);
                     let session = Session {
                         name: AgentBuilder::session_name(&selector, &session_id),
                         id: session_id,
-                        kind: SessionKind::Connector { id },
+                        kind: SessionKind::Connector { id, model },
                         phase: phase.unwrap_or(Phase::Coding),
                         workspace: self.builder.workspace_root().to_path_buf(),
                         created_at: now,
@@ -531,13 +588,19 @@ impl ControlPlane {
                 driver: Box::new(self.builder.agent_for(session).await?),
                 warnings: Vec::new(),
                 catalog: None,
+                connector_models: None,
             }),
-            SessionKind::Connector { id } => {
+            SessionKind::Connector { id, .. } => {
                 let connector = self.connector(*id).ok_or_else(|| {
                     Error::connector(format!("connector {} is not available", id.as_str()))
                 })?;
                 let created_now = existing_id.is_none();
                 let session_id = session.id.clone();
+                let connector_models = if created_now {
+                    Some(self.connector_models(*id, refresh_models).await)
+                } else {
+                    None
+                };
                 let opened = ConnectorSession::open(
                     session,
                     connector,
@@ -552,6 +615,7 @@ impl ControlPlane {
                         driver: Box::new(driver),
                         warnings: Vec::new(),
                         catalog: None,
+                        connector_models,
                     }),
                     Err(error) => {
                         // A row for a session that never opened is noise in

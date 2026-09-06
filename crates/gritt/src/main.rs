@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use clap::{Args, Parser, Subcommand};
-use gritt_connector::{default_connectors_with_secrets, environment_secrets, parse_connector_id};
+use gritt_connector::{default_connectors_configured, environment_secrets, parse_connector_id};
 use gritt_core::connector::{AuthState, ConnectorId};
 use gritt_core::event::{ApprovalDecision, EventKind};
 use gritt_core::mcp::{McpRuntimeSettings, McpServerState, TrustDecision};
@@ -145,7 +145,9 @@ struct SessionArgs {
     /// Provider profile. Defaults to the configured default.
     #[arg(long)]
     profile: Option<String>,
-    /// Model id or alias. Defaults to the configured default.
+    /// Model id or alias. For a native session this is the provider model;
+    /// for `--connector` it is passed to the agent as `--model`. Defaults
+    /// to the configured default, or the agent's own default.
     #[arg(long)]
     model: Option<String>,
     /// Reasoning effort for a new native session: auto, low, medium, or
@@ -170,6 +172,11 @@ struct SessionArgs {
     /// Skip the model list refresh.
     #[arg(long)]
     no_models: bool,
+    /// Refresh the connector model catalog instead of using a still-fresh
+    /// cache. Print and REPL list the catalog through the same service
+    /// the TUI uses.
+    #[arg(long, conflicts_with = "no_models")]
+    refresh_models: bool,
     /// Run through an installed agent instead of the native path:
     /// codex, claude, cursor, or opencode.
     #[arg(long, value_name = "NAME")]
@@ -382,7 +389,13 @@ fn plane(builder: AgentBuilder) -> Result<ControlPlane> {
         .filter_map(|(name, profile)| builder.keys.key(name, &profile.key).ok())
         .collect();
     secrets.extend(environment_secrets(&blocked));
-    let external = default_connectors_with_secrets(&builder.config.connectors, secrets)?;
+    let cache_dir = dirs::cache_dir().map(|dir| dir.join("gritt").join("connector-models"));
+    let external = default_connectors_configured(
+        &builder.config.connectors,
+        secrets,
+        cache_dir,
+        builder.config.model_list.clone(),
+    )?;
     let file_setup = Arc::new(setup::FileSetup::new(builder.workspace_root(), resolver()));
     Ok(ControlPlane::new(Arc::new(builder), external).with_setup(file_setup))
 }
@@ -471,6 +484,22 @@ fn startup_notes(opened: &Opened) -> Vec<String> {
                 lines.push(format!("warning: {reason}; capabilities are unreported"))
             }
             CatalogState::Fresh { .. } | CatalogState::Skipped => {}
+        }
+    }
+    if let Some(discovery) = &opened.connector_models {
+        let prefix = match discovery {
+            gritt_core::connector::ConnectorModelDiscovery::Current { .. } => "note",
+            _ => "warning",
+        };
+        for (index, line) in ControlPlane::connector_model_lines(discovery)
+            .into_iter()
+            .enumerate()
+        {
+            if index == 0 {
+                lines.push(format!("{prefix}: {line}"));
+            } else {
+                lines.push(line);
+            }
         }
     }
     lines.extend(
@@ -611,6 +640,7 @@ async fn print_turn(
             connector,
             startup_request(args),
             phase_flag(args),
+            args.refresh_models,
         )
         .await?;
     for line in startup_notes(&opened) {
@@ -698,6 +728,7 @@ async fn repl_loop(
             connector,
             startup_request(args),
             phase_flag(args),
+            args.refresh_models,
         )
         .await?;
     for line in startup_notes(&opened) {
@@ -944,8 +975,10 @@ async fn session_command(
                             model,
                             ..
                         } => format!("{provider_profile}/{model}"),
-                        gritt_core::session::SessionKind::Connector { id } =>
-                            format!("connector:{}", id.as_str()),
+                        gritt_core::session::SessionKind::Connector { id, model } => match model {
+                            Some(model) => format!("connector:{}:{model}", id.as_str()),
+                            None => format!("connector:{}", id.as_str()),
+                        },
                     },
                     session.updated_at.to_rfc3339()
                 );
@@ -1021,6 +1054,7 @@ async fn connectors_command(workspace: &Path, database: Option<&Path>) -> Result
         deny_all: true,
         ask: false,
         no_models: true,
+        refresh_models: false,
         connector: None,
     };
     let builder = builder(workspace, database, &args).await?;
@@ -1085,6 +1119,7 @@ async fn doctor_command(workspace: &Path, database: Option<&Path>) -> Result<Exi
         deny_all: true,
         ask: false,
         no_models: true,
+        refresh_models: false,
         connector: None,
     };
     // A broken config or connector setup is itself a finding, not a reason
@@ -1251,6 +1286,7 @@ mod tests {
             deny_all,
             ask,
             no_models: true,
+            refresh_models: false,
             connector: connector.map(str::to_owned),
         }
     }
@@ -1310,6 +1346,35 @@ mod tests {
     }
 
     #[test]
+    fn print_and_repl_accept_an_explicit_connector_catalog_refresh() {
+        let cli = Cli::try_parse_from([
+            "gritt",
+            "run",
+            "--connector",
+            "codex",
+            "--refresh-models",
+            "--model",
+            "gpt-5.4",
+            "hello",
+        ])
+        .unwrap();
+        let Some(Command::Run { session, .. }) = cli.command else {
+            panic!("run command")
+        };
+        assert!(session.refresh_models);
+        assert_eq!(session.model.as_deref(), Some("gpt-5.4"));
+        let cli = Cli::try_parse_from(["gritt", "repl", "--refresh-models"]).unwrap();
+        let Some(Command::Repl { session, .. }) = cli.command else {
+            panic!("repl command")
+        };
+        assert!(session.refresh_models);
+        assert!(
+            Cli::try_parse_from(["gritt", "run", "--refresh-models", "--no-models", "hello"])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn mcp_starts_for_every_native_path_and_no_external_one() {
         let native_session = SessionKind::Native {
             provider_profile: "openrouter".into(),
@@ -1318,6 +1383,7 @@ mod tests {
         };
         let external_session = SessionKind::Connector {
             id: ConnectorId::Codex,
+            model: None,
         };
         // An explicit native flag is still the native path.
         assert!(native_backend(Some(ConnectorId::Native), None));

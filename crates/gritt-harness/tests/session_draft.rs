@@ -628,6 +628,7 @@ async fn connector_sessions_are_outside_the_native_draft() {
             name: "codex-work".into(),
             kind: SessionKind::Connector {
                 id: ConnectorId::Codex,
+                model: None,
             },
             phase: Phase::Coding,
             workspace: fx.dir.path().to_path_buf(),
