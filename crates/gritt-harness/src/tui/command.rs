@@ -262,6 +262,8 @@ mod tests {
             Command::Details,
             Command::Sidebar,
             Command::Mcp,
+            Command::Version,
+            Command::Update,
             Command::Help,
             Command::Quit,
         ];

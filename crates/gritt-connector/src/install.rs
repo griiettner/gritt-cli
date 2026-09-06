@@ -496,7 +496,8 @@ mod tests {
             markers: &[".opencode/bin/"],
             update_args: &["upgrade"],
         };
-        let cases: Vec<(InstallSource, Option<(&str, Vec<&str>)>)> = vec![
+        type Expected = Option<(&'static str, Vec<&'static str>)>;
+        let cases: Vec<(InstallSource, Expected)> = vec![
             (
                 InstallSource::Homebrew {
                     name: "codex".into(),

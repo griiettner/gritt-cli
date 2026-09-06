@@ -557,6 +557,7 @@ tickets:
       plan: .agents/tasks/griiettner/TKT-0001-0025/TKT-0025/plan.md
       task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0025/task.md
       report: .agents/tasks/griiettner/TKT-0001-0025/TKT-0025/report.md
+      updates: .agents/tasks/griiettner/TKT-0001-0025/TKT-0025/updates/
     dependencies:
       - TKT-0024
     areas:

@@ -442,9 +442,12 @@ impl ConnectorVersionCheck {
     /// True only when a fresh, successful query says a newer version
     /// exists. A stale cache is reported as stale, never as current.
     pub fn update_available(&self) -> bool {
-        self.status().is_some_and(|status| {
-            status.update.is_some() && status.comparison == VersionComparison::Outdated
-        })
+        match self {
+            Self::Checked { status } => {
+                status.update.is_some() && status.comparison == VersionComparison::Outdated
+            }
+            _ => false,
+        }
     }
 
     /// One line for print, REPL, and TUI diagnostics.

@@ -31,7 +31,7 @@
                │ /new        Start a fresh draft without deleting the current session                   │
                │ /details    Expand or collapse tool output                                             │
                │ /mcp        Inspect configured MCP servers and their tools                             │
-               │ /help       Show commands, keys, and current limitations                               │
+               │ /version    Check the installed agent CLI against its newest published version         │
                ╰────────────────────────────────────────────────────────────────────────────────────────╯
                      /work/gritt  ·  not connected  ·  effort provider default  ·  plan  ·  fixture
 

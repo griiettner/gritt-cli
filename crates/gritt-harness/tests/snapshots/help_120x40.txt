@@ -3,44 +3,44 @@
 ## text
 
  api-cleanup  supervised  /work/gritt  fixture
- you   Tidy the public API of the store module.                                          │ Gritt 0.1.0
-                                                                                         │
- think Reading the module, then the callers.                                             │ Session
-                     ╭ Help ──────────────────────────────────────────────────────────────────────╮-cleanup
- gritt I read `store/│Commands                                                                    │rk/gritt
-       the crate uses│ /connect    Choose an AI provider or an installed agent                    │ervised
-       世界 renders a│ /models     Search the selected provider's models and choose one           │eaming
-                     │ /effort     Choose the reasoning effort for native turns                   │
- tool  -> file_read s│ /plan       Switch to the planning phase                                   │
-                     │ /code       Switch to the coding phase                                     │nai
- tool  <- file_read o│ /mode       Choose Planning, Supervised, Auto Approve, or Full Access      │nai/gpt-5-nano
-                     │[Shift+Tab]                                                                 │edium
-       tool output co│ /sessions   Search and resume sessions for this workspace  [Ctrl-S]        │
-                     │ /new        Start a fresh draft without deleting the current session       │
-                     │ /details    Expand or collapse tool output                                 │80
-                     │ /sidebar    Toggle the session information sidebar                         │0
-                     │ /mcp        Inspect configured MCP servers and their tools                 │0 in, last request
-                     │ /help       Show commands, keys, and current limitations                   │of context
+ you   Tidy the publi╭ Help ──────────────────────────────────────────────────────────────────────╮1.0
+                     │Commands                                                                    │
+ think Reading the mo│ /connect    Choose an AI provider or an installed agent                    │
+                     │ /models     Search the selected provider's models and choose one           │-cleanup
+ gritt I read `store/│ /effort     Choose the reasoning effort for native turns                   │rk/gritt
+       the crate uses│ /plan       Switch to the planning phase                                   │ervised
+       世界 renders a│ /code       Switch to the coding phase                                     │eaming
+                     │ /mode       Choose Planning, Supervised, Auto Approve, or Full Access      │
+ tool  -> file_read s│[Shift+Tab]                                                                 │
+                     │ /sessions   Search and resume sessions for this workspace  [Ctrl-S]        │nai
+ tool  <- file_read o│ /new        Start a fresh draft without deleting the current session       │nai/gpt-5-nano
+                     │ /details    Expand or collapse tool output                                 │edium
+       tool output co│ /sidebar    Toggle the session information sidebar                         │
+                     │ /mcp        Inspect configured MCP servers and their tools                 │
+                     │ /version    Check the installed agent CLI against its newest published     │80
+                     │version                                                                     │0
+                     │ /update     Update the installed agent CLI with its installer's command,   │0 in, last request
+                     │after approval                                                              │of context
+                     │ /help       Show commands, keys, and current limitations                   │
                      │ /quit       Leave Gritt and restore the terminal  [Ctrl-Q]                 │
-                     │                                                                            │
-                     │Keys                                                                        │.0412
-                     │ Enter                     send the prompt                                  │s session, listed p
-                     │ Ctrl-J / Shift-Enter      insert a newline                                 │
-                     │ Tab                       move focus, or complete a suggestion             │files
-                     │ Esc                       close the top overlay, then cancel a running turn│/gritt-harness/src/
-                     │ Ctrl-P                    the command palette                              │ed
-                     │ Shift+Tab                 cycle execution modes                            │.md
-                     │ Ctrl-G                    return to the latest output                      │ed (pre-existing)
-                     │ Ctrl-Y                    copy the draft or transcript to the Gritt buffer │
-                     │ Ctrl-A / Ctrl-W / Ctrl-U  select all, delete word, delete to line start    │ions
-                     │ Ctrl-Q                    quit                                             │d by Gritt
-                     │                                                                            │cal-memory ready
-                     │Limitations                                                                 │s
-                     │ · A session is pinned to its provider and model; /new changes them.        │cal-memory starting
-                     ╰ j/k scrolls · Esc closes ──────────────────────────────────────────────────╯ting and negotiatin
- ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
- │Ask Gritt to do something…                                                                                          │
- ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+                     │                                                                            │.0412
+                     │Keys                                                                        │s session, listed p
+                     │ Enter                     send the prompt                                  │
+                     │ Ctrl-J / Shift-Enter      insert a newline                                 │files
+                     │ Tab                       move focus, or complete a suggestion             │/gritt-harness/src/
+                     │ Esc                       close the top overlay, then cancel a running turn│ed
+                     │ Ctrl-P                    the command palette                              │.md
+                     │ Shift+Tab                 cycle execution modes                            │ed (pre-existing)
+                     │ Ctrl-G                    return to the latest output                      │
+                     │ Ctrl-Y                    copy the draft or transcript to the Gritt buffer │ions
+                     │ Ctrl-A / Ctrl-W / Ctrl-U  select all, delete word, delete to line start    │d by Gritt
+                     │ Ctrl-Q                    quit                                             │cal-memory ready
+                     │                                                                            │s
+                     │Limitations                                                                 │cal-memory starting
+                     │ · A session is pinned to its provider and model; /new changes them.        │ting and negotiatin
+ ╭───────────────────│ · An installed agent manages its own model, effort, and permissions.       │───────────────────╮
+ │Ask Gritt to do som│ · Cost is an estimate from listed prices, never a billed amount.           │                   │
+ ╰───────────────────╰ j/k scrolls · Esc closes ──────────────────────────────────────────────────╯───────────────────╯
  openai · openai/gpt-5-nano  effort medium  in 12480 out 3210  Enter sends · Ctrl-J newline · / commands
 
 ## styles dark

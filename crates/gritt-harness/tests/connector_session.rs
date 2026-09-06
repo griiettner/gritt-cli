@@ -1102,7 +1102,10 @@ fn opencode_vendor_fixture(home: &Path, update_exit: &str) -> (Arc<dyn Connector
         ("FAKE_AGENT_UPDATE_EXIT", update_exit.to_owned()),
         (
             "FAKE_AGENT_FIXTURE",
-            connector_fixture("text").display().to_string(),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../gritt-connector/tests/fixtures/opencode/text.jsonl")
+                .display()
+                .to_string(),
         ),
     ] {
         body.push_str(&format!("{name}='{value}'\nexport {name}\n"));
@@ -1298,7 +1301,7 @@ async fn repl_update_declined_or_failed_leaves_the_connector_usable() {
         "a declined update must not run"
     );
     assert!(
-        body.contains("Hello"),
+        body.contains("PONG"),
         "the session still runs a turn afterwards: {body}"
     );
 
