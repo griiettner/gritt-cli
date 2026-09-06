@@ -10,7 +10,10 @@ use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event as TerminalEvent, KeyEventKind,
 };
 use crossterm::execute;
-use gritt_core::connector::{AuthState, ConnectorId, ConnectorModelDiscovery};
+use gritt_core::connector::{
+    AuthState, ConnectorId, ConnectorModelDiscovery, ConnectorUpdateOutcome, ConnectorVersionCheck,
+    VersionCheckMode,
+};
 use gritt_core::event::{ApprovalDecision, ApprovalRequest, Event};
 use gritt_core::mcp::McpServerSnapshot;
 use gritt_core::session::{BoxFuture, Session, SessionStore};
@@ -64,6 +67,20 @@ enum UiMsg {
         selection: u64,
         connector: ConnectorId,
         result: ConnectorModelDiscovery,
+    },
+    /// A version check for the live connector session. `operation` is 0
+    /// for the detached check that follows opening a session; otherwise
+    /// it names the `/version` request it answers.
+    ConnectorVersion {
+        operation: u64,
+        generation: u64,
+        connector: ConnectorId,
+        result: ConnectorVersionCheck,
+    },
+    ConnectorUpdate {
+        operation: u64,
+        connector: ConnectorId,
+        result: ConnectorUpdateOutcome,
     },
     Sessions {
         operation: u64,
@@ -1188,6 +1205,30 @@ async fn on_message(
             }
             app.apply_connector_catalog(selection, connector, result);
         }
+        UiMsg::ConnectorVersion {
+            operation,
+            generation,
+            connector,
+            result,
+        } => {
+            if operation != 0 && !runtime.finish_work(app, Work::Version, operation) {
+                return Ok(Action::None);
+            }
+            if generation != app.sidebar.generation {
+                return Ok(Action::None);
+            }
+            app.apply_connector_version(connector, result);
+        }
+        UiMsg::ConnectorUpdate {
+            operation,
+            connector,
+            result,
+        } => {
+            if !runtime.finish_work(app, Work::Update, operation) {
+                return Ok(Action::None);
+            }
+            app.apply_connector_update(connector, result);
+        }
         UiMsg::Sessions {
             operation,
             sessions,
@@ -1240,6 +1281,26 @@ async fn on_message(
                     // its replacement exists.
                     drop(pending.previous);
                     adopt(app, &runtime.plane, driver.as_ref()).await?;
+                    // The CLI's version is advisory and reads local
+                    // evidence plus the cache first, so it runs detached:
+                    // it never supersedes the user's request and never
+                    // delays the session it describes.
+                    if let Some(connector) = app.connector {
+                        let plane = Arc::clone(&runtime.plane);
+                        let tx = runtime.tx.clone();
+                        let generation = app.sidebar.generation;
+                        runtime.spawn_detached(async move {
+                            let result = plane
+                                .connector_version(connector, VersionCheckMode::Cached)
+                                .await;
+                            let _ = tx.send(UiMsg::ConnectorVersion {
+                                operation: 0,
+                                generation,
+                                connector,
+                                result,
+                            });
+                        });
+                    }
                     app.show_draft_warnings(&warnings);
                     *idle_agent = Some(driver);
                     scan_changes(runtime, app.sidebar.generation);
@@ -1620,6 +1681,36 @@ async fn on_action(
                 let _ = tx.send(UiMsg::ConnectorCatalog {
                     operation,
                     selection,
+                    connector,
+                    result,
+                });
+            });
+        }
+        Action::LoadConnectorVersion { connector, mode } => {
+            let plane = Arc::clone(&runtime.plane);
+            let tx = runtime.tx.clone();
+            let generation = app.sidebar.generation;
+            let operation = runtime.next_operation();
+            let label = format!("checking {} version", connector.as_str());
+            runtime.spawn(app, Work::Version, operation, label, async move {
+                let result = plane.connector_version(connector, mode).await;
+                let _ = tx.send(UiMsg::ConnectorVersion {
+                    operation,
+                    generation,
+                    connector,
+                    result,
+                });
+            });
+        }
+        Action::RunConnectorUpdate { connector, action } => {
+            let plane = Arc::clone(&runtime.plane);
+            let tx = runtime.tx.clone();
+            let operation = runtime.next_operation();
+            let label = format!("updating {}: {}", connector.as_str(), action.display());
+            runtime.spawn(app, Work::Update, operation, label, async move {
+                let result = plane.connector_update(connector, action).await;
+                let _ = tx.send(UiMsg::ConnectorUpdate {
+                    operation,
                     connector,
                     result,
                 });

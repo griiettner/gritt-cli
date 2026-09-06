@@ -1053,7 +1053,9 @@ fn draw_file_diff(
 
 fn draw_help(frame: &mut Frame<'_>, app: &App, scroll: usize, area: Rect) {
     let theme = &app.theme;
-    let target = overlay_area(area, 78, (area.height * 4 / 5).max(8));
+    // The command list grows with the registry, so help takes the height
+    // it can get; j/k scrolls whatever still does not fit.
+    let target = overlay_area(area, 78, area.height.saturating_sub(2).max(8));
     frame.render_widget(Clear, target);
     let block = panel(theme, "Help".to_owned(), "j/k scrolls · Esc closes");
     let inner = block.inner(target);

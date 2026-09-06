@@ -70,6 +70,9 @@ pub struct ModelSection {
     /// A connector owns its own model and effort. Set for connector
     /// sessions so the sidebar says so instead of showing Gritt's values.
     pub managed_by_agent: bool,
+    /// The agent CLI's version state: installed version, and whether a
+    /// newer one is published. Only for connector sessions.
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -259,6 +262,9 @@ impl SidebarModel {
                 "Managed by agent".to_owned(),
                 theme.muted(),
             )));
+            if self.model.version.is_some() {
+                lines.push(field(theme, "cli ", value(&self.model.version), width));
+            }
         } else {
             lines.push(field(theme, "id  ", value(&self.model.model), width));
             lines.push(field(theme, "effort", value(&self.model.effort), width));

@@ -102,6 +102,64 @@ marks it stale rather than presenting it as current. A missing CLI,
 unsupported listing command, failed command, or unreadable output is a
 typed diagnostic and does not affect native sessions or other connectors.
 
+## Versions and updates
+
+Gritt can tell when an installed agent CLI is behind the newest version its
+installer publishes, and can run that installer's documented update command
+after you approve it. Print, REPL, and the full-screen UI share one
+control-plane operation for the check and one for the update.
+
+Who installed the executable is read from evidence on disk, never guessed
+from a path prefix: a Homebrew `Cellar` or `Caskroom` directory behind the
+symlink, an npm package directory with its `package.json`, a pipx venv with
+its `pipx_metadata.json`, a Cargo `.crates.toml` entry naming the binary,
+or the vendor installer's own directory under your home directory. Two
+owners with evidence are reported as ambiguous and no command is offered;
+no evidence is reported as unknown with the same result.
+
+| Owner | Newest version from | Update command |
+| --- | --- | --- |
+| Homebrew formula | `brew info --json=v2 <name>` | `brew upgrade <name>` |
+| Homebrew cask | `brew info --json=v2 <name>` | `brew upgrade --cask <name>` |
+| npm | `npm view <package> version` | `npm install -g <package>@latest` |
+| Cargo | `cargo search <crate> --limit 1` | `cargo install <crate>` |
+| pipx | not published | `pipx upgrade <package>` |
+| Claude Code native installer | not published | `claude update` |
+| Cursor CLI installer | not published | `cursor-agent update` |
+| OpenCode install script | not published | `opencode upgrade` |
+
+Every command is an executable plus a fixed argument vector. It is shown to
+you exactly as it runs and never joined into a shell string. Nothing from a
+prompt, a credential, or the agent's output enters it.
+
+- `gritt connectors --check` reports each installed agent's version, owner,
+  newest published version, and the command Gritt would run. `--refresh`
+  queries again instead of using a cached answer.
+- `gritt connectors --update <name>` shows the command and asks before
+  running it; `--yes` answers for you. A successful update is followed by a
+  fresh check.
+- In the REPL, `/version [refresh]` and `/update` do the same; `/update`
+  asks `[y/N]` on the prompt.
+- In the full-screen UI, the sidebar's model block shows the CLI version
+  state for a connector session, `/version` checks again, and `/update`
+  opens the same approval overlay a tool call uses.
+
+The check is advisory and never delays a session. Opening a connector
+session reads the installed version and owner from local evidence and the
+newest version from the cache only; the full-screen UI then checks in the
+background. A successful answer is cached for the model list refresh
+interval and shown with its age. When a query fails the last answer is kept
+and marked stale, and a stale answer is never presented as a current update
+offer. Network, authentication, malformed, and unsupported-source failures
+are reported by class; the text a package manager printed stays in the
+process.
+
+An update runs through the same supervised process path as an agent task:
+it is cancellable, stops after a bounded silence, and its process tree is
+killed either way. Its last output lines are kept, redacted and capped, for
+the failure report. A declined, failed, or cancelled update leaves the
+connector as it was.
+
 ## PTY fallback
 
 Machine-readable output is preferred. A connector listed under

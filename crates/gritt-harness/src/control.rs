@@ -21,6 +21,9 @@ use chrono::Utc;
 use gritt_core::connector::{
     AuthState, Connector, ConnectorId, ConnectorInfo, ConnectorModelDiscovery, Transport,
 };
+use gritt_core::connector::{
+    ConnectorUpdateOutcome, ConnectorVersionCheck, UpdateAction, VersionCheckMode,
+};
 use gritt_core::provider::{ModelInfo, Protocol};
 use gritt_core::secret::Secret;
 use gritt_core::session::{Phase, Session, SessionId, SessionKind, SessionStore};
@@ -68,6 +71,10 @@ pub struct Opened {
     /// Present for a new connector session after discovery ran. A resumed
     /// session keeps its stored model and does not discover again.
     pub connector_models: Option<ConnectorModelDiscovery>,
+    /// The offline version status of a new connector session: installed
+    /// version and owner from local evidence, newest version from the
+    /// cache only, so opening never waits on a package manager.
+    pub connector_version: Option<ConnectorVersionCheck>,
 }
 
 /// Cloning shares every handle, which is what
@@ -198,6 +205,68 @@ impl ControlPlane {
                     }
                     _ => lines.push(format!("  {}", model.id)),
                 }
+            }
+        }
+        lines
+    }
+
+    /// Reports an installed connector's version, its owner, and the newest
+    /// version that owner publishes. Advisory: never an error, and never
+    /// on the path to opening a session.
+    pub async fn connector_version(
+        &self,
+        id: ConnectorId,
+        mode: VersionCheckMode,
+    ) -> ConnectorVersionCheck {
+        if id == ConnectorId::Native {
+            return ConnectorVersionCheck::Unsupported {
+                connector: id,
+                reason: "native sessions run inside Gritt; there is no CLI to update".into(),
+            };
+        }
+        match self.connector(id) {
+            Some(connector) => connector.check_version(mode).await,
+            None => ConnectorVersionCheck::NotInstalled {
+                connector: id,
+                reason: format!("{} is not available in this control plane", id.as_str()),
+            },
+        }
+    }
+
+    /// Runs an update the user has already approved. The caller shows
+    /// `action.display()` and collects the approval; nothing here prompts.
+    pub async fn connector_update(
+        &self,
+        id: ConnectorId,
+        action: UpdateAction,
+    ) -> ConnectorUpdateOutcome {
+        if id == ConnectorId::Native {
+            return ConnectorUpdateOutcome::NoAction {
+                connector: id,
+                reason: "native sessions have no CLI to update".into(),
+            };
+        }
+        match self.connector(id) {
+            Some(connector) => connector.update(action).await,
+            None => ConnectorUpdateOutcome::NoAction {
+                connector: id,
+                reason: format!("{} is not available in this control plane", id.as_str()),
+            },
+        }
+    }
+
+    /// Status lines print and REPL show for a version check; the TUI
+    /// renders the same values in its sidebar.
+    pub fn connector_version_lines(check: &ConnectorVersionCheck) -> Vec<String> {
+        let mut lines = vec![check.describe()];
+        if let Some(status) = check.status() {
+            if let Some(source) = &status.latest_source {
+                lines.push(format!("  latest from {source}"));
+            }
+            match (&status.update, &status.next_step) {
+                (Some(action), _) => lines.push(format!("  update: {}", action.display())),
+                (None, Some(next)) => lines.push(format!("  {next}")),
+                (None, None) => {}
             }
         }
         lines
@@ -532,6 +601,7 @@ impl ControlPlane {
                         warnings: opened.warnings,
                         catalog: opened.catalog,
                         connector_models: None,
+                        connector_version: None,
                     });
                 }
                 Some(id) => {
@@ -589,6 +659,7 @@ impl ControlPlane {
                 warnings: Vec::new(),
                 catalog: None,
                 connector_models: None,
+                connector_version: None,
             }),
             SessionKind::Connector { id, .. } => {
                 let connector = self.connector(*id).ok_or_else(|| {
@@ -598,6 +669,11 @@ impl ControlPlane {
                 let session_id = session.id.clone();
                 let connector_models = if created_now {
                     Some(self.connector_models(*id, refresh_models).await)
+                } else {
+                    None
+                };
+                let connector_version = if created_now {
+                    Some(self.connector_version(*id, VersionCheckMode::Offline).await)
                 } else {
                     None
                 };
@@ -616,6 +692,7 @@ impl ControlPlane {
                         warnings: Vec::new(),
                         catalog: None,
                         connector_models,
+                        connector_version,
                     }),
                     Err(error) => {
                         // A row for a session that never opened is noise in

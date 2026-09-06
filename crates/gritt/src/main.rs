@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use clap::{Args, Parser, Subcommand};
 use gritt_connector::{default_connectors_configured, environment_secrets, parse_connector_id};
-use gritt_core::connector::{AuthState, ConnectorId};
+use gritt_core::connector::{
+    AuthState, ConnectorId, ConnectorUpdateOutcome, ConnectorVersionCheck, VersionCheckMode,
+};
 use gritt_core::event::{ApprovalDecision, EventKind};
 use gritt_core::mcp::{McpRuntimeSettings, McpServerState, TrustDecision};
 use gritt_core::provider::ReasoningEffort;
@@ -19,7 +21,7 @@ use gritt_harness::agent::{AgentBuilder, ApprovalMode, SessionSelector, TurnStat
 use gritt_harness::control::{ControlPlane, Opened};
 use gritt_harness::draft::{CatalogState, DraftWarning, SessionDraft};
 use gritt_harness::mcp::McpRuntime;
-use gritt_harness::modes::print::{PrintUi, PrintUiOptions};
+use gritt_harness::modes::print::{read_yes_no, PrintUi, PrintUiOptions};
 use gritt_harness::modes::repl::{line_prompter, run_repl, CancelSlot, LineInput};
 use gritt_harness::startup::StartupRequest;
 use gritt_harness::store::{resolve_location, Store, StoreTrustStore};
@@ -125,7 +127,23 @@ enum Command {
     },
     /// List connectors with installed state, version, auth, and
     /// capabilities.
-    Connectors,
+    Connectors {
+        /// Also report each installed connector's newest published
+        /// version, who installed it, and the update command it would run.
+        #[arg(long)]
+        check: bool,
+        /// Query the package source again instead of using a still-fresh
+        /// cached answer.
+        #[arg(long, requires = "check")]
+        refresh: bool,
+        /// Update one connector with its owner's documented command. The
+        /// command is shown and runs only after confirmation.
+        #[arg(long, value_name = "NAME")]
+        update: Option<String>,
+        /// Confirm the update without prompting.
+        #[arg(long, requires = "update")]
+        yes: bool,
+    },
     /// Diagnose this installation: config locations and precedence, key
     /// availability, database and migrations, model cache freshness,
     /// connectors, and terminal capabilities. Never prints a secret.
@@ -389,11 +407,16 @@ fn plane(builder: AgentBuilder) -> Result<ControlPlane> {
         .filter_map(|(name, profile)| builder.keys.key(name, &profile.key).ok())
         .collect();
     secrets.extend(environment_secrets(&blocked));
-    let cache_dir = dirs::cache_dir().map(|dir| dir.join("gritt").join("connector-models"));
+    let cache_root = dirs::cache_dir().map(|dir| dir.join("gritt"));
+    let cache_dir = cache_root.as_ref().map(|dir| dir.join("connector-models"));
+    let version_cache_dir = cache_root
+        .as_ref()
+        .map(|dir| dir.join("connector-versions"));
     let external = default_connectors_configured(
         &builder.config.connectors,
         secrets,
         cache_dir,
+        version_cache_dir,
         builder.config.model_list.clone(),
     )?;
     let file_setup = Arc::new(setup::FileSetup::new(builder.workspace_root(), resolver()));
@@ -492,6 +515,25 @@ fn startup_notes(opened: &Opened) -> Vec<String> {
             _ => "warning",
         };
         for (index, line) in ControlPlane::connector_model_lines(discovery)
+            .into_iter()
+            .enumerate()
+        {
+            if index == 0 {
+                lines.push(format!("{prefix}: {line}"));
+            } else {
+                lines.push(line);
+            }
+        }
+    }
+    if let Some(check) = &opened.connector_version {
+        let prefix = if check.update_available()
+            || matches!(check, ConnectorVersionCheck::CachedStale { .. })
+        {
+            "warning"
+        } else {
+            "note"
+        };
+        for (index, line) in ControlPlane::connector_version_lines(check)
             .into_iter()
             .enumerate()
         {
@@ -1041,7 +1083,18 @@ async fn session_command(
     Ok(ExitCode::SUCCESS)
 }
 
-async fn connectors_command(workspace: &Path, database: Option<&Path>) -> Result<ExitCode> {
+struct ConnectorsOptions {
+    check: bool,
+    refresh: bool,
+    update: Option<String>,
+    yes: bool,
+}
+
+async fn connectors_command(
+    workspace: &Path,
+    database: Option<&Path>,
+    options: ConnectorsOptions,
+) -> Result<ExitCode> {
     let args = SessionArgs {
         mode: None,
         session: None,
@@ -1100,6 +1153,66 @@ async fn connectors_command(workspace: &Path, database: Option<&Path>) -> Result
                 );
             }
             Err(error) => println!("{:<12} {:<14} {}", id.as_str(), "error", error.message),
+        }
+    }
+    if options.check {
+        let mode = if options.refresh {
+            VersionCheckMode::Refresh
+        } else {
+            VersionCheckMode::Cached
+        };
+        println!();
+        for id in ConnectorId::ORDER {
+            if id == ConnectorId::Native {
+                continue;
+            }
+            let check = plane.connector_version(id, mode).await;
+            if matches!(check, ConnectorVersionCheck::NotInstalled { .. }) {
+                continue;
+            }
+            for line in ControlPlane::connector_version_lines(&check) {
+                println!("{line}");
+            }
+        }
+    }
+    if let Some(name) = options.update {
+        let Some(id) = parse_connector_id(&name).filter(|id| *id != ConnectorId::Native) else {
+            eprintln!("error: `{name}` is not an external connector; use codex, claude, cursor, or opencode");
+            return Ok(ExitCode::FAILURE);
+        };
+        let check = plane.connector_version(id, VersionCheckMode::Cached).await;
+        for line in ControlPlane::connector_version_lines(&check) {
+            println!("{line}");
+        }
+        let Some(action) = check.status().and_then(|status| status.update.clone()) else {
+            println!("no update to run");
+            return Ok(ExitCode::SUCCESS);
+        };
+        let approved = options.yes || {
+            eprint!("run `{}`? [y/N] ", action.display());
+            let mut stdin = std::io::BufReader::new(std::io::stdin());
+            read_yes_no(&mut stdin) == ApprovalDecision::Approved
+        };
+        let outcome = if approved {
+            plane.connector_update(id, action).await
+        } else {
+            ConnectorUpdateOutcome::Declined { connector: id }
+        };
+        println!("{}", outcome.describe());
+        match &outcome {
+            ConnectorUpdateOutcome::Updated { recheck, .. } => {
+                for line in ControlPlane::connector_version_lines(recheck) {
+                    println!("{line}");
+                }
+            }
+            ConnectorUpdateOutcome::Failed { output, .. } => {
+                for line in output {
+                    eprintln!("  {line}");
+                }
+                return Ok(ExitCode::FAILURE);
+            }
+            ConnectorUpdateOutcome::TimedOut { .. } => return Ok(ExitCode::FAILURE),
+            _ => {}
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -1252,7 +1365,24 @@ async fn main() -> ExitCode {
         }
         Some(Command::Mcp { command }) => mcp_command(&workspace, database, command).await,
         Some(Command::Session { command }) => session_command(&workspace, database, command).await,
-        Some(Command::Connectors) => connectors_command(&workspace, database).await,
+        Some(Command::Connectors {
+            check,
+            refresh,
+            update,
+            yes,
+        }) => {
+            connectors_command(
+                &workspace,
+                database,
+                ConnectorsOptions {
+                    check,
+                    refresh,
+                    update,
+                    yes,
+                },
+            )
+            .await
+        }
         Some(Command::Doctor) => doctor_command(&workspace, database).await,
         Some(Command::Telemetry) => telemetry_command(&workspace, database).await,
     };
@@ -1372,6 +1502,30 @@ mod tests {
             Cli::try_parse_from(["gritt", "run", "--refresh-models", "--no-models", "hello"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn connectors_flags_parse_and_update_confirmation_is_explicit() {
+        let cli = Cli::try_parse_from(["gritt", "connectors", "--check", "--refresh"]).unwrap();
+        let Some(Command::Connectors {
+            check,
+            refresh,
+            update,
+            yes,
+        }) = cli.command
+        else {
+            panic!("connectors command")
+        };
+        assert!(check && refresh && update.is_none() && !yes);
+        let cli =
+            Cli::try_parse_from(["gritt", "connectors", "--update", "codex", "--yes"]).unwrap();
+        let Some(Command::Connectors { update, yes, .. }) = cli.command else {
+            panic!("connectors command")
+        };
+        assert_eq!(update.as_deref(), Some("codex"));
+        assert!(yes);
+        assert!(Cli::try_parse_from(["gritt", "connectors", "--refresh"]).is_err());
+        assert!(Cli::try_parse_from(["gritt", "connectors", "--yes"]).is_err());
     }
 
     #[test]
