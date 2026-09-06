@@ -632,6 +632,15 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
         return;
     }
+    if let Some((text, tone)) = &app.version_notice {
+        let style = match tone {
+            crate::tui::app::NoticeTone::Warning => theme.warning(),
+            crate::tui::app::NoticeTone::Muted => theme.muted(),
+        };
+        spans.push(Span::styled(text.clone(), style));
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     spans.push(Span::styled(
         if app.is_connected() {
             format!("{} · {}", app.status.profile, app.status.model)

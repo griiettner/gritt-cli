@@ -60,3 +60,13 @@ The commands listed in `report.md` under Validation, after these changes.
 ## Remaining follow-up
 
 None from this round. The report's follow-up list stands.
+
+## Footer tone (post-merge)
+
+The version status was drawn through the footer's `notice`, which uses the
+error style, so "codex 0.153.4 is current" appeared bold red. Version and
+update status now have their own footer slot, `App::version_notice`, with a
+`NoticeTone`: muted when there is nothing to do, and a new `warning` palette
+token (amber on dark, mustard on light) when an update is available. Failed
+or timed-out updates still use the error notice. `Theme::warning` is
+available to other advisory lines.
