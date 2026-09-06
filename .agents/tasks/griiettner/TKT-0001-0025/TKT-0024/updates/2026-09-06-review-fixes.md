@@ -136,3 +136,46 @@ rejects it.
 Unchanged from the original report. Claude still has no listing command.
 Cursor still has no live binary on this machine. A resumed connector
 session still ignores `--model`.
+
+## Review round 2
+
+Verdict: `pass`, on commit `9bc3d8dd26d3205ad6bdd1cfd16a2b66dcea1cf2`.
+
+Each finding was checked against the diff and its new test:
+
+1. `App.connector_model` holds the connector choice; `/new` clears it and
+   leaves `draft.model` alone; `SelectConnector` reads the connector field
+   (`tui/run.rs:1566`).
+2. `failed_since_fetch` guards the `Current` path. A successful refresh
+   stamps `fetched_at` and `last_attempt_at` from the same instant
+   (`supervise.rs:417`), so a success is never misread as a failure.
+3. Cursor and OpenCode parsers return `Malformed` for empty output.
+4. `open_with` forwards `refresh_models` to the shared
+   `ControlPlane::connector_models`; `--refresh-models` and REPL
+   `/models [refresh]` use it; `connector_model_lines` is the one
+   formatter.
+5. `Picker::replace_contents` carries status and hint onto the open
+   overlay; the test asserts loading, ready, and stale transitions.
+6. The report names the commands that ran and the one that did not.
+
+### Routing deviation
+
+The documented reviewer route (`codex exec --model gpt-6-astra`) produced
+the round 1 verdict, but its first attempt hung for 45 minutes on its
+own `~/.codex/tmp/arg0` lock without contacting the model, and the round 2
+run was killed by a harness restart before returning. The orchestrator
+(Claude Code, this session) performed the round 2 review directly against
+`review/ticket` and `review/impact`, using the round 1 findings as the
+checklist.
+
+### CI
+
+`main` is red on all three platforms at `d007329` and the three commits
+before it. On this branch macOS passes; Ubuntu fails on
+`a_descendant_that_outlives_its_parent_is_cleaned_up_too`
+(`tests/mcp_runtime.rs`) and Windows fails to compile a unix-only
+`ExitStatusExt` import in `crates/gritt-harness/src/changes.rs:501`, added
+by TKT-0019. Neither file is touched by this ticket. The merge gate is
+the explicit review above, per the chain rule for unreliable CI. Follow-up:
+a hygiene ticket to cfg-gate `changes.rs` for Windows and to look at the
+Ubuntu cleanup test.
