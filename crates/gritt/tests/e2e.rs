@@ -853,3 +853,76 @@ fn interrupting_mcp_startup_leaves_no_server_running() {
         thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// `gritt connectors --check` reports an installed agent's version and
+/// owner, and `--update NAME --yes` runs the owner's documented command
+/// as an argument vector. The agent is a fake installed the way the
+/// OpenCode install script does it, under the isolated `HOME`.
+#[test]
+#[cfg(unix)]
+fn connectors_check_and_update_run_the_documented_vendor_command() {
+    let provider = serve(Vec::new(), false);
+    let space = Space::new(provider.port);
+    let home = space.path();
+    let version_file = home.join("opencode-version.txt");
+    std::fs::write(&version_file, "1.0.0\n").unwrap();
+    let exe = home.join(".opencode/bin/opencode");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../gritt-connector/tests/fake-agent/agent.sh");
+    std::fs::write(
+        &exe,
+        format!(
+            "#!/bin/sh\nFAKE_AGENT_VERSION_FILE='{}'\nexport FAKE_AGENT_VERSION_FILE\n\
+             FAKE_AGENT_UPDATE_TO='2.0.0'\nexport FAKE_AGENT_UPDATE_TO\nexec '{}' \"$@\"\n",
+            version_file.display(),
+            script.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let config = home.join("config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&executables_section("opencode", &exe));
+    std::fs::write(&config, text).unwrap();
+
+    let check = space.run(&["connectors", "--check"]);
+    assert!(check.status.success(), "stderr: {}", stderr(&check));
+    let out = stdout(&check);
+    assert!(out.contains("opencode 1.0.0"), "{out}");
+    assert!(out.contains("OpenCode install script"), "{out}");
+    assert!(out.contains("update: "), "{out}");
+    assert!(out.contains("upgrade"), "{out}");
+
+    let declined = space.run(&["connectors", "--update", "opencode"]);
+    assert!(declined.status.success(), "stderr: {}", stderr(&declined));
+    assert!(
+        stdout(&declined).contains("declined"),
+        "with no terminal answer the update must not run: {}",
+        stdout(&declined)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&version_file).unwrap().trim(),
+        "1.0.0"
+    );
+
+    let updated = space.run(&["connectors", "--update", "opencode", "--yes"]);
+    assert!(updated.status.success(), "stderr: {}", stderr(&updated));
+    let out = stdout(&updated);
+    assert!(out.contains("opencode updated to 2.0.0"), "{out}");
+    assert!(
+        out.contains("opencode 2.0.0"),
+        "the recheck sees the new version: {out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&version_file).unwrap().trim(),
+        "2.0.0"
+    );
+
+    let native = space.run(&["connectors", "--update", "native"]);
+    assert!(!native.status.success());
+    assert!(stderr(&native).contains("not an external connector"));
+}

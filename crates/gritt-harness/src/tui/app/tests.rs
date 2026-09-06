@@ -2129,3 +2129,266 @@ fn a_connector_session_does_not_relabel_gritts_mcp_inventory() {
     assert!(text.contains("MCP owned by Gritt"), "{text}");
     assert!(text.contains("codex's own MCP: not reported"), "{text}");
 }
+
+// -- connector CLI versions and updates (TKT-0025) --------------------------
+
+use gritt_core::connector::{
+    ConnectorUpdateOutcome, ConnectorVersionCheck, ConnectorVersionStatus, InstallSource,
+    UpdateAction, VersionCheckFailure, VersionCheckMode, VersionComparison, VersionFreshness,
+};
+
+fn connector_session(id: gritt_core::connector::ConnectorId) -> Session {
+    let now = Utc::now();
+    Session {
+        id: SessionId("cv".into()),
+        name: "agent-run".into(),
+        kind: gritt_core::session::SessionKind::Connector { id, model: None },
+        phase: Phase::Coding,
+        workspace: "/ws".into(),
+        created_at: now,
+        updated_at: now,
+        parent_id: None,
+    }
+}
+
+fn npm_action() -> UpdateAction {
+    UpdateAction {
+        program: "npm".into(),
+        args: vec!["install".into(), "-g".into(), "@openai/codex@latest".into()],
+        source: InstallSource::Npm {
+            package: "@openai/codex".into(),
+        },
+    }
+}
+
+fn version_status(
+    installed: &str,
+    latest: Option<&str>,
+    comparison: VersionComparison,
+    freshness: VersionFreshness,
+    source: InstallSource,
+    update: Option<UpdateAction>,
+    next_step: Option<&str>,
+) -> ConnectorVersionStatus {
+    ConnectorVersionStatus {
+        connector: gritt_core::connector::ConnectorId::Codex,
+        installed: Some(installed.into()),
+        latest: latest.map(str::to_owned),
+        comparison,
+        source,
+        latest_source: latest.map(|_| "npm view @openai/codex version".to_owned()),
+        checked_at: Utc::now(),
+        freshness,
+        update,
+        next_step: next_step.map(str::to_owned),
+    }
+}
+
+#[test]
+fn a_version_result_fills_the_sidebar_and_an_update_asks_through_the_overlay() {
+    let mut app = plain();
+    let codex = gritt_core::connector::ConnectorId::Codex;
+    app.set_session(&connector_session(codex));
+    assert_eq!(app.sidebar.model.version, None);
+    assert_eq!(
+        app.dispatch(Command::Version, None),
+        Action::LoadConnectorVersion {
+            connector: codex,
+            mode: VersionCheckMode::Refresh,
+        }
+    );
+    let outdated = ConnectorVersionCheck::Checked {
+        status: version_status(
+            "0.1.0",
+            Some("0.2.0"),
+            VersionComparison::Outdated,
+            VersionFreshness::Current,
+            npm_action().source,
+            Some(npm_action()),
+            None,
+        ),
+    };
+    assert!(app.apply_connector_version(codex, outdated));
+    let line = app.sidebar.model.version.clone().unwrap();
+    assert!(line.contains("0.1.0"), "{line}");
+    assert!(line.contains("latest 0.2.0"), "{line}");
+    assert!(line.contains("/update"), "{line}");
+    assert!(app.notice.as_deref().unwrap().contains("outdated"));
+
+    assert_eq!(app.dispatch(Command::Update, None), Action::None);
+    let pending = app
+        .pending
+        .clone()
+        .expect("the update opens the approval overlay");
+    assert_eq!(pending.request.tool, "connector_update");
+    assert_eq!(
+        pending.request.resource,
+        "npm install -g @openai/codex@latest"
+    );
+    assert!(pending.request.reason.contains("npm package @openai/codex"));
+    assert!(pending
+        .preview
+        .as_deref()
+        .unwrap()
+        .contains("update: npm install -g @openai/codex@latest"));
+    assert_eq!(
+        app.on_key(key(KeyCode::Char('y'))),
+        Action::RunConnectorUpdate {
+            connector: codex,
+            action: npm_action(),
+        },
+        "approving runs exactly the displayed vector"
+    );
+    assert!(app.pending.is_none());
+    assert!(app.update_approval.is_none());
+
+    let recheck = ConnectorVersionCheck::Checked {
+        status: version_status(
+            "0.2.0",
+            Some("0.2.0"),
+            VersionComparison::Current,
+            VersionFreshness::Current,
+            npm_action().source,
+            None,
+            None,
+        ),
+    };
+    assert!(app.apply_connector_update(
+        codex,
+        ConnectorUpdateOutcome::Updated {
+            connector: codex,
+            before: Some("0.1.0".into()),
+            after: Some("0.2.0".into()),
+            recheck: Box::new(recheck),
+        },
+    ));
+    let line = app.sidebar.model.version.clone().unwrap();
+    assert!(line.contains("0.2.0"), "{line}");
+    assert!(line.contains("current"), "{line}");
+    assert!(app.notice.as_deref().unwrap().contains("updated"));
+    assert_eq!(app.dispatch(Command::Update, None), Action::None);
+    assert!(
+        app.pending.is_none(),
+        "a current install has nothing to approve"
+    );
+    assert!(app.notice.as_deref().unwrap().contains("no update to run"));
+}
+
+#[test]
+fn declining_runs_nothing_and_late_or_foreign_results_are_dropped() {
+    let mut app = plain();
+    let codex = gritt_core::connector::ConnectorId::Codex;
+    app.set_session(&connector_session(codex));
+    app.apply_connector_version(
+        codex,
+        ConnectorVersionCheck::CachedStale {
+            status: version_status(
+                "0.1.0",
+                Some("0.2.0"),
+                VersionComparison::Outdated,
+                VersionFreshness::Stale,
+                npm_action().source,
+                Some(npm_action()),
+                None,
+            ),
+            reason: "npm view failed".into(),
+        },
+    );
+    assert!(app
+        .sidebar
+        .model
+        .version
+        .as_deref()
+        .unwrap()
+        .contains("stale"));
+    assert_eq!(app.dispatch(Command::Update, None), Action::None);
+    assert!(app.pending.is_some());
+    assert_eq!(app.on_key(key(KeyCode::Char('n'))), Action::None);
+    assert!(app.pending.is_none());
+    assert!(app.update_approval.is_none());
+    assert!(app.notice.as_deref().unwrap().contains("declined"));
+
+    // A result for another agent, or for a session already left, changes nothing.
+    let line = app.sidebar.model.version.clone();
+    assert!(!app.apply_connector_version(
+        gritt_core::connector::ConnectorId::ClaudeCode,
+        ConnectorVersionCheck::NotInstalled {
+            connector: gritt_core::connector::ConnectorId::ClaudeCode,
+            reason: "gone".into(),
+        },
+    ));
+    assert_eq!(app.sidebar.model.version, line);
+    app.dispatch(Command::New, None);
+    assert!(app.connector_version.is_none());
+    assert!(app.update_approval.is_none());
+    assert!(app.sidebar.model.version.is_none());
+    assert!(
+        !app.apply_connector_update(codex, ConnectorUpdateOutcome::Declined { connector: codex },)
+    );
+}
+
+#[test]
+fn an_unknown_owner_offers_no_update_and_native_sessions_say_so() {
+    let mut app = plain();
+    let codex = gritt_core::connector::ConnectorId::Codex;
+    app.set_session(&connector_session(codex));
+    app.apply_connector_version(
+        codex,
+        ConnectorVersionCheck::LatestUnavailable {
+            status: version_status(
+                "0.1.0",
+                None,
+                VersionComparison::Unknown,
+                VersionFreshness::Current,
+                InstallSource::Unknown,
+                None,
+                Some("Gritt could not tell which installer owns /x/codex"),
+            ),
+            failure: VersionCheckFailure::UnsupportedSource,
+            reason: "the installer that owns /x/codex is not known".into(),
+        },
+    );
+    assert!(app
+        .sidebar
+        .model
+        .version
+        .as_deref()
+        .unwrap()
+        .contains("latest unknown"));
+    assert_eq!(app.dispatch(Command::Update, None), Action::None);
+    assert!(
+        app.pending.is_none(),
+        "an unknown owner never opens a command to approve"
+    );
+    let notice = app.notice.clone().unwrap();
+    assert!(notice.contains("no update to run"), "{notice}");
+    assert!(
+        notice.contains("could not tell which installer"),
+        "{notice}"
+    );
+
+    // Before any check, /update checks first instead of guessing.
+    app.connector_version = None;
+    assert_eq!(
+        app.dispatch(Command::Update, None),
+        Action::LoadConnectorVersion {
+            connector: codex,
+            mode: VersionCheckMode::Cached,
+        }
+    );
+
+    let mut native = plain();
+    assert_eq!(native.dispatch(Command::Version, None), Action::None);
+    assert!(native
+        .notice
+        .as_deref()
+        .unwrap()
+        .contains("native sessions"));
+    assert_eq!(native.dispatch(Command::Update, None), Action::None);
+    assert!(native
+        .notice
+        .as_deref()
+        .unwrap()
+        .contains("native sessions"));
+    assert!(native.pending.is_none());
+}

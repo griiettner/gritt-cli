@@ -9,7 +9,10 @@
 use std::cell::{Cell, RefCell};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use gritt_core::connector::{ConnectorId, ConnectorModel, ConnectorModelDiscovery};
+use gritt_core::connector::{
+    ConnectorId, ConnectorModel, ConnectorModelDiscovery, ConnectorUpdateOutcome,
+    ConnectorVersionCheck, UpdateAction, VersionCheckMode,
+};
 use gritt_core::event::{
     ApprovalDecision, ApprovalRequest, Event, EventKind, SessionStatus, Usage,
 };
@@ -26,6 +29,7 @@ use super::picker::{ListStatus, Picker, PickerRow};
 use super::sidebar::{self, SidebarModel, SidebarPlacement};
 use super::theme::Theme;
 use crate::changes::{ChangedFiles, FileDiff};
+use crate::control::ControlPlane;
 use crate::draft::{CatalogState, DraftError, DraftWarning, SessionDraft};
 use crate::modes::print::describe_call;
 use crate::policy::Decision;
@@ -169,6 +173,18 @@ pub enum Action {
     /// Start a session on an installed agent, chosen explicitly from its
     /// detail view rather than by highlighting its row.
     SelectConnector(ConnectorId),
+    /// Check the live connector session's CLI version. `mode` says
+    /// whether a still-fresh cached answer is enough.
+    LoadConnectorVersion {
+        connector: ConnectorId,
+        mode: VersionCheckMode,
+    },
+    /// Run an update the user approved in the modal overlay. The action
+    /// is the one the overlay displayed; nothing is re-derived here.
+    RunConnectorUpdate {
+        connector: ConnectorId,
+        action: UpdateAction,
+    },
 }
 
 /// What `/mcp` asks the runtime to do. The runtime calls the same typed
@@ -253,6 +269,10 @@ pub enum Work {
     Sessions,
     /// Reading a file's diff.
     Diff,
+    /// Checking an agent CLI's version against its published one.
+    Version,
+    /// Running an approved agent CLI update.
+    Update,
 }
 
 /// Which searchable list an overlay is showing.
@@ -647,6 +667,11 @@ pub struct App {
     /// a native session after `/new` cannot open with a connector id.
     pub connector_model: Option<String>,
     pub connector_catalog: ConnectorCatalogView,
+    /// The live connector session's version check, once one has run.
+    pub connector_version: Option<ConnectorVersionCheck>,
+    /// The update the approval overlay is showing. Answering the overlay
+    /// takes it, so a late key cannot run a command that was withdrawn.
+    pub update_approval: Option<(ConnectorId, UpdateAction)>,
     /// The server `/mcp` opened an action list for.
     pub mcp_target: Option<String>,
     /// Set while the pending approval is an MCP server launch rather than
@@ -737,6 +762,8 @@ impl App {
             connector_choice: None,
             connector_model: None,
             connector_catalog: ConnectorCatalogView::default(),
+            connector_version: None,
+            update_approval: None,
             mcp_target: None,
             mcp_approval: None,
             session_transition: false,
@@ -1117,6 +1144,79 @@ impl App {
     /// The same modal overlay a tool approval uses: reading a workspace
     /// file does not authorize running what it names, so the executable
     /// and its arguments are shown before anything starts.
+    /// Puts an update command in front of the user through the same modal
+    /// overlay a tool call uses. The vector shown is the vector that runs.
+    pub fn request_update_approval(
+        &mut self,
+        connector: ConnectorId,
+        action: UpdateAction,
+        check: &ConnectorVersionCheck,
+    ) {
+        self.diff_scroll = 0;
+        let preview = ControlPlane::connector_version_lines(check).join("\n");
+        self.install_pending(PendingApproval {
+            request: ApprovalRequest {
+                id: gritt_core::event::ApprovalId(format!(
+                    "connector-update:{}",
+                    connector.as_str()
+                )),
+                tool: "connector_update".into(),
+                resource: action.display(),
+                reason: format!(
+                    "updates {} through {}; runs exactly this command",
+                    connector.as_str(),
+                    action.source.label()
+                ),
+                call_id: None,
+            },
+            decision: Decision {
+                outcome: gritt_core::policy::PolicyOutcome::Ask,
+                reason: "an update changes the installed agent CLI".into(),
+                destructive: false,
+                rule: None,
+            },
+            preview: Some(preview),
+        });
+        self.update_approval = Some((connector, action));
+    }
+
+    /// Records a version check for the live connector session. A result
+    /// for a connector the user has already left is dropped.
+    pub fn apply_connector_version(
+        &mut self,
+        connector: ConnectorId,
+        check: ConnectorVersionCheck,
+    ) -> bool {
+        if self.connector != Some(connector) {
+            return false;
+        }
+        self.sidebar.model.version = Some(version_summary(&check));
+        self.notice = Some(check.describe());
+        self.connector_version = Some(check);
+        true
+    }
+
+    /// Records an update's outcome and the version check that followed a
+    /// successful one.
+    pub fn apply_connector_update(
+        &mut self,
+        connector: ConnectorId,
+        outcome: ConnectorUpdateOutcome,
+    ) -> bool {
+        if self.connector != Some(connector) {
+            return false;
+        }
+        match outcome {
+            ConnectorUpdateOutcome::Updated { recheck, .. } => {
+                let text = recheck.describe();
+                self.apply_connector_version(connector, *recheck);
+                self.notice = Some(format!("{} updated; {text}", connector.as_str()));
+            }
+            other => self.notice = Some(other.describe()),
+        }
+        true
+    }
+
     pub fn request_mcp_approval(&mut self, server: String, definition: String) {
         self.diff_scroll = 0;
         self.install_pending(PendingApproval {
@@ -1644,6 +1744,49 @@ impl App {
                 self.open_picker(PickerKind::Connect);
                 Action::None
             }
+            Command::Version => {
+                let Some(id) = self.connector else {
+                    self.notice = Some(
+                        "native sessions have no agent CLI to check; /connect to an agent first"
+                            .into(),
+                    );
+                    return Action::None;
+                };
+                Action::LoadConnectorVersion {
+                    connector: id,
+                    mode: VersionCheckMode::Refresh,
+                }
+            }
+            Command::Update => {
+                let Some(id) = self.connector else {
+                    self.notice = Some(
+                        "native sessions have no agent CLI to update; /connect to an agent first"
+                            .into(),
+                    );
+                    return Action::None;
+                };
+                let Some(check) = self.connector_version.clone() else {
+                    self.notice = Some(format!("checking {} first", id.as_str()));
+                    return Action::LoadConnectorVersion {
+                        connector: id,
+                        mode: VersionCheckMode::Cached,
+                    };
+                };
+                match check.status().and_then(|status| status.update.clone()) {
+                    Some(action) => {
+                        self.request_update_approval(id, action, &check);
+                        Action::None
+                    }
+                    None => {
+                        let why = check
+                            .status()
+                            .and_then(|status| status.next_step.clone())
+                            .unwrap_or_else(|| check.describe());
+                        self.notice = Some(format!("no update to run: {why}"));
+                        Action::None
+                    }
+                }
+            }
             Command::Models => {
                 if let Some(id) = self.connector_choice {
                     self.open_picker(PickerKind::Models);
@@ -1876,6 +2019,16 @@ impl App {
     fn answer_approval(&mut self, approved: bool) -> Action {
         self.pending = None;
         self.view = View::Transcript;
+        if let Some((connector, action)) = self.update_approval.take() {
+            if approved {
+                return Action::RunConnectorUpdate { connector, action };
+            }
+            self.notice = Some(format!(
+                "{} update declined; nothing was run",
+                connector.as_str()
+            ));
+            return Action::None;
+        }
         if let Some(server) = self.mcp_approval.take() {
             return Action::Mcp(McpRequest::Decide {
                 server,
@@ -2735,6 +2888,8 @@ impl App {
         self.connector_choice = None;
         self.connector_model = None;
         self.connector_catalog = ConnectorCatalogView::default();
+        self.connector_version = None;
+        self.update_approval = None;
         self.running = false;
         self.pending = None;
         self.mcp_approval = None;
@@ -3079,6 +3234,8 @@ impl App {
                 self.sidebar.model.model = Some(model.clone());
                 self.sidebar.model.effort = Some(effort.label().to_owned());
                 self.sidebar.model.managed_by_agent = false;
+                self.sidebar.model.version = None;
+                self.connector_version = None;
                 self.connector = None;
                 // A session with stored history is pinned to the provider
                 // and model its transcript was produced under.
@@ -3095,6 +3252,8 @@ impl App {
                 // ADR-010: the connector owns effort and permissions. A
                 // model Gritt passed at launch is shown, not guessed.
                 self.sidebar.model.managed_by_agent = true;
+                self.sidebar.model.version = None;
+                self.connector_version = None;
             }
         }
     }
@@ -3112,6 +3271,7 @@ fn changes_settings(command: Command) -> bool {
             | Command::Plan
             | Command::Code
             | Command::New
+            | Command::Update
     )
 }
 
@@ -3122,6 +3282,34 @@ fn is_native_setting(command: Command) -> bool {
         command,
         Command::Connect | Command::Models | Command::Effort | Command::Mode
     )
+}
+
+/// The sidebar's one-line version state for an agent CLI.
+pub fn version_summary(check: &ConnectorVersionCheck) -> String {
+    use gritt_core::connector::{VersionComparison, VersionFreshness};
+    match check {
+        ConnectorVersionCheck::NotInstalled { .. } => "not installed".to_owned(),
+        ConnectorVersionCheck::Unsupported { .. } => "no version check".to_owned(),
+        _ => {
+            let status = check.status().expect("status for a checked outcome");
+            let installed = status.installed.as_deref().unwrap_or("unknown");
+            let stale = match status.freshness {
+                VersionFreshness::Stale => ", stale",
+                VersionFreshness::Current => "",
+            };
+            match (status.comparison, &status.latest) {
+                (VersionComparison::Outdated, Some(latest)) => {
+                    format!("{installed} (latest {latest}{stale}; /update)")
+                }
+                (VersionComparison::Current, _) => format!("{installed} (current{stale})"),
+                (VersionComparison::Newer, Some(latest)) => {
+                    format!("{installed} (newer than {latest}{stale})")
+                }
+                (_, Some(latest)) => format!("{installed} (latest {latest}?{stale})"),
+                (_, None) => format!("{installed} (latest unknown)"),
+            }
+        }
+    }
 }
 
 /// A typed draft rejection as a modal explanation. The interface never

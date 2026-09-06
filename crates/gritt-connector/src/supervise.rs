@@ -30,6 +30,10 @@ use gritt_core::{Error, ErrorKind, Result};
 use tokio::sync::{mpsc, Notify};
 
 use crate::health::{find_executable, probe, version_at_least, version_token, ProbeOutput};
+use crate::install::{
+    classify_failure, detect_install_source, latest_query, next_step, parse_latest, update_action,
+    InstallEnv, VendorInstall,
+};
 use crate::models::{
     attempted_recently, cache_is_fresh, catalog_from_cache, failed_since_fetch,
     CachedConnectorModels, ConnectorModelCache,
@@ -37,6 +41,11 @@ use crate::models::{
 use crate::process::{self, Launch, Line, Supervised};
 use crate::protocols::ModelParseError;
 use crate::redact::{cap, redact_text, redact_value};
+use crate::versions::{self, run_update, CachedConnectorVersion, ConnectorVersionCache};
+use gritt_core::connector::{
+    ConnectorUpdateOutcome, ConnectorVersionCheck, ConnectorVersionStatus, InstallSource,
+    UpdateAction, VersionCheckFailure, VersionCheckMode, VersionFreshness,
+};
 
 /// Longest raw line kept in a diagnostic.
 pub const MAX_RAW_BYTES: usize = 2048;
@@ -140,6 +149,11 @@ pub trait Protocol: Send + Sync + 'static {
     }
     fn version_args(&self) -> Vec<String> {
         vec!["--version".into()]
+    }
+    /// The vendor's own installer, when the CLI documents one with a
+    /// directory of its own and a self-update subcommand.
+    fn vendor_install(&self) -> Option<VendorInstall> {
+        None
     }
     /// Arguments of the auth probe, or `None` when the agent has no
     /// documented way to ask.
@@ -255,6 +269,12 @@ pub struct ExternalConnector<P: Protocol> {
     sessions: Sessions,
     model_cache: Option<ConnectorModelCache>,
     model_policy: ModelListPolicy,
+    version_cache: Option<ConnectorVersionCache>,
+    version_policy: ModelListPolicy,
+    install_env: InstallEnv,
+    /// Package-manager executables by name, for tests and for hosts
+    /// that keep them off `PATH`. Anything else is found on `PATH`.
+    manager_programs: std::collections::BTreeMap<String, PathBuf>,
 }
 
 impl<P: Protocol> ExternalConnector<P> {
@@ -292,6 +312,292 @@ impl<P: Protocol> ExternalConnector<P> {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             model_cache: None,
             model_policy: ModelListPolicy::default(),
+            version_cache: None,
+            version_policy: ModelListPolicy::default(),
+            install_env: InstallEnv::from_process(),
+            manager_programs: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Disk cache for the newest published version. Absent means every
+    /// check queries live and a failed query cannot fall back.
+    pub fn with_version_cache(
+        mut self,
+        cache: ConnectorVersionCache,
+        policy: ModelListPolicy,
+    ) -> Self {
+        self.version_cache = Some(cache);
+        self.version_policy = policy;
+        self
+    }
+
+    /// Where the owner detectors look. Tests point this at a scratch home.
+    pub fn with_install_env(mut self, env: InstallEnv) -> Self {
+        self.install_env = env;
+        self
+    }
+
+    /// Package-manager executables by name (`brew`, `npm`, `cargo`,
+    /// `pipx`). Unlisted names are found on `PATH`.
+    pub fn with_manager_programs(
+        mut self,
+        programs: std::collections::BTreeMap<String, PathBuf>,
+    ) -> Self {
+        self.manager_programs = programs;
+        self
+    }
+
+    fn manager_program(&self, name: &str) -> Option<PathBuf> {
+        self.manager_programs
+            .get(name)
+            .cloned()
+            .or_else(|| find_executable(name))
+    }
+
+    async fn installed_version(&self, program: &std::path::Path) -> Option<String> {
+        match probe(program, &self.protocol.version_args(), self.timeouts.health).await {
+            Ok(output) if output.success => {
+                version_token(&output.stdout).or_else(|| version_token(&output.stderr))
+            }
+            _ => None,
+        }
+    }
+
+    async fn check_version_inner(&self, mode: VersionCheckMode) -> ConnectorVersionCheck {
+        let id = self.protocol.id();
+        let Some(program) = &self.program else {
+            return ConnectorVersionCheck::NotInstalled {
+                connector: id,
+                reason: format!(
+                    "`{}` was not found on PATH and no executable is configured",
+                    self.protocol.executable()
+                ),
+            };
+        };
+        let installed = self.installed_version(program).await;
+        let vendor = self.protocol.vendor_install();
+        let source = detect_install_source(program, &self.install_env, vendor.as_ref());
+        let update = update_action(&source, program, vendor.as_ref());
+        let next = next_step(&source, program);
+        let now = Utc::now();
+        let status = |latest: Option<String>,
+                      latest_source: Option<String>,
+                      freshness: VersionFreshness,
+                      checked_at: chrono::DateTime<Utc>| {
+            version_status(
+                id,
+                &installed,
+                &source,
+                &update,
+                &next,
+                latest,
+                latest_source,
+                freshness,
+                checked_at,
+            )
+        };
+        let Some(query) = latest_query(&source) else {
+            let reason = match &source {
+                InstallSource::Unknown | InstallSource::Ambiguous { .. } => {
+                    format!("the installer that owns {} is not known", program.display())
+                }
+                _ => format!(
+                    "{} does not publish a newest version Gritt can query",
+                    source.label()
+                ),
+            };
+            return ConnectorVersionCheck::LatestUnavailable {
+                status: status(None, None, VersionFreshness::Current, now),
+                failure: VersionCheckFailure::UnsupportedSource,
+                reason,
+            };
+        };
+        let cached = self
+            .version_cache
+            .as_ref()
+            .and_then(|cache| cache.read(id).ok().flatten());
+        let policy = &self.version_policy;
+        let stale_or_unavailable = |failure: VersionCheckFailure, reason: String| {
+            if policy.stale_fallback {
+                if let Some(cached) = &cached {
+                    if let (Some(latest), Some(checked_at)) = (&cached.latest, cached.checked_at) {
+                        return ConnectorVersionCheck::CachedStale {
+                            status: status(
+                                Some(latest.clone()),
+                                cached.latest_source.clone(),
+                                VersionFreshness::Stale,
+                                checked_at,
+                            ),
+                            reason,
+                        };
+                    }
+                }
+            }
+            ConnectorVersionCheck::LatestUnavailable {
+                status: status(None, None, VersionFreshness::Current, now),
+                failure,
+                reason,
+            }
+        };
+        if mode != VersionCheckMode::Refresh {
+            if let Some(cached) = &cached {
+                if let (Some(latest), Some(checked_at)) = (&cached.latest, cached.checked_at) {
+                    if !versions::failed_since_check(cached)
+                        && versions::cache_is_fresh(cached, policy, now)
+                    {
+                        return ConnectorVersionCheck::Checked {
+                            status: status(
+                                Some(latest.clone()),
+                                cached
+                                    .latest_source
+                                    .clone()
+                                    .or_else(|| Some(query.source.clone())),
+                                VersionFreshness::Current,
+                                checked_at,
+                            ),
+                        };
+                    }
+                }
+            }
+        }
+        match mode {
+            VersionCheckMode::Offline => {
+                return stale_or_unavailable(
+                    VersionCheckFailure::NotChecked,
+                    format!("not checked yet; {} runs on request", query.source),
+                );
+            }
+            VersionCheckMode::Cached => {
+                if let Some(cached) = &cached {
+                    if versions::failed_since_check(cached)
+                        && versions::attempted_recently(cached, policy, now)
+                    {
+                        return stale_or_unavailable(
+                            VersionCheckFailure::CommandFailure,
+                            format!("{} was retried recently and is still failing", query.source),
+                        );
+                    }
+                }
+            }
+            VersionCheckMode::Refresh => {}
+        }
+        let Some(manager) = self.manager_program(&query.program) else {
+            record_version_attempt(&self.version_cache, id, &cached, now);
+            return stale_or_unavailable(
+                VersionCheckFailure::CommandFailure,
+                format!(
+                    "`{}` is not installed, so {} cannot run",
+                    query.program, query.source
+                ),
+            );
+        };
+        match probe(&manager, &query.args, self.timeouts.health).await {
+            Ok(output) if output.success => match parse_latest(&source, &output.stdout) {
+                Ok(latest) => {
+                    if let Some(cache) = &self.version_cache {
+                        let _ = cache.write(
+                            id,
+                            &CachedConnectorVersion {
+                                checked_at: Some(now),
+                                last_attempt_at: Some(now),
+                                latest: Some(latest.clone()),
+                                latest_source: Some(query.source.clone()),
+                            },
+                        );
+                    }
+                    ConnectorVersionCheck::Checked {
+                        status: status(
+                            Some(latest),
+                            Some(query.source),
+                            VersionFreshness::Current,
+                            now,
+                        ),
+                    }
+                }
+                Err(failure) => {
+                    record_version_attempt(&self.version_cache, id, &cached, now);
+                    stale_or_unavailable(
+                        failure,
+                        format!("{} returned no readable version", query.source),
+                    )
+                }
+            },
+            Ok(output) => {
+                record_version_attempt(&self.version_cache, id, &cached, now);
+                stale_or_unavailable(
+                    classify_failure(&output.stderr, &output.stdout),
+                    format!("{} exited unsuccessfully", query.source),
+                )
+            }
+            Err(error) => {
+                record_version_attempt(&self.version_cache, id, &cached, now);
+                let failure = if error.message.contains("did not answer") {
+                    VersionCheckFailure::Timeout
+                } else {
+                    VersionCheckFailure::CommandFailure
+                };
+                stale_or_unavailable(failure, error.message)
+            }
+        }
+    }
+
+    async fn update_inner(&self, action: UpdateAction) -> ConnectorUpdateOutcome {
+        let id = self.protocol.id();
+        let Some(program) = &self.program else {
+            return ConnectorUpdateOutcome::NoAction {
+                connector: id,
+                reason: format!("`{}` is not installed", self.protocol.executable()),
+            };
+        };
+        let before = self.installed_version(program).await;
+        let Some(manager) = self.manager_program(&action.program) else {
+            return ConnectorUpdateOutcome::Failed {
+                connector: id,
+                reason: format!("`{}` is not installed", action.program),
+                output: Vec::new(),
+            };
+        };
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        match run_update(
+            &manager,
+            &action.args,
+            &cwd,
+            &self.secrets,
+            self.timeouts.idle,
+        )
+        .await
+        {
+            Ok(run) if run.timed_out => ConnectorUpdateOutcome::TimedOut {
+                connector: id,
+                reason: format!(
+                    "`{}` printed nothing for {}s and was stopped",
+                    action.display(),
+                    self.timeouts.idle.as_secs()
+                ),
+            },
+            Ok(run) if run.success => {
+                let recheck = self.check_version_inner(VersionCheckMode::Refresh).await;
+                let after = recheck.status().and_then(|status| status.installed.clone());
+                ConnectorUpdateOutcome::Updated {
+                    connector: id,
+                    before,
+                    after,
+                    recheck: Box::new(recheck),
+                }
+            }
+            Ok(run) => ConnectorUpdateOutcome::Failed {
+                connector: id,
+                reason: match run.exit_code {
+                    Some(code) => format!("`{}` exited with status {code}", action.display()),
+                    None => format!("`{}` was stopped by a signal", action.display()),
+                },
+                output: run.output,
+            },
+            Err(error) => ConnectorUpdateOutcome::Failed {
+                connector: id,
+                reason: error.message,
+                output: Vec::new(),
+            },
         }
     }
 
@@ -609,6 +915,54 @@ fn record_attempt(
         source: String::new(),
         models: Vec::new(),
     });
+    next.last_attempt_at = Some(now);
+    let _ = cache.write(id, &next);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn version_status(
+    id: ConnectorId,
+    installed: &Option<String>,
+    source: &InstallSource,
+    update: &Option<UpdateAction>,
+    next_step: &Option<String>,
+    latest: Option<String>,
+    latest_source: Option<String>,
+    freshness: VersionFreshness,
+    checked_at: chrono::DateTime<Utc>,
+) -> ConnectorVersionStatus {
+    let comparison = versions::comparison(installed.as_deref(), latest.as_deref());
+    // A current install has nothing to update; the command stays available
+    // for an outdated one and for an owner whose newest version is unknown.
+    let update = match comparison {
+        gritt_core::connector::VersionComparison::Current
+        | gritt_core::connector::VersionComparison::Newer => None,
+        _ => update.clone(),
+    };
+    ConnectorVersionStatus {
+        connector: id,
+        installed: installed.clone(),
+        comparison,
+        latest,
+        source: source.clone(),
+        latest_source,
+        checked_at,
+        freshness,
+        update,
+        next_step: next_step.clone(),
+    }
+}
+
+fn record_version_attempt(
+    cache: &Option<ConnectorVersionCache>,
+    id: ConnectorId,
+    cached: &Option<CachedConnectorVersion>,
+    now: chrono::DateTime<Utc>,
+) {
+    let Some(cache) = cache else {
+        return;
+    };
+    let mut next = cached.clone().unwrap_or_default();
     next.last_attempt_at = Some(now);
     let _ = cache.write(id, &next);
 }
@@ -1061,6 +1415,14 @@ impl<P: Protocol> Connector for ExternalConnector<P> {
 
     fn discover_models(&self, refresh: bool) -> BoxFuture<'_, ConnectorModelDiscovery> {
         Box::pin(async move { self.discover_models_inner(refresh).await })
+    }
+
+    fn check_version(&self, mode: VersionCheckMode) -> BoxFuture<'_, ConnectorVersionCheck> {
+        Box::pin(async move { self.check_version_inner(mode).await })
+    }
+
+    fn update(&self, action: UpdateAction) -> BoxFuture<'_, ConnectorUpdateOutcome> {
+        Box::pin(async move { self.update_inner(action).await })
     }
 
     fn start(&self, request: TaskRequest) -> BoxFuture<'_, Result<EventStream<'_>>> {

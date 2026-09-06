@@ -16,7 +16,7 @@ use gritt_connector::{ExternalConnector, Timeouts};
 use gritt_core::config::{Config, ConnectorSettings, ModelListPolicy};
 use gritt_core::connector::{
     AuthState, Connector, ConnectorId, ConnectorModelDiscovery, ConnectorModelFreshness,
-    TaskRequest, TaskState,
+    ConnectorUpdateOutcome, ConnectorVersionCheck, TaskRequest, TaskState, VersionCheckMode,
 };
 use gritt_core::event::{ApprovalDecision, ApprovalRequest, Event, EventKind, EventSource};
 use gritt_core::provider::{Protocol, ProviderProfile};
@@ -1077,5 +1077,268 @@ async fn repl_models_lists_the_connector_catalog() {
     assert!(
         body.matches("gpt-5.4").count() >= 2,
         "refresh did not list again: {body}"
+    );
+}
+
+// -- version checks and updates (TKT-0025) ---------------------------------
+
+/// The fake agent installed the way OpenCode's install script does it:
+/// under `<home>/.opencode/bin/`, with a version file it reads and a
+/// self-update that rewrites it.
+fn opencode_vendor_fixture(home: &Path, update_exit: &str) -> (Arc<dyn Connector>, PathBuf) {
+    let version_file = home.join("version.txt");
+    std::fs::write(&version_file, "1.0.0\n").unwrap();
+    let exe = home.join(".opencode/bin/opencode");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../gritt-connector/tests/fake-agent/agent.sh");
+    let mut body = String::from("#!/bin/sh\n");
+    for (name, value) in [
+        (
+            "FAKE_AGENT_VERSION_FILE",
+            version_file.display().to_string(),
+        ),
+        ("FAKE_AGENT_UPDATE_TO", "2.0.0".to_owned()),
+        ("FAKE_AGENT_UPDATE_EXIT", update_exit.to_owned()),
+        (
+            "FAKE_AGENT_FIXTURE",
+            connector_fixture("text").display().to_string(),
+        ),
+    ] {
+        body.push_str(&format!("{name}='{value}'\nexport {name}\n"));
+    }
+    body.push_str(&format!("exec '{}' \"$@\"\n", script.display()));
+    std::fs::write(&exe, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let settings = ConnectorSettings {
+        executables: BTreeMap::from([("opencode".to_owned(), exe.display().to_string())]),
+        ..ConnectorSettings::default()
+    };
+    let connector =
+        ExternalConnector::new(gritt_connector::protocols::opencode::OpenCode, &settings)
+            .with_timeouts(Timeouts {
+                health: Duration::from_secs(5),
+                startup: Duration::from_secs(10),
+                idle: Duration::from_secs(10),
+            })
+            .with_install_env(gritt_connector::InstallEnv {
+                home: Some(home.to_path_buf()),
+                cargo_home: Some(home.join(".cargo")),
+            });
+    (Arc::new(connector), exe)
+}
+
+#[tokio::test]
+async fn opening_a_connector_session_reports_its_version_offline() {
+    let scratch = tempfile::tempdir().unwrap();
+    let (connector, exe) = opencode_vendor_fixture(scratch.path(), "0");
+    let fx = fixture(Vec::new(), ApprovalMode::DenyAll, vec![connector]).await;
+    let opened = fx
+        .plane
+        .open_with(
+            SessionSelector::Named("versioned".into()),
+            Some(ConnectorId::OpenCode),
+            StartupRequest::from_flags(None, None, None),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let check = opened
+        .connector_version
+        .as_ref()
+        .expect("a new connector session carries its offline version state");
+    let status = check.status().expect("the fake agent is installed");
+    assert_eq!(status.installed.as_deref(), Some("1.0.0"));
+    assert_eq!(
+        status.source,
+        gritt_core::connector::InstallSource::Vendor {
+            installer: "OpenCode install script".into()
+        }
+    );
+    let action = status
+        .update
+        .as_ref()
+        .expect("a vendor install offers its self-update");
+    assert_eq!(action.program, exe.display().to_string());
+    assert_eq!(action.args, vec!["upgrade"]);
+    assert!(
+        !check.update_available(),
+        "no newest version is known, so nothing is offered as outdated"
+    );
+    let lines = ControlPlane::connector_version_lines(check);
+    assert!(lines[0].contains("opencode 1.0.0"), "{lines:?}");
+    assert!(
+        lines.iter().any(|line| line.contains("update: ")),
+        "{lines:?}"
+    );
+
+    let resumed = fx
+        .plane
+        .open_with(
+            SessionSelector::Named("versioned".into()),
+            Some(ConnectorId::OpenCode),
+            StartupRequest::from_flags(None, None, None),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(
+        resumed.connector_version.is_none(),
+        "a resumed session does not check again"
+    );
+    assert!(matches!(
+        fx.plane
+            .connector_version(ConnectorId::Native, VersionCheckMode::Cached)
+            .await,
+        ConnectorVersionCheck::Unsupported { .. }
+    ));
+}
+
+#[tokio::test]
+async fn repl_version_and_update_run_through_the_shared_service_after_a_yes() {
+    let scratch = tempfile::tempdir().unwrap();
+    let (connector, _exe) = opencode_vendor_fixture(scratch.path(), "0");
+    let fx = fixture(Vec::new(), ApprovalMode::DenyAll, vec![connector]).await;
+    let opened = fx
+        .plane
+        .open_with(
+            SessionSelector::Named("repl-update".into()),
+            Some(ConnectorId::OpenCode),
+            StartupRequest::from_flags(None, None, None),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let script = "/version\n/update\ny\n/version\n/quit\n";
+    let input = LineInput::from_reader(std::io::Cursor::new(script.as_bytes().to_vec()));
+    let out = SharedBuffer::default();
+    let err = SharedBuffer::default();
+    let slot: CancelSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    run_repl(
+        &fx.plane,
+        opened.driver,
+        &input,
+        out.clone(),
+        err.clone(),
+        PrintUiOptions::deny_all(false),
+        slot,
+    )
+    .await
+    .unwrap();
+    let body = out.contents();
+    assert!(body.contains("opencode 1.0.0"), "{body}");
+    assert!(
+        body.contains("run `"),
+        "the command is shown before the question: {body}"
+    );
+    assert!(body.contains("upgrade`? [y/N]"), "{body}");
+    assert!(body.contains("opencode updated to 2.0.0"), "{body}");
+    assert!(
+        body.contains("opencode 2.0.0"),
+        "the check after the update sees the new version: {body}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.path().join("version.txt"))
+            .unwrap()
+            .trim(),
+        "2.0.0"
+    );
+}
+
+#[tokio::test]
+async fn repl_update_declined_or_failed_leaves_the_connector_usable() {
+    let scratch = tempfile::tempdir().unwrap();
+    let (connector, _exe) = opencode_vendor_fixture(scratch.path(), "0");
+    let fx = fixture(Vec::new(), ApprovalMode::DenyAll, vec![connector]).await;
+    let opened = fx
+        .plane
+        .open_with(
+            SessionSelector::Named("repl-decline".into()),
+            Some(ConnectorId::OpenCode),
+            StartupRequest::from_flags(None, None, None),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let script = "/update\nno\n/update\n\nhello\n/quit\n";
+    let input = LineInput::from_reader(std::io::Cursor::new(script.as_bytes().to_vec()));
+    let out = SharedBuffer::default();
+    let err = SharedBuffer::default();
+    let slot: CancelSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    run_repl(
+        &fx.plane,
+        opened.driver,
+        &input,
+        out.clone(),
+        err.clone(),
+        PrintUiOptions::deny_all(false),
+        slot,
+    )
+    .await
+    .unwrap();
+    let body = out.contents();
+    assert_eq!(
+        body.matches("update declined; nothing was run").count(),
+        2,
+        "{body}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.path().join("version.txt"))
+            .unwrap()
+            .trim(),
+        "1.0.0",
+        "a declined update must not run"
+    );
+    assert!(
+        body.contains("Hello"),
+        "the session still runs a turn afterwards: {body}"
+    );
+
+    let failing = tempfile::tempdir().unwrap();
+    let (connector, _exe) = opencode_vendor_fixture(failing.path(), "1");
+    let fx = fixture(Vec::new(), ApprovalMode::DenyAll, vec![connector]).await;
+    let outcome = {
+        let check = fx
+            .plane
+            .connector_version(ConnectorId::OpenCode, VersionCheckMode::Cached)
+            .await;
+        let action = check.status().unwrap().update.clone().unwrap();
+        fx.plane
+            .connector_update(ConnectorId::OpenCode, action)
+            .await
+    };
+    assert!(
+        matches!(outcome, ConnectorUpdateOutcome::Failed { .. }),
+        "{outcome:?}"
+    );
+    let opened = fx
+        .plane
+        .open_with(
+            SessionSelector::Named("after-failure".into()),
+            Some(ConnectorId::OpenCode),
+            StartupRequest::from_flags(None, None, None),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        opened
+            .connector_version
+            .unwrap()
+            .status()
+            .unwrap()
+            .installed
+            .as_deref(),
+        Some("1.0.0"),
+        "a failed update leaves the connector usable at its old version"
     );
 }

@@ -7,7 +7,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use gritt_core::connector::ConnectorId;
+use gritt_core::connector::{ConnectorId, ConnectorUpdateOutcome, VersionCheckMode};
 use gritt_core::event::ApprovalDecision;
 use gritt_core::session::{Phase, SessionKind, SessionStore};
 use gritt_core::Result;
@@ -109,6 +109,8 @@ pub enum ReplCommand {
     Resume(String),
     History,
     Models { refresh: bool },
+    Version { refresh: bool },
+    Update,
     Help,
     Quit,
     Empty,
@@ -136,13 +138,17 @@ pub fn parse_command(line: &str) -> ReplCommand {
         "/models" => ReplCommand::Models {
             refresh: argument == "refresh",
         },
+        "/version" => ReplCommand::Version {
+            refresh: argument == "refresh",
+        },
+        "/update" => ReplCommand::Update,
         "/help" => ReplCommand::Help,
         "/quit" | "/exit" => ReplCommand::Quit,
         other => ReplCommand::Unknown(other.to_owned()),
     }
 }
 
-pub const HELP: &str = "commands: /mode [planning|supervised|auto-approve|full-access]  /plan  /code  /sessions  /resume NAME  /models [refresh]  /history  /help  /quit\n\
+pub const HELP: &str = "commands: /mode [planning|supervised|auto-approve|full-access]  /plan  /code  /sessions  /resume NAME  /models [refresh]  /version [refresh]  /update  /history  /help  /quit\n\
 Ctrl-C cancels a running turn; a second Ctrl-C at the prompt quits.";
 
 /// Runs the loop until `/quit` or end of input. Returns the driver so the
@@ -223,6 +229,75 @@ pub async fn run_repl<O: Write + Send, E: Write + Send>(
                 _ => {
                     let (_, err) = ui.parts_mut();
                     let _ = writeln!(err, "native sessions use the provider model catalog");
+                }
+            },
+            ReplCommand::Version { refresh } => match &agent.session().kind {
+                SessionKind::Connector { id, .. } if *id != ConnectorId::Native => {
+                    let mode = if refresh {
+                        VersionCheckMode::Refresh
+                    } else {
+                        VersionCheckMode::Cached
+                    };
+                    let check = plane.connector_version(*id, mode).await;
+                    let (out, _) = ui.parts_mut();
+                    for line in ControlPlane::connector_version_lines(&check) {
+                        let _ = writeln!(out, "{line}");
+                    }
+                }
+                _ => {
+                    let (_, err) = ui.parts_mut();
+                    let _ = writeln!(err, "native sessions have no connector CLI to check");
+                }
+            },
+            ReplCommand::Update => match &agent.session().kind {
+                SessionKind::Connector { id, .. } if *id != ConnectorId::Native => {
+                    let id = *id;
+                    let check = plane.connector_version(id, VersionCheckMode::Cached).await;
+                    let lines = ControlPlane::connector_version_lines(&check);
+                    let action = check.status().and_then(|status| status.update.clone());
+                    match action {
+                        None => {
+                            let (out, _) = ui.parts_mut();
+                            for line in lines {
+                                let _ = writeln!(out, "{line}");
+                            }
+                            let _ = writeln!(out, "no update to run");
+                        }
+                        Some(action) => {
+                            {
+                                let (out, _) = ui.parts_mut();
+                                for line in lines {
+                                    let _ = writeln!(out, "{line}");
+                                }
+                                let _ = write!(out, "run `{}`? [y/N] ", action.display());
+                                let _ = out.flush();
+                            }
+                            let reader = input.clone();
+                            let answer = tokio::task::spawn_blocking(move || reader.next_line())
+                                .await
+                                .ok()
+                                .flatten();
+                            let approved = answer.is_some_and(|line| {
+                                matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+                            });
+                            let outcome = if approved {
+                                plane.connector_update(id, action).await
+                            } else {
+                                ConnectorUpdateOutcome::Declined { connector: id }
+                            };
+                            let (out, _) = ui.parts_mut();
+                            let _ = writeln!(out, "{}", outcome.describe());
+                            if let ConnectorUpdateOutcome::Updated { recheck, .. } = &outcome {
+                                for line in ControlPlane::connector_version_lines(recheck) {
+                                    let _ = writeln!(out, "{line}");
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    let (_, err) = ui.parts_mut();
+                    let _ = writeln!(err, "native sessions have no connector CLI to update");
                 }
             },
             ReplCommand::Plan => {
@@ -373,6 +448,11 @@ mod tests {
             parse_command("/models refresh"),
             ReplCommand::Models { refresh: true }
         );
+        assert_eq!(
+            parse_command("/version refresh"),
+            ReplCommand::Version { refresh: true }
+        );
+        assert_eq!(parse_command("/update"), ReplCommand::Update);
         assert_eq!(parse_command("/nope"), ReplCommand::Unknown("/nope".into()));
     }
 }

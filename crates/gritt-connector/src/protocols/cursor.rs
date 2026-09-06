@@ -33,6 +33,14 @@ impl Protocol for Cursor {
         "cursor-agent"
     }
 
+    fn vendor_install(&self) -> Option<crate::install::VendorInstall> {
+        Some(crate::install::VendorInstall {
+            installer: "Cursor CLI installer",
+            markers: &[".local/share/cursor-agent/"],
+            update_args: &["update"],
+        })
+    }
+
     fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             follow_up_input: true,

@@ -83,29 +83,39 @@ pub fn version_token(text: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Compares dotted versions; `None` when either does not parse.
-pub fn version_at_least(found: &str, minimum: &str) -> Option<bool> {
-    fn parse(text: &str) -> Option<Vec<u64>> {
-        text.split('.')
-            .map(|part| {
-                part.chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse()
-                    .ok()
-            })
-            .collect()
-    }
-    let found = parse(found)?;
-    let minimum = parse(minimum)?;
-    for index in 0..found.len().max(minimum.len()) {
-        let a = found.get(index).copied().unwrap_or(0);
-        let b = minimum.get(index).copied().unwrap_or(0);
+/// The numeric components of a dotted version. A leading `v` and any
+/// pre-release suffix after the digits of a component are ignored.
+pub fn parse_version(text: &str) -> Option<Vec<u64>> {
+    text.trim()
+        .trim_start_matches('v')
+        .split('.')
+        .map(|part| {
+            part.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+        .collect()
+}
+
+/// Orders two dotted versions; `None` when either does not parse.
+pub fn compare_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    let left = parse_version(left)?;
+    let right = parse_version(right)?;
+    for index in 0..left.len().max(right.len()) {
+        let a = left.get(index).copied().unwrap_or(0);
+        let b = right.get(index).copied().unwrap_or(0);
         if a != b {
-            return Some(a > b);
+            return Some(a.cmp(&b));
         }
     }
-    Some(true)
+    Some(std::cmp::Ordering::Equal)
+}
+
+/// Compares dotted versions; `None` when either does not parse.
+pub fn version_at_least(found: &str, minimum: &str) -> Option<bool> {
+    compare_versions(found, minimum).map(|ordering| ordering != std::cmp::Ordering::Less)
 }
 
 #[cfg(test)]
@@ -127,6 +137,23 @@ mod tests {
         assert_eq!(version_at_least("0.153.2", "0.150.0"), Some(true));
         assert_eq!(version_at_least("0.9", "0.10.0"), Some(false));
         assert_eq!(version_at_least("x", "1"), None);
+        assert_eq!(
+            compare_versions("v1.2.3", "1.2.3"),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(
+            compare_versions("1.10.0", "1.9.9"),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions("2.1.263", "2.1.270"),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            compare_versions("1.2.3-beta", "1.2.3"),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(compare_versions("", "1.0"), None);
     }
 
     #[test]

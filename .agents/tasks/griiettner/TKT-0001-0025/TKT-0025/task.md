@@ -3,7 +3,7 @@ id: TKT-0025
 namespace: griiettner
 title: Detect and offer updates for installed provider CLIs
 artifact: task
-status: ready
+status: done
 owner: griiettner
 created: 2026-09-06
 updated: 2026-09-06

@@ -9,8 +9,30 @@
 #   FAKE_AGENT_ARGS_FILE  file that receives the arguments, one per line
 #   FAKE_AGENT_AUTH       text printed by the auth probe
 #   FAKE_AGENT_NOISE      when set, print a line every 50 ms forever after the fixture
+#   FAKE_AGENT_VERSION_FILE file whose first line is the version `--version` reports
+#   FAKE_AGENT_UPDATE_SLEEP seconds a self-update (`update`/`upgrade`) sleeps first
+#   FAKE_AGENT_UPDATE_EXIT  exit status of a self-update (default 0)
+#   FAKE_AGENT_UPDATE_TO    version a successful self-update writes to FAKE_AGENT_VERSION_FILE
+#   FAKE_AGENT_PID_FILE     file that receives this process id during a self-update
 case "$1" in
-  --version) echo "fake-agent 1.0.0"; exit 0 ;;
+  --version)
+    if [ -n "$FAKE_AGENT_VERSION_FILE" ] && [ -f "$FAKE_AGENT_VERSION_FILE" ]; then
+      echo "fake-agent $(head -n 1 "$FAKE_AGENT_VERSION_FILE")"
+    else
+      echo "fake-agent 1.0.0"
+    fi
+    exit 0
+    ;;
+  update|upgrade)
+    if [ -n "$FAKE_AGENT_PID_FILE" ]; then echo "$$" > "$FAKE_AGENT_PID_FILE"; fi
+    echo "checking for updates"
+    if [ -n "$FAKE_AGENT_UPDATE_SLEEP" ]; then sleep "$FAKE_AGENT_UPDATE_SLEEP"; fi
+    if [ "${FAKE_AGENT_UPDATE_EXIT:-0}" = "0" ] && [ -n "$FAKE_AGENT_UPDATE_TO" ] && [ -n "$FAKE_AGENT_VERSION_FILE" ]; then
+      echo "$FAKE_AGENT_UPDATE_TO" > "$FAKE_AGENT_VERSION_FILE"
+    fi
+    if [ "${FAKE_AGENT_UPDATE_EXIT:-0}" != "0" ]; then echo "update failed: token=sk-fake-secret" >&2; fi
+    exit "${FAKE_AGENT_UPDATE_EXIT:-0}"
+    ;;
   --list-models)
     if [ -n "$FAKE_AGENT_MODELS_FILE" ]; then cat "$FAKE_AGENT_MODELS_FILE"; else printf '%s\n' "gpt-5.5-medium (default)" "composer-2"; fi
     exit "${FAKE_AGENT_MODELS_EXIT:-0}"

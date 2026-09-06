@@ -28,6 +28,14 @@ impl Protocol for OpenCode {
         "opencode"
     }
 
+    fn vendor_install(&self) -> Option<crate::install::VendorInstall> {
+        Some(crate::install::VendorInstall {
+            installer: "OpenCode install script",
+            markers: &[".opencode/bin/"],
+            update_args: &["upgrade"],
+        })
+    }
+
     fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             follow_up_input: true,

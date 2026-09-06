@@ -21,6 +21,8 @@ pub enum Command {
     Details,
     Sidebar,
     Mcp,
+    Version,
+    Update,
     Help,
     Quit,
 }
@@ -127,6 +129,20 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "mcp",
         aliases: &["servers"],
         summary: "Inspect configured MCP servers and their tools",
+        shortcut: None,
+    },
+    CommandSpec {
+        command: Command::Version,
+        name: "version",
+        aliases: &["outdated"],
+        summary: "Check the installed agent CLI against its newest published version",
+        shortcut: None,
+    },
+    CommandSpec {
+        command: Command::Update,
+        name: "update",
+        aliases: &["upgrade"],
+        summary: "Update the installed agent CLI with its installer's command, after approval",
         shortcut: None,
     },
     CommandSpec {

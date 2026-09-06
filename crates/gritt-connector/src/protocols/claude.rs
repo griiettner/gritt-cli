@@ -26,6 +26,14 @@ impl Protocol for ClaudeCode {
         "claude"
     }
 
+    fn vendor_install(&self) -> Option<crate::install::VendorInstall> {
+        Some(crate::install::VendorInstall {
+            installer: "Claude Code native installer",
+            markers: &[".local/share/claude/", ".claude/local/"],
+            update_args: &["update"],
+        })
+    }
+
     fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             follow_up_input: true,
