@@ -107,6 +107,15 @@ pub enum View {
     Diff,
 }
 
+/// How the footer draws an advisory line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeTone {
+    /// Nothing to do; faded so it does not compete with the transcript.
+    Muted,
+    /// Something to act on, such as an available update.
+    Warning,
+}
+
 /// An `ask` waiting for the user. `preview` is the write diff.
 #[derive(Debug, Clone)]
 pub struct PendingApproval {
@@ -669,6 +678,10 @@ pub struct App {
     pub connector_catalog: ConnectorCatalogView,
     /// The live connector session's version check, once one has run.
     pub connector_version: Option<ConnectorVersionCheck>,
+    /// A version or update status for the footer. Advisory, so it is
+    /// drawn muted, or in the warning colour when an update is available;
+    /// never in the error style `notice` uses.
+    pub version_notice: Option<(String, NoticeTone)>,
     /// The update the approval overlay is showing. Answering the overlay
     /// takes it, so a late key cannot run a command that was withdrawn.
     pub update_approval: Option<(ConnectorId, UpdateAction)>,
@@ -763,6 +776,7 @@ impl App {
             connector_model: None,
             connector_catalog: ConnectorCatalogView::default(),
             connector_version: None,
+            version_notice: None,
             update_approval: None,
             mcp_target: None,
             mcp_approval: None,
@@ -1191,7 +1205,12 @@ impl App {
             return false;
         }
         self.sidebar.model.version = Some(version_summary(&check));
-        self.notice = Some(check.describe());
+        let tone = if check.update_available() {
+            NoticeTone::Warning
+        } else {
+            NoticeTone::Muted
+        };
+        self.version_notice = Some((check.describe(), tone));
         self.connector_version = Some(check);
         true
     }
@@ -1210,9 +1229,14 @@ impl App {
             ConnectorUpdateOutcome::Updated { recheck, .. } => {
                 let text = recheck.describe();
                 self.apply_connector_version(connector, *recheck);
-                self.notice = Some(format!("{} updated; {text}", connector.as_str()));
+                self.version_notice = Some((
+                    format!("{} updated; {text}", connector.as_str()),
+                    NoticeTone::Muted,
+                ));
             }
-            other => self.notice = Some(other.describe()),
+            failed @ (ConnectorUpdateOutcome::Failed { .. }
+            | ConnectorUpdateOutcome::TimedOut { .. }) => self.notice = Some(failed.describe()),
+            other => self.version_notice = Some((other.describe(), NoticeTone::Muted)),
         }
         true
     }
@@ -1704,6 +1728,7 @@ impl App {
     /// palette, and a shortcut — comes through here.
     pub fn dispatch(&mut self, cmd: Command, argument: Option<String>) -> Action {
         self.notice = None;
+        self.version_notice = None;
         self.suggestions_dismissed = false;
         // An approval or a running turn owns the session: the plan keeps
         // both modal, so a settings command explains the refusal instead
@@ -1766,7 +1791,8 @@ impl App {
                     return Action::None;
                 };
                 let Some(check) = self.connector_version.clone() else {
-                    self.notice = Some(format!("checking {} first", id.as_str()));
+                    self.version_notice =
+                        Some((format!("checking {} first", id.as_str()), NoticeTone::Muted));
                     return Action::LoadConnectorVersion {
                         connector: id,
                         mode: VersionCheckMode::Cached,
@@ -1782,7 +1808,8 @@ impl App {
                             .status()
                             .and_then(|status| status.next_step.clone())
                             .unwrap_or_else(|| check.describe());
-                        self.notice = Some(format!("no update to run: {why}"));
+                        self.version_notice =
+                            Some((format!("no update to run: {why}"), NoticeTone::Muted));
                         Action::None
                     }
                 }
@@ -2023,9 +2050,9 @@ impl App {
             if approved {
                 return Action::RunConnectorUpdate { connector, action };
             }
-            self.notice = Some(format!(
-                "{} update declined; nothing was run",
-                connector.as_str()
+            self.version_notice = Some((
+                format!("{} update declined; nothing was run", connector.as_str()),
+                NoticeTone::Muted,
             ));
             return Action::None;
         }
@@ -2889,6 +2916,7 @@ impl App {
         self.connector_model = None;
         self.connector_catalog = ConnectorCatalogView::default();
         self.connector_version = None;
+        self.version_notice = None;
         self.update_approval = None;
         self.running = false;
         self.pending = None;

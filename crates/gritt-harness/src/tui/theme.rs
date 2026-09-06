@@ -65,6 +65,9 @@ pub struct Palette {
     pub selection: Color,
     pub success: Color,
     pub error: Color,
+    /// Something worth acting on that is not a failure: an update is
+    /// available, a list is stale.
+    pub warning: Color,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +91,7 @@ const DARK: Palette = Palette {
     selection: Color::Rgb(0x2d, 0x3f, 0x64),
     success: Color::Rgb(0x7d, 0xcf, 0x8a),
     error: Color::Rgb(0xf0, 0x71, 0x78),
+    warning: Color::Rgb(0xc8, 0x9b, 0x2f),
 };
 
 const LIGHT: Palette = Palette {
@@ -99,6 +103,7 @@ const LIGHT: Palette = Palette {
     selection: Color::Rgb(0xcd, 0xda, 0xf5),
     success: Color::Rgb(0x1d, 0x6f, 0x35),
     error: Color::Rgb(0xa3, 0x1d, 0x2c),
+    warning: Color::Rgb(0x8a, 0x64, 0x00),
 };
 
 impl Theme {
@@ -183,6 +188,11 @@ impl Theme {
 
     pub fn error(&self) -> Style {
         self.styled(self.palette.error, Modifier::BOLD)
+    }
+
+    /// Advisory, not alarming: plain weight in the warning colour.
+    pub fn warning(&self) -> Style {
+        self.styled(self.palette.warning, Modifier::empty())
     }
 
     /// The highlighted row of a picker or suggestion list. Reversed in

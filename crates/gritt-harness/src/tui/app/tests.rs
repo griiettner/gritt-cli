@@ -2213,7 +2213,17 @@ fn a_version_result_fills_the_sidebar_and_an_update_asks_through_the_overlay() {
     assert!(line.contains("0.1.0"), "{line}");
     assert!(line.contains("latest 0.2.0"), "{line}");
     assert!(line.contains("/update"), "{line}");
-    assert!(app.notice.as_deref().unwrap().contains("outdated"));
+    let (text, tone) = app.version_notice.clone().unwrap();
+    assert!(text.contains("outdated"), "{text}");
+    assert_eq!(
+        tone,
+        NoticeTone::Warning,
+        "an available update is a warning, not an error"
+    );
+    assert!(
+        app.notice.is_none(),
+        "version state never uses the error notice"
+    );
 
     assert_eq!(app.dispatch(Command::Update, None), Action::None);
     let pending = app
@@ -2265,13 +2275,22 @@ fn a_version_result_fills_the_sidebar_and_an_update_asks_through_the_overlay() {
     let line = app.sidebar.model.version.clone().unwrap();
     assert!(line.contains("0.2.0"), "{line}");
     assert!(line.contains("current"), "{line}");
-    assert!(app.notice.as_deref().unwrap().contains("updated"));
+    let (text, tone) = app.version_notice.clone().unwrap();
+    assert!(text.contains("updated"), "{text}");
+    assert_eq!(
+        tone,
+        NoticeTone::Muted,
+        "a current install is faded, not highlighted"
+    );
     assert_eq!(app.dispatch(Command::Update, None), Action::None);
     assert!(
         app.pending.is_none(),
         "a current install has nothing to approve"
     );
-    assert!(app.notice.as_deref().unwrap().contains("no update to run"));
+    let (text, tone) = app.version_notice.clone().unwrap();
+    assert!(text.contains("no update to run"), "{text}");
+    assert_eq!(tone, NoticeTone::Muted);
+    assert!(app.notice.is_none());
 }
 
 #[test]
@@ -2306,7 +2325,14 @@ fn declining_runs_nothing_and_late_or_foreign_results_are_dropped() {
     assert_eq!(app.on_key(key(KeyCode::Char('n'))), Action::None);
     assert!(app.pending.is_none());
     assert!(app.update_approval.is_none());
-    assert!(app.notice.as_deref().unwrap().contains("declined"));
+    let (text, tone) = app.version_notice.clone().unwrap();
+    assert!(text.contains("declined"), "{text}");
+    assert_eq!(tone, NoticeTone::Muted);
+    assert_eq!(
+        app.version_notice.as_ref().map(|(_, tone)| *tone),
+        Some(NoticeTone::Muted),
+        "a stale outdated answer is never highlighted as an offer"
+    );
 
     // A result for another agent, or for a session already left, changes nothing.
     let line = app.sidebar.model.version.clone();
@@ -2321,6 +2347,7 @@ fn declining_runs_nothing_and_late_or_foreign_results_are_dropped() {
     app.dispatch(Command::New, None);
     assert!(app.connector_version.is_none());
     assert!(app.update_approval.is_none());
+    assert!(app.version_notice.is_none());
     assert!(app.sidebar.model.version.is_none());
     assert!(
         !app.apply_connector_update(codex, ConnectorUpdateOutcome::Declined { connector: codex },)
@@ -2360,12 +2387,13 @@ fn an_unknown_owner_offers_no_update_and_native_sessions_say_so() {
         app.pending.is_none(),
         "an unknown owner never opens a command to approve"
     );
-    let notice = app.notice.clone().unwrap();
+    let (notice, tone) = app.version_notice.clone().unwrap();
     assert!(notice.contains("no update to run"), "{notice}");
     assert!(
         notice.contains("could not tell which installer"),
         "{notice}"
     );
+    assert_eq!(tone, NoticeTone::Muted);
 
     // Before any check, /update checks first instead of guessing.
     app.connector_version = None;
