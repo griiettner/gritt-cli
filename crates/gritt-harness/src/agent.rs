@@ -53,7 +53,12 @@ pub enum ApprovalMode {
 }
 
 /// What an interface must provide to the loop. Print, REPL, and the
-/// full-screen mode all implement it.
+/// full-screen mode all implement it, and so does a non-terminal client
+/// (ADR-011): implement `event` and `approve` over your own channel or
+/// store instead of a terminal, exactly as `tui::run::ChannelUi` and the
+/// test-only `RecordingUi`/`ClientUi` fixtures do. Nothing in this trait
+/// or its `Event`/`ApprovalRequest`/`ApprovalDecision` arguments names a
+/// terminal type.
 pub trait Ui: Send {
     /// Every persisted event, in order.
     fn event(&mut self, event: &Event);
