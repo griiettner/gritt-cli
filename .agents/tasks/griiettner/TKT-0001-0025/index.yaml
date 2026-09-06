@@ -497,7 +497,7 @@ tickets:
   - id: TKT-0023
     namespace: griiettner
     title: Expose reusable control plane API for T3Code
-    status: ready
+    status: done
     owner: griiettner
     priority: normal
     created: 2026-09-06
@@ -506,6 +506,7 @@ tickets:
       concept: .agents/tasks/griiettner/TKT-0001-0025/TKT-0023/concept.md
       plan: .agents/tasks/griiettner/TKT-0001-0025/TKT-0023/plan.md
       task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0023/task.md
+      report: .agents/tasks/griiettner/TKT-0001-0025/TKT-0023/report.md
     dependencies: []
     areas:
       - core
@@ -540,6 +541,32 @@ tickets:
     skills:
       - dev-provider
       - dev-harness
+      - codebase-design
+      - tdd
+      - write
+  - id: TKT-0025
+    namespace: griiettner
+    title: Detect and offer updates for installed provider CLIs
+    status: ready
+    owner: griiettner
+    priority: normal
+    created: 2026-09-06
+    updated: 2026-09-06
+    artifacts:
+      concept: .agents/tasks/griiettner/TKT-0001-0025/TKT-0025/concept.md
+      plan: .agents/tasks/griiettner/TKT-0001-0025/TKT-0025/plan.md
+      task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0025/task.md
+    dependencies:
+      - TKT-0024
+    areas:
+      - crates/gritt-core
+      - crates/gritt-provider
+      - crates/gritt-harness
+      - crates/gritt
+    skills:
+      - dev-provider
+      - dev-harness
+      - dev-cli
       - codebase-design
       - tdd
       - write

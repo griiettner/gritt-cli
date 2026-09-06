@@ -3,6 +3,17 @@
 //! first connector; external ones are optional and a missing one only
 //! fails its own sessions. It also validates and opens session drafts and
 //! reports profile and catalog state for the setup flow.
+//!
+//! This is also the seam ADR-011 names for the first non-terminal
+//! frontend: `ControlPlane` plus [`AgentBuilder`] own provider/profile/
+//! model resolution, session lifecycle, execution mode and effort
+//! selection, permission decisions (via [`crate::policy::PolicyEngine`]
+//! and the [`crate::agent::Ui`] trait), last-used preferences, and the
+//! normalized [`gritt_core::event::Event`] stream. None of it references
+//! Ratatui, Crossterm, terminal dimensions, or escape sequences; the CLI,
+//! REPL, and TUI consume this module, and it does not depend on any of
+//! them. `crates/gritt-harness/tests/control_plane_client.rs` is a
+//! non-terminal Rust client fixture built directly against this API.
 
 use std::sync::Arc;
 

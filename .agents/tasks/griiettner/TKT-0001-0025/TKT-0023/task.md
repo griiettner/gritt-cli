@@ -3,7 +3,7 @@ id: TKT-0023
 namespace: griiettner
 title: Expose reusable control plane API for T3Code
 artifact: task
-status: ready
+status: done
 owner: griiettner
 created: 2026-09-06
 updated: 2026-09-06

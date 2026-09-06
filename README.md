@@ -125,6 +125,30 @@ installed binary has no runtime dependency. Repository maintenance runs
 through the separate `gritt-agent` crate at `.agents/cli/`. The repository
 has no Node tooling.
 
+### Control plane API
+
+`gritt-harness` exposes a Rust seam that the CLI, REPL, and TUI already
+share, and that ADR-011 names as the first non-terminal frontend's API:
+
+- `control::ControlPlane` and `agent::AgentBuilder` own provider and
+  profile resolution (with failover and last-used preferences), session
+  lifecycle, execution mode, and effort selection.
+- `driver::Driver` runs one turn to completion and reports `DriverInfo`;
+  `agent::Ui` is the extension point a caller implements to receive the
+  normalized `gritt_core::event::Event` stream and answer permission
+  decisions (`allow`/`ask`/`deny`) without rendering anything.
+- `setup::ProviderSetup` is the injected seam for config-file and keychain
+  writes; a read-only or embedded client can use `setup::ReadOnlySetup`.
+
+None of this module set depends on Ratatui, Crossterm, terminal
+dimensions, or terminal escape sequences, and the terminal application
+does not depend on a future frontend that reuses it.
+`crates/gritt-harness/tests/control_plane_client.rs` is a non-terminal
+Rust client fixture built directly against this API: it selects a
+profile, model, mode, and effort, opens and resumes a session, answers a
+permission decision, and consumes the same normalized events the
+terminal clients do.
+
 ## Terminal modes
 
 Three modes share one session store:
