@@ -4,10 +4,12 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use gritt_connector::protocols::{claude::ClaudeCode, codex::Codex};
+use gritt_connector::protocols::{claude::ClaudeCode, codex::Codex, opencode::OpenCode};
 use gritt_connector::ExternalConnector;
 use gritt_core::config::ConnectorSettings;
-use gritt_core::connector::{AuthState, Connector, TaskRequest};
+use gritt_core::connector::{
+    AuthState, Connector, ConnectorId, ConnectorModelDiscovery, TaskRequest,
+};
 use gritt_core::event::EventKind;
 use gritt_core::session::SessionId;
 
@@ -35,6 +37,7 @@ async fn smoke(connector: &dyn Connector, name: &str) {
             prompt: "Reply with the single word PONG.".into(),
             workspace: workspace.path().to_path_buf(),
             continuation: None,
+            model: None,
         })
         .await
         .expect("start");
@@ -115,6 +118,7 @@ async fn codex_live_resume() {
             prompt: prompt.to_owned(),
             workspace: workspace.path().to_path_buf(),
             continuation,
+            model: None,
         };
         let connector = &connector;
         async move {
@@ -159,4 +163,66 @@ async fn codex_live_resume() {
         second.to_ascii_uppercase().contains("MARMALADE"),
         "the resumed thread lost its context: {second:?}"
     );
+}
+
+#[tokio::test]
+async fn live_codex_model_listing() {
+    if !gated() {
+        eprintln!("GRITT_LIVE_CONNECTOR_TESTS is not set; skipping");
+        return;
+    }
+    let connector = ExternalConnector::new(Codex, &ConnectorSettings::default());
+    let info = connector.info().await.expect("info");
+    if info.auth == AuthState::NotInstalled {
+        eprintln!("codex is not installed; skipping live model listing");
+        return;
+    }
+    let outcome = connector.discover_models(true).await;
+    eprintln!("codex models: {}", outcome.describe());
+    assert!(
+        outcome.catalog().is_some(),
+        "codex should return a catalog, got {outcome:?}"
+    );
+    assert_eq!(outcome.connector(), ConnectorId::Codex);
+}
+
+#[tokio::test]
+async fn live_claude_model_listing_is_unsupported() {
+    if !gated() {
+        eprintln!("GRITT_LIVE_CONNECTOR_TESTS is not set; skipping");
+        return;
+    }
+    let connector = ExternalConnector::new(ClaudeCode, &ConnectorSettings::default());
+    let info = connector.info().await.expect("info");
+    if info.auth == AuthState::NotInstalled {
+        eprintln!("claude is not installed; skipping live model listing");
+        return;
+    }
+    let outcome = connector.discover_models(true).await;
+    eprintln!("claude models: {}", outcome.describe());
+    assert!(
+        matches!(outcome, ConnectorModelDiscovery::Unsupported { .. }),
+        "claude has no documented listing command, got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn live_opencode_model_listing() {
+    if !gated() {
+        eprintln!("GRITT_LIVE_CONNECTOR_TESTS is not set; skipping");
+        return;
+    }
+    let connector = ExternalConnector::new(OpenCode, &ConnectorSettings::default());
+    let info = connector.info().await.expect("info");
+    if info.auth == AuthState::NotInstalled {
+        eprintln!("opencode is not installed; skipping live model listing");
+        return;
+    }
+    let outcome = connector.discover_models(true).await;
+    eprintln!("opencode models: {}", outcome.describe());
+    assert!(
+        outcome.catalog().is_some(),
+        "opencode should return a catalog, got {outcome:?}"
+    );
+    assert_eq!(outcome.connector(), ConnectorId::OpenCode);
 }

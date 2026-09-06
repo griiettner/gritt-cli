@@ -10,10 +10,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use gritt_connector::models::{CachedConnectorModels, ConnectorModelCache};
 use gritt_connector::protocols::codex::Codex;
 use gritt_connector::{ExternalConnector, Timeouts};
-use gritt_core::config::{Config, ConnectorSettings};
-use gritt_core::connector::{AuthState, Connector, ConnectorId, TaskRequest, TaskState};
+use gritt_core::config::{Config, ConnectorSettings, ModelListPolicy};
+use gritt_core::connector::{
+    AuthState, Connector, ConnectorId, ConnectorModelDiscovery, ConnectorModelFreshness,
+    TaskRequest, TaskState,
+};
 use gritt_core::event::{ApprovalDecision, ApprovalRequest, Event, EventKind, EventSource};
 use gritt_core::provider::{Protocol, ProviderProfile};
 use gritt_core::secret::{Secret, SecretRef};
@@ -25,6 +29,7 @@ use gritt_harness::control::ControlPlane;
 use gritt_harness::modes::print::{PrintUi, PrintUiOptions, SharedBuffer};
 use gritt_harness::native_connector::NativeConnector;
 use gritt_harness::policy::Decision;
+use gritt_harness::startup::StartupRequest;
 use gritt_harness::store::{DatabaseLocation, Store};
 use gritt_harness::telemetry::Telemetry;
 use gritt_harness::tools::Workspace;
@@ -213,7 +218,8 @@ async fn a_connector_session_runs_stores_and_resumes_like_a_native_one() {
     assert_eq!(
         driver.session().kind,
         SessionKind::Connector {
-            id: ConnectorId::Codex
+            id: ConnectorId::Codex,
+            model: None,
         }
     );
     assert_eq!(driver.phase(), Phase::Coding);
@@ -256,7 +262,8 @@ async fn a_connector_session_runs_stores_and_resumes_like_a_native_one() {
     assert_eq!(
         listed[0].kind,
         SessionKind::Connector {
-            id: ConnectorId::Codex
+            id: ConnectorId::Codex,
+            model: None,
         }
     );
 
@@ -483,6 +490,7 @@ async fn the_native_path_runs_behind_the_connector_contract() {
             prompt: "write it".into(),
             workspace: fx.dir.path().to_path_buf(),
             continuation: None,
+            model: None,
         })
         .await
         .unwrap();
@@ -557,6 +565,7 @@ async fn the_connector_runner_relays_native_approvals() {
         name: "via-runner".into(),
         kind: SessionKind::Connector {
             id: ConnectorId::Native,
+            model: None,
         },
         phase: Phase::Coding,
         workspace: fx.dir.path().to_path_buf(),
@@ -721,6 +730,7 @@ async fn a_slow_consumer_receives_every_native_event_in_order() {
             prompt: "count".into(),
             workspace: fx.dir.path().to_path_buf(),
             continuation: None,
+            model: None,
         })
         .await
         .unwrap();
@@ -749,4 +759,186 @@ async fn a_slow_consumer_receives_every_native_event_in_order() {
     for (index, delta) in deltas.iter().enumerate() {
         assert_eq!(delta, &format!("t{index} "), "out of order at {index}");
     }
+}
+
+fn models_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../gritt-connector/tests/fixtures/models/codex")
+        .join(name)
+}
+
+fn codex_connector_with_models(wrapper: &Path, cache_dir: &Path) -> Arc<dyn Connector> {
+    let settings = ConnectorSettings {
+        executables: BTreeMap::from([("codex".to_owned(), wrapper.display().to_string())]),
+        ..ConnectorSettings::default()
+    };
+    Arc::new(
+        ExternalConnector::new(Codex, &settings)
+            .with_timeouts(Timeouts {
+                health: Duration::from_secs(5),
+                startup: Duration::from_secs(10),
+                idle: Duration::from_secs(10),
+            })
+            .with_model_cache(
+                ConnectorModelCache::new(cache_dir),
+                ModelListPolicy {
+                    refresh_interval_secs: 24 * 60 * 60,
+                    stale_fallback: true,
+                },
+            ),
+    )
+}
+
+#[tokio::test]
+async fn explicit_connector_model_is_stored_and_default_is_omitted() {
+    let scratch = tempfile::tempdir().unwrap();
+    let args_path = scratch.path().join("args.txt");
+    let wrapper = fake_agent(
+        scratch.path(),
+        &[
+            (
+                "FAKE_AGENT_FIXTURE",
+                connector_fixture("text").display().to_string(),
+            ),
+            ("FAKE_AGENT_ARGS_FILE", args_path.display().to_string()),
+            (
+                "FAKE_AGENT_MODELS_FILE",
+                models_fixture("current.json").display().to_string(),
+            ),
+        ],
+    );
+    let cache = scratch.path().join("cache");
+    let fx = fixture(
+        Vec::new(),
+        ApprovalMode::DenyAll,
+        vec![codex_connector_with_models(&wrapper, &cache)],
+    )
+    .await;
+    let opened = fx
+        .plane
+        .open_with(
+            SessionSelector::Named("picked".into()),
+            Some(ConnectorId::Codex),
+            StartupRequest::from_flags(None, Some("gpt-5.4"), None),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        opened.driver.session().kind,
+        SessionKind::Connector {
+            id: ConnectorId::Codex,
+            model: Some("gpt-5.4".into()),
+        }
+    );
+    let discovery = opened.connector_models.as_ref().expect("discovery ran");
+    assert!(discovery.catalog().is_some());
+    drop(opened);
+
+    let defaulted = fx
+        .plane
+        .open_with(
+            SessionSelector::Named("defaulted".into()),
+            Some(ConnectorId::Codex),
+            StartupRequest::from_flags(None, None, None),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        defaulted.driver.session().kind,
+        SessionKind::Connector {
+            id: ConnectorId::Codex,
+            model: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn resumed_connector_sessions_keep_the_stored_model() {
+    let scratch = tempfile::tempdir().unwrap();
+    let wrapper = fake_agent(
+        scratch.path(),
+        &[
+            (
+                "FAKE_AGENT_FIXTURE",
+                connector_fixture("text").display().to_string(),
+            ),
+            (
+                "FAKE_AGENT_MODELS_FILE",
+                models_fixture("current.json").display().to_string(),
+            ),
+        ],
+    );
+    let cache = scratch.path().join("cache");
+    let fx = fixture(
+        Vec::new(),
+        ApprovalMode::DenyAll,
+        vec![codex_connector_with_models(&wrapper, &cache)],
+    )
+    .await;
+    fx.plane
+        .open_with(
+            SessionSelector::Named("keep".into()),
+            Some(ConnectorId::Codex),
+            StartupRequest::from_flags(None, Some("gpt-5.4"), None),
+            None,
+        )
+        .await
+        .unwrap();
+    let resumed = fx
+        .plane
+        .open_with(
+            SessionSelector::Named("keep".into()),
+            Some(ConnectorId::Codex),
+            StartupRequest::from_flags(None, Some("gpt-5.4-mini"), None),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed.driver.session().kind,
+        SessionKind::Connector {
+            id: ConnectorId::Codex,
+            model: Some("gpt-5.4".into()),
+        }
+    );
+    assert!(
+        resumed.connector_models.is_none(),
+        "resume must not run a new selection"
+    );
+}
+
+#[tokio::test]
+async fn connector_refresh_failure_marks_the_cached_list_stale() {
+    let scratch = tempfile::tempdir().unwrap();
+    let cache_dir = scratch.path().join("cache");
+    let cache = ConnectorModelCache::new(&cache_dir);
+    cache
+        .write(
+            ConnectorId::Codex,
+            &CachedConnectorModels {
+                fetched_at: Some(chrono::Utc::now() - chrono::Duration::hours(48)),
+                last_attempt_at: Some(chrono::Utc::now() - chrono::Duration::hours(48)),
+                source: "codex debug models".into(),
+                models: vec![gritt_core::connector::ConnectorModel {
+                    id: "gpt-5.4".into(),
+                    display_label: Some("GPT-5.4".into()),
+                }],
+            },
+        )
+        .unwrap();
+    let wrapper = fake_agent(scratch.path(), &[("FAKE_AGENT_MODELS_EXIT", "1".into())]);
+    let fx = fixture(
+        Vec::new(),
+        ApprovalMode::DenyAll,
+        vec![codex_connector_with_models(&wrapper, &cache_dir)],
+    )
+    .await;
+    let outcome = fx.plane.connector_models(ConnectorId::Codex, true).await;
+    let ConnectorModelDiscovery::CachedStale { catalog, .. } = outcome else {
+        panic!("expected stale fallback, got {outcome:?}");
+    };
+    assert_eq!(catalog.freshness, ConnectorModelFreshness::Stale);
+    assert_eq!(catalog.models[0].id, "gpt-5.4");
 }

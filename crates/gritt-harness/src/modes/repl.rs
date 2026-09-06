@@ -245,8 +245,12 @@ pub async fn run_repl<O: Write + Send, E: Write + Send>(
                                 model,
                                 ..
                             } => format!("{provider_profile}/{model}"),
-                            gritt_core::session::SessionKind::Connector { id } =>
-                                id.as_str().to_owned(),
+                            gritt_core::session::SessionKind::Connector { id, model } => {
+                                match model {
+                                    Some(model) => format!("{}:{model}", id.as_str()),
+                                    None => id.as_str().to_owned(),
+                                }
+                            }
                         },
                         session.updated_at.to_rfc3339()
                     );

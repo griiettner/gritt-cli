@@ -11,7 +11,7 @@ use gritt_core::connector::{AuthState, ConnectorCapabilities, ConnectorId, TaskR
 use gritt_core::event::{EventKind, SessionStatus, StopReason};
 use gritt_core::ErrorKind;
 
-use super::{number, render, text, tool_call, tool_result};
+use super::{model_flag, number, render, text, tool_call, tool_result};
 use crate::health::ProbeOutput;
 use crate::supervise::{usage, Normalized, Normalizer, Protocol};
 
@@ -70,6 +70,7 @@ impl Protocol for ClaudeCode {
             args.push("--resume".into());
             args.push(id.to_owned());
         }
+        args.extend(model_flag(request.model.as_deref()));
         args.push(request.prompt.clone());
         args
     }

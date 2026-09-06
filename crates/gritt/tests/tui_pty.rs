@@ -519,7 +519,7 @@ fn the_fixture_home_walkthrough_runs_by_keyboard_and_never_opens_a_session() {
 
     writer.write_all(b"/effort\r").unwrap();
     writer.flush().unwrap();
-    wait_for(&rx, &mut seen, "Model default", Duration::from_secs(20));
+    wait_for(&rx, &mut seen, "Provider default", Duration::from_secs(20));
     writer.write_all(&[0x1b]).unwrap();
     writer.flush().unwrap();
     thread::sleep(Duration::from_millis(200));
@@ -629,7 +629,7 @@ fn the_fixture_conversation_shows_the_sidebar_only_above_110_columns() {
             // reached the visible interface and not a stale overlay.
             writer.write_all(&[0x10]).unwrap();
             writer.flush().unwrap();
-            wait_for(&rx, &mut seen, "same registry", Duration::from_secs(20));
+            wait_for(&rx, &mut seen, "type to filter", Duration::from_secs(20));
             writer.write_all(&[0x1b]).unwrap();
             writer.flush().unwrap();
             thread::sleep(Duration::from_millis(200));

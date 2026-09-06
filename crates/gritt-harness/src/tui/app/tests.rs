@@ -714,16 +714,21 @@ fn a_connector_selection_says_the_agent_manages_its_own_model() {
         .find(|row| row.id == "agent:cursor-agent")
         .unwrap();
     assert!(!missing.availability.is_available());
-    // Choosing an installed agent explains its authority instead of
-    // opening the native model picker.
+    // Choosing an installed agent opens that agent's model catalog.
     app.dispatch(Command::Connect, None);
     type_text(&mut app, "codex");
-    app.on_key(key(KeyCode::Enter));
-    let Some(Overlay::Notice(notice)) = app.top_overlay() else {
-        panic!("expected the connector explanation");
-    };
-    assert!(
-        notice.body.contains("Managed by agent") || notice.body.contains("managed by the agent")
+    let action = app.on_key(key(KeyCode::Enter));
+    assert!(matches!(
+        action,
+        Action::LoadConnectorCatalog {
+            connector: gritt_core::connector::ConnectorId::Codex,
+            refresh: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        app.top_overlay().and_then(Overlay::picker_kind),
+        Some(PickerKind::Models)
     );
 }
 
@@ -1067,6 +1072,7 @@ fn setting_a_connector_session_marks_the_model_as_managed_by_the_agent() {
         name: "codex-run".into(),
         kind: gritt_core::session::SessionKind::Connector {
             id: gritt_core::connector::ConnectorId::Codex,
+            model: None,
         },
         phase: Phase::Coding,
         workspace: "/ws".into(),
@@ -1837,39 +1843,106 @@ fn setup_on_an_unpinned_draft_selects_the_profile_and_reloads_its_catalog() {
 /// An installed agent is selected explicitly, from its detail view, and
 /// never by highlighting its row.
 #[test]
-fn an_installed_agent_is_selected_only_by_confirming_its_detail_view() {
+fn an_installed_agent_opens_its_model_picker_instead_of_starting() {
     let mut app = fixture::home(Theme::new(ThemeMode::NoColor));
     app.dispatch(Command::Connect, None);
     type_text(&mut app, "codex");
-    // Choosing the row opens the detail view and starts nothing.
     let action = app.on_key(key(KeyCode::Enter));
     assert_eq!(
         action,
-        Action::None,
+        Action::LoadConnectorCatalog {
+            connector: gritt_core::connector::ConnectorId::Codex,
+            selection: app.selection,
+            refresh: false,
+        },
         "highlighting an agent started a session"
     );
-    let Some(Overlay::Notice(notice)) = app.top_overlay() else {
-        panic!("no detail view was shown")
-    };
-    assert!(
-        notice.body.contains("Managed by agent") || notice.body.contains("managed by the agent")
+    assert_eq!(
+        app.top_overlay().and_then(Overlay::picker_kind),
+        Some(PickerKind::Models)
     );
     assert_eq!(
-        notice.confirm,
+        app.connector_choice,
         Some(gritt_core::connector::ConnectorId::Codex)
     );
-    // Enter on the detail view is the explicit selection.
+    app.apply_connector_catalog(
+        app.selection,
+        gritt_core::connector::ConnectorId::Codex,
+        gritt_core::connector::ConnectorModelDiscovery::Current {
+            catalog: gritt_core::connector::ConnectorModelCatalog {
+                connector: gritt_core::connector::ConnectorId::Codex,
+                models: vec![gritt_core::connector::ConnectorModel {
+                    id: "gpt-5.4".into(),
+                    display_label: Some("GPT-5.4".into()),
+                }],
+                source: "codex debug models".into(),
+                fetched_at: Utc::now(),
+                freshness: gritt_core::connector::ConnectorModelFreshness::Current,
+            },
+        },
+    );
+    type_text(&mut app, "gpt-5.4");
     assert_eq!(
         app.on_key(key(KeyCode::Enter)),
         Action::SelectConnector(gritt_core::connector::ConnectorId::Codex)
     );
-    // Escape instead of Enter starts nothing.
+    assert_eq!(app.draft.model.as_deref(), Some("gpt-5.4"));
+    // Escape from the picker starts nothing.
     let mut app = fixture::home(Theme::new(ThemeMode::NoColor));
     app.dispatch(Command::Connect, None);
     type_text(&mut app, "codex");
     app.on_key(key(KeyCode::Enter));
     assert_eq!(app.on_key(key(KeyCode::Esc)), Action::None);
-    assert!(app.overlays.is_empty());
+}
+
+#[test]
+fn a_stale_connector_catalog_is_not_shown_as_current() {
+    let mut app = fixture::home(Theme::new(ThemeMode::NoColor));
+    app.connector_choice = Some(gritt_core::connector::ConnectorId::Codex);
+    app.apply_connector_catalog(
+        app.selection,
+        gritt_core::connector::ConnectorId::Codex,
+        gritt_core::connector::ConnectorModelDiscovery::CachedStale {
+            catalog: gritt_core::connector::ConnectorModelCatalog {
+                connector: gritt_core::connector::ConnectorId::Codex,
+                models: vec![gritt_core::connector::ConnectorModel {
+                    id: "gpt-5.4".into(),
+                    display_label: None,
+                }],
+                source: "codex debug models".into(),
+                fetched_at: Utc::now(),
+                freshness: gritt_core::connector::ConnectorModelFreshness::Stale,
+            },
+            reason: "codex debug models exited unsuccessfully".into(),
+        },
+    );
+    let picker = app.model_picker();
+    assert!(matches!(
+        picker.status,
+        crate::tui::picker::ListStatus::Failed { cached: true, .. }
+    ));
+    assert!(picker.hint.contains("stale"));
+}
+
+#[test]
+fn an_unsupported_connector_catalog_still_offers_the_agent_default() {
+    let mut app = fixture::home(Theme::new(ThemeMode::NoColor));
+    app.connector_choice = Some(gritt_core::connector::ConnectorId::ClaudeCode);
+    app.apply_connector_catalog(
+        app.selection,
+        gritt_core::connector::ConnectorId::ClaudeCode,
+        gritt_core::connector::ConnectorModelDiscovery::Unsupported {
+            connector: gritt_core::connector::ConnectorId::ClaudeCode,
+            reason: "claude has no documented model listing command".into(),
+        },
+    );
+    let picker = app.model_picker();
+    assert_eq!(picker.rows()[0].id, "__default__");
+    assert!(picker.rows()[0].availability.is_available());
+    assert!(matches!(
+        picker.status,
+        crate::tui::picker::ListStatus::Failed { cached: false, .. }
+    ));
 }
 
 /// The MCP inventory is Gritt's on a connector session, and the agent's

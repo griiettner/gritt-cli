@@ -82,6 +82,7 @@ impl Fake {
             prompt: prompt.into(),
             workspace: self.dir.path().to_path_buf(),
             continuation: None,
+            model: None,
         }
     }
 }
@@ -471,6 +472,7 @@ async fn a_missing_executable_is_reported_not_fatal() {
             prompt: "x".into(),
             workspace: std::env::temp_dir(),
             continuation: None,
+            model: None,
         })
         .await
         .err()

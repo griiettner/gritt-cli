@@ -11,6 +11,20 @@
 #   FAKE_AGENT_NOISE      when set, print a line every 50 ms forever after the fixture
 case "$1" in
   --version) echo "fake-agent 1.0.0"; exit 0 ;;
+  --list-models)
+    if [ -n "$FAKE_AGENT_MODELS_FILE" ]; then cat "$FAKE_AGENT_MODELS_FILE"; else printf '%s\n' "gpt-5.5-medium (default)" "composer-2"; fi
+    exit "${FAKE_AGENT_MODELS_EXIT:-0}"
+    ;;
+  debug)
+    if [ "$2" = "models" ]; then
+      if [ -n "$FAKE_AGENT_MODELS_FILE" ]; then cat "$FAKE_AGENT_MODELS_FILE"; else printf '%s\n' '{"models":[{"slug":"gpt-5.4","display_name":"GPT-5.4"}]}'; fi
+      exit "${FAKE_AGENT_MODELS_EXIT:-0}"
+    fi
+    ;;
+  models)
+    if [ -n "$FAKE_AGENT_MODELS_FILE" ]; then cat "$FAKE_AGENT_MODELS_FILE"; else printf '%s\n' "opencode/big-pickle" "openai/gpt-5-nano"; fi
+    exit "${FAKE_AGENT_MODELS_EXIT:-0}"
+    ;;
   login|auth|status) echo "${FAKE_AGENT_AUTH:-Logged in using fake}"; exit 0 ;;
 esac
 if [ -n "$FAKE_AGENT_ARGS_FILE" ]; then

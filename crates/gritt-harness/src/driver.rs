@@ -112,9 +112,9 @@ impl Driver for NativeAgent {
                 backend: provider_profile.clone(),
                 detail: model.clone(),
             },
-            SessionKind::Connector { id } => DriverInfo {
+            SessionKind::Connector { id, model } => DriverInfo {
                 backend: id.as_str().to_owned(),
-                detail: String::new(),
+                detail: model.clone().unwrap_or_default(),
             },
         }
     }

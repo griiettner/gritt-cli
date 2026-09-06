@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use clap::{Args, Parser, Subcommand};
-use gritt_connector::{default_connectors_with_secrets, environment_secrets, parse_connector_id};
+use gritt_connector::{default_connectors_configured, environment_secrets, parse_connector_id};
 use gritt_core::connector::{AuthState, ConnectorId};
 use gritt_core::event::{ApprovalDecision, EventKind};
 use gritt_core::mcp::{McpRuntimeSettings, McpServerState, TrustDecision};
@@ -145,7 +145,9 @@ struct SessionArgs {
     /// Provider profile. Defaults to the configured default.
     #[arg(long)]
     profile: Option<String>,
-    /// Model id or alias. Defaults to the configured default.
+    /// Model id or alias. For a native session this is the provider model;
+    /// for `--connector` it is passed to the agent as `--model`. Defaults
+    /// to the configured default, or the agent's own default.
     #[arg(long)]
     model: Option<String>,
     /// Reasoning effort for a new native session: auto, low, medium, or
@@ -382,7 +384,13 @@ fn plane(builder: AgentBuilder) -> Result<ControlPlane> {
         .filter_map(|(name, profile)| builder.keys.key(name, &profile.key).ok())
         .collect();
     secrets.extend(environment_secrets(&blocked));
-    let external = default_connectors_with_secrets(&builder.config.connectors, secrets)?;
+    let cache_dir = dirs::cache_dir().map(|dir| dir.join("gritt").join("connector-models"));
+    let external = default_connectors_configured(
+        &builder.config.connectors,
+        secrets,
+        cache_dir,
+        builder.config.model_list.clone(),
+    )?;
     let file_setup = Arc::new(setup::FileSetup::new(builder.workspace_root(), resolver()));
     Ok(ControlPlane::new(Arc::new(builder), external).with_setup(file_setup))
 }
@@ -471,6 +479,14 @@ fn startup_notes(opened: &Opened) -> Vec<String> {
                 lines.push(format!("warning: {reason}; capabilities are unreported"))
             }
             CatalogState::Fresh { .. } | CatalogState::Skipped => {}
+        }
+    }
+    if let Some(discovery) = &opened.connector_models {
+        match discovery {
+            gritt_core::connector::ConnectorModelDiscovery::Current { .. } => {
+                lines.push(format!("note: {}", discovery.describe()));
+            }
+            _ => lines.push(format!("warning: {}", discovery.describe())),
         }
     }
     lines.extend(
@@ -944,8 +960,10 @@ async fn session_command(
                             model,
                             ..
                         } => format!("{provider_profile}/{model}"),
-                        gritt_core::session::SessionKind::Connector { id } =>
-                            format!("connector:{}", id.as_str()),
+                        gritt_core::session::SessionKind::Connector { id, model } => match model {
+                            Some(model) => format!("connector:{}:{model}", id.as_str()),
+                            None => format!("connector:{}", id.as_str()),
+                        },
                     },
                     session.updated_at.to_rfc3339()
                 );
@@ -1318,6 +1336,7 @@ mod tests {
         };
         let external_session = SessionKind::Connector {
             id: ConnectorId::Codex,
+            model: None,
         };
         // An explicit native flag is still the native path.
         assert!(native_backend(Some(ConnectorId::Native), None));

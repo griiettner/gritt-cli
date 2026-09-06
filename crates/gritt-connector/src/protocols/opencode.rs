@@ -6,12 +6,15 @@
 
 use std::collections::HashSet;
 
-use gritt_core::connector::{AuthState, ConnectorCapabilities, ConnectorId, TaskRequest};
+use gritt_core::connector::{
+    AuthState, ConnectorCapabilities, ConnectorId, ConnectorModel, TaskRequest,
+};
 use gritt_core::event::{EventKind, SessionStatus, StopReason};
 use gritt_core::ErrorKind;
 
-use super::{number, render, text, tool_call, tool_result};
+use super::{model_flag, number, render, text, tool_call, tool_result, ModelParseError};
 use crate::health::ProbeOutput;
+use crate::models::strip_ansi;
 use crate::supervise::{usage, Normalized, Normalizer, Protocol};
 
 pub struct OpenCode;
@@ -69,13 +72,76 @@ impl Protocol for OpenCode {
             args.push("--session".into());
             args.push(id.to_owned());
         }
+        args.extend(model_flag(request.model.as_deref()));
         args.push(request.prompt.clone());
         args
+    }
+
+    fn model_list_args(&self, refresh: bool) -> Option<Vec<String>> {
+        let mut args = vec!["models".to_owned()];
+        if refresh {
+            args.push("--refresh".into());
+        }
+        Some(args)
+    }
+
+    fn model_list_source(&self) -> &'static str {
+        "opencode models"
+    }
+
+    fn parse_models(
+        &self,
+        stdout: &str,
+        _stderr: &str,
+    ) -> std::result::Result<Vec<ConnectorModel>, ModelParseError> {
+        parse_opencode_models(stdout)
     }
 
     fn normalizer(&self) -> Box<dyn Normalizer> {
         Box::new(OpenCodeNormalizer::default())
     }
+}
+
+/// `opencode models` prints one `provider/id` line. JSON blobs from
+/// `--verbose` are skipped so a display name is only taken from the id.
+pub fn parse_opencode_models(
+    stdout: &str,
+) -> std::result::Result<Vec<ConnectorModel>, ModelParseError> {
+    let text = strip_ansi(stdout);
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        depth += line.chars().filter(|c| *c == '{').count();
+        depth = depth.saturating_sub(line.chars().filter(|c| *c == '}').count());
+        if depth > 0 || line.starts_with('{') || line.starts_with('}') {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("warning") || lower.starts_with("error") {
+            continue;
+        }
+        if let Some((provider, model)) = line.split_once('/') {
+            if provider
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && !model.is_empty()
+                && !model.contains(' ')
+            {
+                out.push(ConnectorModel {
+                    id: line.to_owned(),
+                    display_label: None,
+                });
+            }
+        }
+    }
+    if out.is_empty() && text.chars().any(|c| !c.is_whitespace()) {
+        return Err(ModelParseError::Malformed);
+    }
+    Ok(out)
 }
 
 #[derive(Default)]
