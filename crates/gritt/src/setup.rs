@@ -199,6 +199,7 @@ mod tests {
             base_url: "https://api.openai.com/v1".into(),
             key: SecretRef::for_profile(name, "OPENAI_API_KEY"),
             aliases: Default::default(),
+            fallback_model: None,
         }
     }
 

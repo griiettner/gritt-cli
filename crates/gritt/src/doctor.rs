@@ -68,7 +68,7 @@ pub async fn report(
         )),
         None => report.line("3. user config: no config directory on this platform"),
     }
-    report.line("4. environment: GRITT_DEFAULT_PROFILE, GRITT_DEFAULT_MODEL, AGENT_EMBEDDING_PROVIDER, AGENT_RERANK_PROVIDER, AGENT_MEMORY_BASE_URL, AGENT_MEMORY_API_KEY");
+    report.line("4. environment: GRITT_DEFAULT_PROFILE, GRITT_DEFAULT_MODEL, GRITT_FALLBACK_PROFILES, AGENT_EMBEDDING_PROVIDER, AGENT_RERANK_PROVIDER, AGENT_MEMORY_BASE_URL, AGENT_MEMORY_API_KEY");
     report.line("5. built-in defaults");
     if let Some(error) = config_error {
         report.line(format!("config error: {error}"));
@@ -114,6 +114,14 @@ pub async fn report(
                 "default: {}/{}",
                 config.default_profile.as_deref().unwrap_or("-"),
                 config.default_model.as_deref().unwrap_or("-")
+            ));
+            report.line(format!(
+                "fallback profiles: {}",
+                if config.fallback_profiles.is_empty() {
+                    "none".to_owned()
+                } else {
+                    config.fallback_profiles.join(", ")
+                }
             ));
             report.line(format!(
                 "embeddings: {} | reranking: {}",

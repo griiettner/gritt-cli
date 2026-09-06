@@ -165,6 +165,7 @@ async fn plane_with_mcp(dir: &Path, mcp: Option<Arc<McpRuntime>>) -> ControlPlan
             base_url: "https://openrouter.ai/api/v1".into(),
             key: SecretRef::for_profile("openrouter", "OPENROUTER_API_KEY"),
             aliases: Default::default(),
+            fallback_model: None,
         },
     );
     config.default_profile = Some("openrouter".into());

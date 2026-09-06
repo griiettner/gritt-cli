@@ -29,6 +29,64 @@ fn plain() -> App {
     App::new(StatusBar::default(), Theme::new(ThemeMode::NoColor))
 }
 
+#[test]
+fn modes_are_selectable_by_command_and_keyboard_but_not_during_work() {
+    use gritt_core::session::ExecutionMode;
+    let mut app = plain();
+    assert_eq!(app.dispatch(Command::Mode, None), Action::None);
+    assert!(matches!(
+        app.top_overlay(),
+        Some(Overlay::Picker {
+            kind: PickerKind::Mode,
+            ..
+        })
+    ));
+    app.on_key(key(KeyCode::Esc));
+    for shortcut in [
+        key(KeyCode::BackTab),
+        shift(KeyCode::BackTab),
+        shift(KeyCode::Tab),
+    ] {
+        app.set_effective_mode(Some(ExecutionMode::Planning));
+        for mode in [
+            ExecutionMode::Supervised,
+            ExecutionMode::AutoApprove,
+            ExecutionMode::FullAccess,
+            ExecutionMode::Planning,
+        ] {
+            assert_eq!(app.on_key(shortcut), Action::SetMode(mode));
+            assert!(app.overlays.is_empty());
+            app.set_effective_mode(Some(mode));
+        }
+    }
+    type_text(&mut app, "/mod");
+    assert_eq!(
+        app.on_key(shift(KeyCode::Tab)),
+        Action::SetMode(ExecutionMode::Supervised)
+    );
+    assert_eq!(app.composer.text(), "/mod");
+    for mode in ExecutionMode::ALL {
+        assert_eq!(
+            app.dispatch(Command::Mode, Some(mode.as_str().into())),
+            Action::SetMode(mode)
+        );
+    }
+    app.running = true;
+    assert_eq!(app.on_key(key(KeyCode::BackTab)), Action::None);
+    assert_eq!(
+        app.dispatch(Command::Mode, Some("full-access".into())),
+        Action::None
+    );
+    app.running = false;
+    app.connector = Some(gritt_core::connector::ConnectorId::ClaudeCode);
+    assert_eq!(app.on_key(key(KeyCode::BackTab)), Action::None);
+    assert_eq!(
+        app.dispatch(Command::Mode, Some("full-access".into())),
+        Action::None
+    );
+    assert!(app.notice.as_deref().unwrap().contains("permissions"));
+}
+
 fn type_text(app: &mut App, text: &str) {
     for c in text.chars() {
         app.on_key(key(KeyCode::Char(c)));
@@ -176,7 +234,7 @@ fn tab_completes_a_suggestion_and_otherwise_moves_focus() {
     app.on_key(key(KeyCode::Tab));
     assert_eq!(app.focus, Focus::Composer);
     app.on_key(key(KeyCode::BackTab));
-    assert_eq!(app.focus, Focus::Sidebar);
+    assert_eq!(app.focus, Focus::Composer);
 }
 
 /// Finding 1 (round 3): home draws neither the transcript pane nor the
@@ -274,7 +332,7 @@ fn focus_skips_the_sidebar_when_its_column_is_not_on_screen() {
         "Tab stopped on a hidden sidebar"
     );
     app.on_key(key(KeyCode::BackTab));
-    assert_eq!(app.focus, Focus::Transcript);
+    assert_eq!(app.focus, Focus::Composer);
 
     // The reviewer's sequence: Tab twice then PageUp must move the
     // transcript, not a sidebar offset nobody can see.
@@ -538,6 +596,7 @@ fn the_effort_picker_offers_auto_and_explains_every_refusal() {
     app.session_pinned = false;
     let picker = app.effort_picker();
     assert_eq!(picker.rows()[0].id, "auto");
+    assert_eq!(picker.rows()[0].label, "Provider default");
     assert!(picker.rows()[0].availability.is_available());
     assert!(picker
         .rows()
@@ -853,6 +912,96 @@ fn streamed_text_accumulates_into_one_entry() {
 }
 
 #[test]
+fn streamed_reasoning_accumulates_and_refreshes_the_rendered_transcript() {
+    let mut app = plain();
+    for text in ["I", "'ll", " ask", " clar", "ifying", " questions", "."] {
+        app.transcript_lines(80, crate::tui::render::transcript_lines);
+        app.on_event(&event(EventKind::ReasoningSummary { text: text.into() }));
+        assert!(!app.layout_cache_hit(80));
+    }
+    assert_eq!(app.entries.len(), 1);
+    assert_eq!(app.entries[0].kind, EntryKind::Reasoning);
+    assert_eq!(app.entries[0].text, "I'll ask clarifying questions.");
+    let lines = app.transcript_lines(80, crate::tui::render::transcript_lines);
+    let rendered = lines
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(rendered.matches("think").count(), 1);
+    assert!(rendered.contains("I'll ask clarifying questions."));
+}
+
+#[test]
+fn reasoning_and_answers_keep_separate_blocks() {
+    let mut app = plain();
+    for kind in [
+        EventKind::ReasoningSummary {
+            text: "Thinking".into(),
+        },
+        EventKind::TextDelta { text: "An".into() },
+        EventKind::TextDelta {
+            text: "swer".into(),
+        },
+        EventKind::ReasoningSummary {
+            text: "More".into(),
+        },
+        EventKind::ReasoningSummary {
+            text: " thought".into(),
+        },
+    ] {
+        app.on_event(&event(kind));
+    }
+    let blocks: Vec<_> = app
+        .entries
+        .iter()
+        .map(|e| (e.kind, e.text.as_str()))
+        .collect();
+    assert_eq!(
+        blocks,
+        vec![
+            (EntryKind::Reasoning, "Thinking"),
+            (EntryKind::Assistant, "Answer"),
+            (EntryKind::Reasoning, "More thought"),
+        ]
+    );
+}
+
+#[test]
+fn reasoning_replay_and_turn_boundaries_do_not_join_separate_turns() {
+    let mut app = plain();
+    let thought = || {
+        event(EventKind::ReasoningSummary {
+            text: "thought".into(),
+        })
+    };
+    app.load_history(&[thought(), thought()]);
+    assert_eq!(app.entries.len(), 1);
+    assert_eq!(app.entries[0].text, "thoughtthought");
+    app.on_event(&thought());
+    assert_eq!(app.entries.len(), 2);
+    for status in [
+        SessionStatus::Finished,
+        SessionStatus::Failed,
+        SessionStatus::Idle,
+    ] {
+        let count = app.entries.len();
+        app.on_event(&event(EventKind::StatusChanged { status }));
+        app.on_event(&thought());
+        assert_eq!(app.entries.len(), count + 1);
+    }
+    let count = app.entries.len();
+    app.on_event(&event(EventKind::Completed {
+        stop_reason: gritt_core::event::StopReason::EndTurn,
+    }));
+    app.on_event(&thought());
+    assert_eq!(app.entries.len(), count + 1);
+    app.push(EntryKind::Tool, "-> file_read");
+    app.on_event(&thought());
+    assert_eq!(app.entries.len(), count + 3);
+}
+
+#[test]
 fn the_wrapped_layout_is_cached_until_the_width_or_transcript_changes() {
     let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
     assert!(!app.layout_cache_hit(80));
@@ -1044,10 +1193,13 @@ fn a_late_session_load_keeps_the_query_and_the_highlight() {
 #[test]
 fn a_running_turn_refuses_settings_commands_and_shows_no_phase_change() {
     let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
-    assert_eq!(app.status.phase, "coding");
+    assert_eq!(app.status.phase, "supervised");
     app.running = true;
     assert_eq!(app.dispatch(Command::Plan, None), Action::None);
-    assert_eq!(app.status.phase, "coding", "a refused change showed anyway");
+    assert_eq!(
+        app.status.phase, "supervised",
+        "a refused change showed anyway"
+    );
     assert!(app.notice.as_deref().unwrap().contains("a turn is running"));
     for command in [
         Command::Connect,
@@ -1071,7 +1223,7 @@ fn a_running_turn_refuses_settings_commands_and_shows_no_phase_change() {
         Action::SetPhase(Phase::Planning)
     );
     assert_eq!(
-        app.status.phase, "coding",
+        app.status.phase, "supervised",
         "the phase moved before the runtime applied it"
     );
     // `set_session` is where the runtime commits it.

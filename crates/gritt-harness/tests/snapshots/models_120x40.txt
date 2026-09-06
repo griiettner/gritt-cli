@@ -2,13 +2,13 @@
 
 ## text
 
- api-cleanup  coding  /work/gritt  fixture
+ api-cleanup  supervised  /work/gritt  fixture
  you   Tidy the public API of the store module.                                          │ Gritt 0.1.0
                                                                                          │
  think Reading the module, then the callers.                                             │ Session
                       ╭ Models · openai ─────────────────────────────────────────────────────────╮i-cleanup
  gritt I read `store/m│› ▏                                                                       │ork/gritt
-       the crate uses.│catalog fresh                                                             │oding
+       the crate uses.│catalog fresh                                                             │pervised
        世界 renders at│● GPT-5 nano                                                     [openai] │reaming
                       │    openai/gpt-5-nano                                                     │
  tool  -> file_read st│  GPT-5                                                          [openai] │

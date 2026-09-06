@@ -21,6 +21,11 @@ pub struct Config {
     pub aliases: BTreeMap<String, String>,
     pub default_profile: Option<String>,
     pub default_model: Option<String>,
+    /// Profiles tried, in order, when the default profile is unusable for
+    /// a new native session. The default stays first; it must not be
+    /// repeated here. See [`Config::fallback_order`].
+    #[serde(default)]
+    pub fallback_profiles: Vec<String>,
     pub model_list: ModelListPolicy,
     pub policy: PolicyConfig,
     pub connectors: ConnectorSettings,
@@ -116,6 +121,8 @@ pub struct ConfigLayer {
     pub aliases: BTreeMap<String, String>,
     pub default_profile: Option<String>,
     pub default_model: Option<String>,
+    /// Replaces, never extends, a lower layer's list.
+    pub fallback_profiles: Option<Vec<String>>,
     pub model_list: Option<ModelListPolicy>,
     pub policy: Option<PolicyConfig>,
     pub connectors: Option<ConnectorSettings>,
@@ -211,6 +218,9 @@ pub fn merge(layers: impl IntoIterator<Item = ConfigLayer>) -> Config {
         if layer.default_model.is_some() {
             config.default_model = layer.default_model;
         }
+        if let Some(value) = layer.fallback_profiles {
+            config.fallback_profiles = value;
+        }
         if let Some(value) = layer.model_list {
             config.model_list = value;
         }
@@ -234,6 +244,44 @@ pub fn merge(layers: impl IntoIterator<Item = ConfigLayer>) -> Config {
         }
     }
     config
+}
+
+impl Config {
+    /// The profiles a new native session tries, in order: the default
+    /// profile, then `fallback_profiles`. Fails on a name that is not a
+    /// configured profile and on a duplicate, including the default
+    /// profile repeated in the fallback list, so a typo cannot silently
+    /// shorten the chain.
+    pub fn fallback_order(&self) -> Result<Vec<String>> {
+        let mut order: Vec<String> = Vec::new();
+        if let Some(default) = &self.default_profile {
+            order.push(default.clone());
+        }
+        for name in &self.fallback_profiles {
+            if !self.profiles.contains_key(name) {
+                return Err(Error::config(format!(
+                    "fallback_profiles names `{name}`, which is not a configured profile"
+                )));
+            }
+            if order.iter().any(|seen| seen == name) {
+                let role = if self.default_profile.as_deref() == Some(name.as_str()) {
+                    "the default profile and is repeated"
+                } else {
+                    "listed more than once"
+                };
+                return Err(Error::config(format!(
+                    "fallback_profiles: `{name}` is {role}; each profile may appear once"
+                )));
+            }
+            order.push(name.clone());
+        }
+        Ok(order)
+    }
+
+    /// Checks the cross-field rules a layer cannot check on its own.
+    pub fn validate(&self) -> Result<()> {
+        self.fallback_order().map(|_| ())
+    }
 }
 
 /// The precedence order, lowest first, for callers that assemble layers.
@@ -274,6 +322,89 @@ mod tests {
         assert_eq!(config.model_list.refresh_interval_secs, 86_400);
         assert!(!config.logging.content_logging);
         assert_eq!(config.logging.content_retention_days, 7);
+    }
+
+    fn profile(name: &str) -> ProviderProfile {
+        ProviderProfile {
+            name: name.into(),
+            protocol: crate::provider::Protocol::ChatCompletions,
+            base_url: "https://example.test/v1".into(),
+            key: crate::secret::SecretRef::for_profile(name, "KEY"),
+            aliases: Default::default(),
+            fallback_model: None,
+        }
+    }
+
+    #[test]
+    fn fallback_order_is_default_first_then_the_list_and_rejects_bad_entries() {
+        let mut config = Config::default();
+        for name in ["openrouter", "anthropic", "openai"] {
+            config.profiles.insert(name.into(), profile(name));
+        }
+        assert!(config.fallback_order().unwrap().is_empty());
+        config.default_profile = Some("openrouter".into());
+        config.fallback_profiles = vec!["anthropic".into(), "openai".into()];
+        assert_eq!(
+            config.fallback_order().unwrap(),
+            vec!["openrouter", "anthropic", "openai"]
+        );
+        config.validate().unwrap();
+
+        config.fallback_profiles = vec!["anthropic".into(), "nope".into()];
+        let error = config.fallback_order().unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Config);
+        assert!(error.message.contains("`nope`"), "{}", error.message);
+
+        config.fallback_profiles = vec!["anthropic".into(), "anthropic".into()];
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.message.contains("more than once"),
+            "{}",
+            error.message
+        );
+
+        config.fallback_profiles = vec!["openrouter".into()];
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.message.contains("default profile"),
+            "{}",
+            error.message
+        );
+
+        // Without a default the list alone is the chain.
+        config.default_profile = None;
+        config.fallback_profiles = vec!["openai".into()];
+        assert_eq!(config.fallback_order().unwrap(), vec!["openai"]);
+    }
+
+    #[test]
+    fn a_higher_layer_replaces_the_fallback_list_and_an_absent_one_keeps_it() {
+        let user = ConfigLayer {
+            fallback_profiles: Some(vec!["anthropic".into()]),
+            ..ConfigLayer::default()
+        };
+        let config = merge([user.clone(), ConfigLayer::default()]);
+        assert_eq!(config.fallback_profiles, vec!["anthropic"]);
+        let project = ConfigLayer {
+            fallback_profiles: Some(vec![]),
+            ..ConfigLayer::default()
+        };
+        let config = merge([user, project]);
+        assert!(config.fallback_profiles.is_empty());
+        let layer = layer_from_value(
+            serde_json::json!({ "fallback_profiles": ["a", "b"] }),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(layer.fallback_profiles.unwrap(), vec!["a", "b"]);
+        let legacy: Config = serde_json::from_value(serde_json::json!({
+            "profiles": {}, "aliases": {}, "default_profile": null, "default_model": null,
+            "model_list": {"refresh_interval_secs": 1, "stale_fallback": true},
+            "policy": PolicyConfig::default(), "connectors": {}, "interface": InterfacePreferences::default(),
+            "logging": LoggingConfig::default(), "embeddings": null, "rerank": null
+        }))
+        .unwrap();
+        assert!(legacy.fallback_profiles.is_empty());
     }
 
     #[test]

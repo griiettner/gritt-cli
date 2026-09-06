@@ -57,8 +57,9 @@ fn line_column(text: &str, offset: usize) -> (usize, usize) {
 }
 
 /// Environment overrides. `GRITT_DEFAULT_PROFILE` and `GRITT_DEFAULT_MODEL`
-/// set defaults; the `AGENT_*` memory variables configure opt-in
-/// embeddings and reranking.
+/// set defaults, `GRITT_FALLBACK_PROFILES` is a comma-separated fallback
+/// order, and the `AGENT_*` memory variables configure opt-in embeddings
+/// and reranking.
 pub fn env_layer(vars: impl IntoIterator<Item = (String, String)>) -> ConfigLayer {
     let env: std::collections::HashMap<String, String> = vars.into_iter().collect();
     let embedding = embeddings::embedding_config(&env);
@@ -66,6 +67,14 @@ pub fn env_layer(vars: impl IntoIterator<Item = (String, String)>) -> ConfigLaye
     ConfigLayer {
         default_profile: env.get("GRITT_DEFAULT_PROFILE").cloned(),
         default_model: env.get("GRITT_DEFAULT_MODEL").cloned(),
+        fallback_profiles: env.get("GRITT_FALLBACK_PROFILES").map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect()
+        }),
         embeddings: embedding.is_enabled().then_some(embedding),
         rerank: rerank.is_enabled().then_some(rerank),
         ..ConfigLayer::default()
@@ -96,7 +105,12 @@ pub fn load_with(
         layers.push(project);
     }
     layers.push(flags);
-    Ok(merge(layers))
+    let config = merge(layers);
+    // Cross-field rules fail here, loudly, rather than at the first
+    // session: a fallback list naming an unknown profile is a typo, not a
+    // shorter chain.
+    config.validate()?;
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -125,6 +139,47 @@ mod tests {
         assert_eq!(config.default_model.as_deref(), Some("project-model"));
         assert_eq!(config.default_profile.as_deref(), Some("openrouter"));
         assert!(config.embeddings.is_none());
+    }
+
+    #[test]
+    fn fallback_profiles_load_from_file_or_environment_and_are_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = |name: &str| {
+            format!(
+                "[profiles.{name}]\nname = \"{name}\"\nprotocol = \"chat_completions\"\nbase_url = \"https://{name}.example/v1\"\n[profiles.{name}.key]\nkeychain_service_entry = \"gritt/{name}\"\nenv_var_name = \"{}_KEY\"\n",
+                name.to_uppercase()
+            )
+        };
+        let profiles = format!("{}{}{}", profile("a"), profile("b"), profile("c"));
+        std::fs::write(
+            dir.path().join(PROJECT_CONFIG),
+            format!("default_profile = \"a\"\nfallback_profiles = [\"b\", \"c\"]\n{profiles}"),
+        )
+        .unwrap();
+        let config = load_with(dir.path(), None, [], ConfigLayer::default()).unwrap();
+        assert_eq!(config.fallback_order().unwrap(), vec!["a", "b", "c"]);
+
+        // The environment layer sits below the file, so it does not win
+        // here; on its own it does.
+        let vars = [("GRITT_FALLBACK_PROFILES".to_string(), " c , b,".to_string())];
+        let config = load_with(dir.path(), None, vars.clone(), ConfigLayer::default()).unwrap();
+        assert_eq!(config.fallback_profiles, vec!["b", "c"]);
+        std::fs::write(
+            dir.path().join(PROJECT_CONFIG),
+            format!("default_profile = \"a\"\n{profiles}"),
+        )
+        .unwrap();
+        let config = load_with(dir.path(), None, vars, ConfigLayer::default()).unwrap();
+        assert_eq!(config.fallback_profiles, vec!["c", "b"]);
+
+        std::fs::write(
+            dir.path().join(PROJECT_CONFIG),
+            format!("default_profile = \"a\"\nfallback_profiles = [\"nope\"]\n{profiles}"),
+        )
+        .unwrap();
+        let error = load_with(dir.path(), None, [], ConfigLayer::default()).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Config);
+        assert!(error.message.contains("`nope`"), "{}", error.message);
     }
 
     #[test]

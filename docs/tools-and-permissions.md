@@ -10,10 +10,10 @@ The native path offers three tools during the coding phase:
 | `file_write` | Replaces a file inside the workspace after diff review | ask |
 | `shell` | Runs a command line in the workspace root and returns its output | ask |
 
-File paths are resolved against the workspace root. Absolute paths outside
+File paths are resolved against the workspace root. Except in Full Access, absolute paths outside
 it, `..` traversal, and symlinks that escape are refused before the policy
 runs. A file write shows a unified diff against the current content and
-applies only after approval. Shell commands run in their own process group
+applies according to the selected mode and policy. Shell commands run in their own process group
 and are tracked so cancellation kills them.
 
 ## MCP server tools
@@ -75,7 +75,8 @@ must treat annotations from an unvetted server as untrusted.
 
 Gritt speaks MCP revisions 2025-06-18 (offered), 2025-03-26, and 2024-11-05.
 A server that answers with anything else is disconnected with a stated
-reason. Planning turns carry no tools at all, MCP included.
+reason. Planning turns expose only the native `file_read` tool; MCP calls
+are disabled in Planning.
 
 ### Timeouts, limits, and cancellation
 
@@ -171,6 +172,32 @@ If you need confinement, run Gritt inside a container or sandbox of your
 choice.
 
 ## Approval modes
+
+Use Shift+Tab to cycle native execution modes, or `/mode` to open the picker. In the
+REPL, use `/mode NAME`. On startup, use `--mode NAME` with `run`, `repl`, or
+`tui`.
+
+| Mode | Behavior |
+| --- | --- |
+| `planning` | Read workspace files and discuss the task. Writes, shell, and MCP calls are blocked. |
+| `supervised` | Apply tool policy and ask when it requires approval. |
+| `auto-approve` | Automatically accept approval prompts. Explicit policy denials and file boundaries remain enforced. |
+| `full-access` | Allow tool calls without policy prompts or denials, and allow file paths outside the workspace. OS permissions still apply. |
+
+Full Access can modify files outside the project and execute destructive
+commands without asking. MCP servers still require their own trust approval.
+Cancellation and secret redaction remain enabled in every mode. Supervised
+and Auto Approve file tools remain bounded as described above; shell commands
+are not an OS sandbox.
+
+Changes apply between turns. `/plan` selects Planning and `/code` selects
+Supervised on native sessions. Elevated modes last for the current driver;
+resuming a session does not restore them from history. Select the mode again
+or pass an explicit launch flag. External agents manage their own permission
+modes, so Gritt refuses native mode selection on connector sessions.
+
+The older approval flags remain available and cannot be combined with
+`--mode`:
 
 | Mode | Behavior |
 | --- | --- |

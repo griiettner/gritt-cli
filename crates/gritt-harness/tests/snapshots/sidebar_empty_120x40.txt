@@ -2,13 +2,13 @@
 
 ## text
 
- api-cleanup  coding  /work/gritt  fixture
+ api-cleanup  supervised  /work/gritt  fixture
  you   Tidy the public API of the store module.                                          │ Gritt 0.1.0
                                                                                          │
  think Reading the module, then the callers.                                             │ Session
                                                                                          │ name api-cleanup
  gritt I read `store/mod.rs` and found three exported helpers that no caller outside     │ dir  /work/gritt
-       the crate uses. I will make them private and keep the trait surface unchanged.    │ phase coding
+       the crate uses. I will make them private and keep the trait surface unchanged.    │ mode Supervised
        世界 renders at its real width.                                                   │ now  streaming
                                                                                          │
  tool  -> file_read store/mod.rs                                                         │ Model

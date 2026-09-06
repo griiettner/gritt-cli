@@ -285,6 +285,7 @@ async fn fixture_loop(
                 );
                 app.running = false;
             }
+            Action::SetMode(mode) => app.set_effective_mode(Some(mode)),
             Action::Quit => break,
             // A fixture run has no setup service, and the interface says
             // so rather than implying a write happened.
@@ -562,6 +563,7 @@ async fn adopt(app: &mut App, plane: &ControlPlane, agent: &dyn Driver) -> Resul
     app.status.profile = info.backend;
     app.status.model = info.detail;
     app.set_effective_effort(agent.effort());
+    app.set_effective_mode(agent.mode());
     // A session that already has output is pinned to the provider and
     // model that produced it.
     app.session_pinned = !app.entries.is_empty();
@@ -623,7 +625,10 @@ async fn event_loop(
     // The flags above the configured defaults are the selection the home
     // screen shows before a session exists. It is a choice, not an open
     // connection, which is why nothing here opens anything.
-    seed_draft(&mut app, &plane);
+    // The remembered choices are one row in the local store; a store that
+    // cannot answer leaves the draft on the configured defaults.
+    let last_used = plane.builder.last_used().await.unwrap_or(None);
+    seed_draft(&mut app, &plane, last_used.as_ref());
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<UiMsg>();
     let runtime = Runtime {
         plane: Arc::new(plane),
@@ -891,20 +896,50 @@ impl Scheduler {
     }
 }
 
-/// Fills the draft's empty fields from the configured defaults and shows
-/// the result. With nothing configured the fields stay empty and the home
-/// screen keeps saying `/connect` is where to start.
-fn seed_draft(app: &mut App, plane: &ControlPlane) {
+/// Fills the draft's empty fields from the configured defaults, then from
+/// the last successful session's choices, and shows the result. The same
+/// order the startup resolver applies (`crate::startup`), so the home
+/// screen names the profile and model the first prompt will really open;
+/// a seeded profile is not pinned, so the fallback order still applies.
+/// With nothing configured or remembered the fields stay empty and the
+/// home screen keeps saying `/connect` is where to start.
+fn seed_draft(
+    app: &mut App,
+    plane: &ControlPlane,
+    last_used: Option<&gritt_core::session::LastUsedNative>,
+) {
     let config = &plane.builder.config;
     if app.draft.profile.is_none() {
-        app.draft.profile = config.default_profile.clone();
+        // The resolver's own rule, so the home screen names the profile
+        // the first prompt opens on. A profile a qualified model name
+        // spells out is pinned exactly as it is in print mode.
+        let request = crate::startup::StartupRequest::from_draft(&app.draft);
+        if let Some((profile, source)) = plane.builder.primary_profile(&request, last_used) {
+            app.draft.profile = Some(profile);
+            app.draft.explicit_profile = source.is_pinned();
+        }
     }
     if app.draft.model.is_none() {
-        app.draft.model = config.default_model.clone();
+        // The resolver's order for the model: the remembered one when it
+        // was chosen on this profile, else the configured default.
+        app.draft.model = last_used
+            .filter(|last| app.draft.profile.as_deref() == Some(last.provider_profile.as_str()))
+            .map(|last| last.model.clone())
+            .or_else(|| config.default_model.clone());
     }
+    // The remembered effort stays out of the draft, so the resolver can
+    // return it to the provider default with a note where the model cannot
+    // take it. The status bar, the sidebar, and the effort picker show it
+    // as the selection meanwhile.
+    app.remembered_effort = last_used.map(|last| last.effort);
     app.status.profile = app.draft.profile.clone().unwrap_or_default();
     app.status.model = app.draft.model.clone().unwrap_or_default();
-    app.status.effort = app.draft.effort.unwrap_or_default();
+    app.status.effort = app
+        .draft
+        .effort
+        .or(app.remembered_effort)
+        .unwrap_or_default();
+    app.sidebar.model.effort = Some(app.status.effort.label().to_owned());
     app.status.phase = match app
         .draft
         .phase
@@ -918,6 +953,23 @@ fn seed_draft(app: &mut App, plane: &ControlPlane) {
     }
     app.sidebar.model.model = app.draft.model.clone();
     app.sidebar.session.phase = Some(app.status.phase.clone());
+    let mode = app.draft.mode.unwrap_or_else(|| {
+        use gritt_core::session::ExecutionMode;
+        if app.draft.phase == Some(gritt_core::session::Phase::Coding) {
+            match plane.builder.approval {
+                crate::agent::ApprovalMode::FullAccess => ExecutionMode::FullAccess,
+                crate::agent::ApprovalMode::ApproveAll => ExecutionMode::AutoApprove,
+                _ => ExecutionMode::Supervised,
+            }
+        } else {
+            ExecutionMode::Planning
+        }
+    });
+    let explicit_mode = app.draft.mode;
+    app.set_effective_mode(Some(mode));
+    // Displaying a default is not a mode selection. In particular, do
+    // not turn a launch-time --deny-all into Ask when opening the draft.
+    app.draft.mode = explicit_mode;
     if let (Some(profile), Some(model)) = (&app.draft.profile, &app.draft.model) {
         let info = plane.builder.catalog.model(profile, model);
         app.set_model_facts(info.as_ref());
@@ -1390,6 +1442,21 @@ async fn on_action(
             }
         }
         Action::SetPhase(phase) => {
+            if app.connector.is_none() {
+                let mode = match phase {
+                    gritt_core::session::Phase::Planning => {
+                        gritt_core::session::ExecutionMode::Planning
+                    }
+                    gritt_core::session::Phase::Coding => {
+                        gritt_core::session::ExecutionMode::Supervised
+                    }
+                };
+                if let Some(agent) = idle_agent.as_mut() {
+                    agent.set_mode(mode).await?;
+                }
+                app.set_effective_mode(Some(mode));
+                return Ok(());
+            }
             if let Some(agent) = idle_agent.as_mut() {
                 agent.set_phase(phase).await?;
                 app.set_session(agent.session());
@@ -1403,6 +1470,21 @@ async fn on_action(
                     gritt_core::session::Phase::Coding => "coding".into(),
                 };
                 app.sidebar.session.phase = Some(app.status.phase.clone());
+            }
+        }
+        Action::SetMode(mode) => {
+            if !app.settings_are_editable() || handle.is_some() || runtime.pending_open.is_some() {
+                app.notice =
+                    Some("finish or cancel the work in flight before changing mode".into());
+                return Ok(());
+            }
+            if let Some(agent) = idle_agent.as_mut() {
+                match agent.set_mode(mode).await {
+                    Ok(()) => app.set_effective_mode(agent.mode()),
+                    Err(error) => app.notice = Some(error.message),
+                }
+            } else {
+                app.set_effective_mode(Some(mode));
             }
         }
         Action::RefreshSessions => {
@@ -2387,6 +2469,7 @@ mod tests {
                 base_url: "https://openrouter.ai/api/v1".into(),
                 key: SecretRef::for_profile("openrouter", "OPENROUTER_API_KEY"),
                 aliases: Default::default(),
+                fallback_model: None,
             },
         );
         config.default_profile = Some("openrouter".into());
@@ -2455,6 +2538,48 @@ mod tests {
             .await
             .unwrap()
         }
+    }
+
+    #[tokio::test]
+    async fn displaying_a_default_mode_does_not_override_launch_permissions() {
+        let mut h = harness().await;
+        h.app.draft.phase = Some(gritt_core::session::Phase::Coding);
+        seed_draft(&mut h.app, &h.runtime.plane, None);
+        assert_eq!(h.app.status.phase, "supervised");
+        assert_eq!(h.app.draft.mode, None);
+        assert!(matches!(
+            h.runtime.plane.builder.approval,
+            ApprovalMode::DenyAll
+        ));
+
+        h.act(Action::SetMode(
+            gritt_core::session::ExecutionMode::FullAccess,
+        ))
+        .await;
+        assert_eq!(h.app.status.phase, "full-access");
+        assert_eq!(
+            h.app.draft.mode,
+            Some(gritt_core::session::ExecutionMode::FullAccess)
+        );
+        let opened = h
+            .runtime
+            .plane
+            .open_draft(h.app.draft.clone())
+            .await
+            .unwrap();
+        let DraftOpen::Opened { driver, .. } = opened else {
+            panic!("draft rejected")
+        };
+        h.idle = Some(driver);
+        h.act(Action::SetMode(
+            gritt_core::session::ExecutionMode::Supervised,
+        ))
+        .await;
+        assert_eq!(
+            h.idle.as_ref().unwrap().mode(),
+            Some(gritt_core::session::ExecutionMode::Supervised)
+        );
+        assert_eq!(h.app.status.phase, "supervised");
     }
 
     /// Finding 1: a resume reserves the transition, so a prompt submitted

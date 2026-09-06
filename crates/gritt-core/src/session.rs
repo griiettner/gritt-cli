@@ -41,6 +41,78 @@ pub enum Phase {
     Coding,
 }
 
+/// Native tool authority for the current run. Elevated modes are never
+/// restored from session history; resuming requires a fresh selection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutionMode {
+    #[default]
+    Planning,
+    Supervised,
+    AutoApprove,
+    FullAccess,
+}
+
+impl ExecutionMode {
+    pub const ALL: [Self; 4] = [
+        Self::Planning,
+        Self::Supervised,
+        Self::AutoApprove,
+        Self::FullAccess,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::Supervised => "supervised",
+            Self::AutoApprove => "auto-approve",
+            Self::FullAccess => "full-access",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Planning => "Planning",
+            Self::Supervised => "Supervised",
+            Self::AutoApprove => "Auto Approve",
+            Self::FullAccess => "Full Access",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Planning => "Read workspace files and plan. Writes, shell, and MCP calls are disabled.",
+            Self::Supervised => "Follow tool policy and ask before actions that require approval.",
+            Self::AutoApprove => "Approve permission prompts automatically. Policy denials and file boundaries still apply.",
+            Self::FullAccess => "Run tools without policy prompts or denials, including files outside the workspace. OS permissions still apply.",
+        }
+    }
+
+    pub fn phase(self) -> Phase {
+        if self == Self::Planning {
+            Phase::Planning
+        } else {
+            Phase::Coding
+        }
+    }
+}
+
+impl std::fmt::Display for ExecutionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ExecutionMode {
+    type Err = String;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|mode| mode.as_str() == value)
+            .ok_or_else(|| "choose planning, supervised, auto-approve, or full-access".to_owned())
+    }
+}
+
 impl SessionKind {
     /// The native effort, `None` for a connector session (managed by the
     /// external agent).
@@ -64,6 +136,17 @@ pub struct Session {
     /// Reserved for child sessions. Not populated before Phase 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<SessionId>,
+}
+
+/// The native choices of the last successful new session, remembered for
+/// later new sessions. Never a credential: a profile name, a model id, and
+/// an effort level, nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastUsedNative {
+    pub provider_profile: String,
+    pub model: String,
+    #[serde(default)]
+    pub effort: ReasoningEffort,
 }
 
 /// Whatever an adapter or connector needs to continue a session. Opaque to

@@ -2,7 +2,7 @@
 
 ## text
 
-api-cleanup  coding  fixture
+api-cleanup  supervised  fixture
 you   Tidy the public API of the store module.
  ╭ Help ──────────────────────────────────────────────────╮
 t│Commands                                                │
@@ -13,12 +13,12 @@ g│ /models     Search the selected provider's models and  │
  │turns                                                   │
  │ /plan       Switch to the planning phase               │
 t│ /code       Switch to the coding phase                 │
+ │ /mode       Choose Planning, Supervised, Auto Approve, │
+t│or Full Access  [Shift+Tab]                             │
  │ /sessions   Search and resume sessions for this        │
-t│workspace  [Ctrl-S]                                     │
+ │workspace  [Ctrl-S]                                     │
  │ /new        Start a fresh draft without deleting the   │
- │current session                                         │
- │ /details    Expand or collapse tool output             │
-╭│ /sidebar    Toggle the session information sidebar     │╮
+╭│current session                                         │╮
 │╰ j/k scrolls · Esc closes ──────────────────────────────╯│
 ╰──────────────────────────────────────────────────────────╯
 openai · openai/gpt-5-nano  effort medium

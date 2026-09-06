@@ -15,9 +15,23 @@ The exit code reflects the result: 0 on completion, 1 on failure, 130 when
 the turn was cancelled with Ctrl-C. If stdout breaks (a closed pipe) the
 turn stops, running tools are cancelled, and the exit code is 1.
 
-Flags: `--session NAME`, `--profile P`, `--model M`, `--plan` or `--code`,
-`--approve-all`, `--deny-all`, `--ask`, `--no-models`, `--connector NAME`,
-`--verbose`. Global flags: `--workspace PATH`, `--database PATH`.
+Flags: `--session NAME`, `--profile P`, `--model M`, `--effort LEVEL`,
+`--plan` or `--code`, `--approve-all`, `--deny-all`, `--ask`, `--no-models`,
+`--connector NAME`, `--verbose`. Global flags: `--workspace PATH`,
+`--database PATH`.
+
+A new native session starts on the first usable profile in the configured
+fallback order, and on the profile, model, and effort of the last session
+that completed when the flags leave them open; the configured defaults
+fill whatever is still unnamed. Each
+skipped profile and each remembered choice is a `note:` line on stderr,
+followed by the profile and model the session runs on when the chain moved.
+`--profile` pins the profile. See [Providers](providers.md#startup-failover).
+
+`--mode planning|supervised|auto-approve|full-access` selects native tool
+authority. It replaces the phase and approval flags for that invocation.
+See [Tools and permissions](tools-and-permissions.md#approval-modes) for
+the boundaries of each mode.
 
 ## REPL mode
 
@@ -30,6 +44,7 @@ Lines are prompts. Commands:
 | Command | Does |
 | --- | --- |
 | `/plan`, `/code` | Switch phase; the model is told on the next turn |
+| `/mode [NAME]` | Show or change Planning, Supervised, Auto Approve, or Full Access |
 | `/sessions` | List sessions |
 | `/resume NAME` | Switch to another session |
 | `/history` | Show this session's events |
@@ -43,6 +58,12 @@ window may still be consumed as the stale answer, which is a recorded
 follow-up. The REPL reads plain lines; there is no arrow-key editing yet.
 
 ## Full-screen mode
+
+Shift+Tab cycles through Planning, Supervised, Auto Approve, and Full Access.
+`/mode` opens the execution-mode picker. `/mode full-access`, for
+example, selects Full Access directly. The header and sidebar show the
+effective mode. Finish or cancel a turn or pending approval before changing
+it. `/plan` and `/code` remain shortcuts for Planning and Supervised.
 
 ```bash
 gritt tui [flags]
@@ -235,7 +256,8 @@ control plane is connected.
 ## Sessions and phases
 
 Sessions are named, listable, resumable, and removable, whichever path
-produced them. Each carries a phase. Planning is conversation only. Coding
-offers tools. Switching phase sends the model a transition note on the
+produced them. Each carries a phase. Native Planning offers workspace file
+reading; Coding offers tools under the selected execution mode. Switching
+phase sends the model a transition note on the
 next turn, also after resuming a session that changed phase before exit.
 Continuation state an adapter needs is stored behind the session interface.

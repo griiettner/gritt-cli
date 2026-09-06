@@ -73,6 +73,21 @@ fn resolve_name(
     Ok((profile, name.to_owned()))
 }
 
+/// The profile a name selects on its own: a `<profile>/<model>` qualified
+/// name or a global alias. `None` for a bare name or a profile-scoped
+/// alias, which resolve under a hint or the default profile. Startup uses
+/// it to pin a session to the profile a model name spells out.
+pub fn named_profile(config: &Config, name: &str) -> Option<String> {
+    if let Some((profile, _)) = split_qualified(config, name) {
+        return Some(profile.to_owned());
+    }
+    config
+        .aliases
+        .get(name)
+        .and_then(|target| split_qualified(config, target))
+        .map(|(profile, _)| profile.to_owned())
+}
+
 /// Resolves `name` and applies the deprecation policy against the catalog.
 pub fn resolve(
     config: &Config,
@@ -159,6 +174,7 @@ mod tests {
                 .iter()
                 .map(|(a, m)| (a.to_string(), m.to_string()))
                 .collect(),
+            fallback_model: None,
         }
     }
 
@@ -221,6 +237,19 @@ mod tests {
         assert_eq!(fast.model, "gpt-fast");
         let bare = resolve(&config, &catalog, "or/fast", None).unwrap();
         assert_eq!(bare.profile, "openrouter");
+    }
+
+    #[test]
+    fn named_profile_reads_qualified_names_and_global_aliases_only() {
+        let config = config();
+        assert_eq!(
+            named_profile(&config, "openai/gpt-x").as_deref(),
+            Some("openai")
+        );
+        assert_eq!(named_profile(&config, "smart").as_deref(), Some("openai"));
+        assert_eq!(named_profile(&config, "fast"), None);
+        assert_eq!(named_profile(&config, "or/fast"), None);
+        assert_eq!(named_profile(&config, "plain"), None);
     }
 
     #[test]

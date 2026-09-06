@@ -61,3 +61,8 @@ portable-pty = "0.9.0"
 turso = { version = "0.7.2", default-features = false, features = ["fts"] }
 
 tempfile = "3.27.0"
+
+# portable-pty 0.9 requires nix 0.28 and cfg_aliases 0.1.1. Patch only the
+# macro's trailing expression semicolons until that chain can be upgraded.
+[patch.crates-io]
+cfg_aliases = { path = "vendor/cfg_aliases" }

@@ -19,6 +19,12 @@
 default_profile = "openrouter"
 default_model = "openai/gpt-5-nano"
 
+# Profiles a new session tries, in order, when the default is unusable: no
+# key, a 401 or 403, an unreachable endpoint, or a model its list lacks.
+# The default stays first and must not be repeated. Leave the list out to
+# keep startup on the default profile only. See docs/providers.md.
+fallback_profiles = ["anthropic", "openai"]
+
 # Global aliases map a short name to `profile/model`.
 [aliases]
 fast = "openrouter/openai/gpt-5-nano"
@@ -51,6 +57,9 @@ env_var_name = "OPENAI_API_KEY"
 name = "anthropic"
 protocol = "messages"
 base_url = "https://api.anthropic.com"
+# Used when startup falls back to this profile and the requested model is
+# not in its list.
+fallback_model = "claude-sonnet-5"
 [profiles.anthropic.key]
 keychain_service_entry = "gritt/anthropic"
 env_var_name = "ANTHROPIC_API_KEY"

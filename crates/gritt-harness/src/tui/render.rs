@@ -30,11 +30,11 @@ const WORDMARK_MIN_HEIGHT: u16 = 20;
 const COMPACT_WIDTH: u16 = 80;
 
 const WORDMARK: [&str; 5] = [
-    "  ▟█████▙  ▗█▙  ▗█▙  █▄▄▄▄  █▄▄▄▄  ▗█▙  ▗█▙ ",
-    " ▟█▛▘      ▐█▌  ▐█▌  █▌  █  █▌  █    ██▛▛   ",
-    " ██▌  ▟██  ▐█████▛▌  █▛▀▀   █▛▀▀      ██    ",
-    " ▜█▙   █▌  ▐█▌  ▐█▌  █▌     █▌        ██    ",
-    "  ▜█████▛  ▐█▌  ▐█▌  █▌     █▌        ██    ",
+    "  ▟█████▙          ▄▄    ██     ██  ",
+    " ▟█▛▘      ▐█▟█▙       █████  █████ ",
+    " ██▌  ▟██  ▐█▛     ██    ██     ██  ",
+    " ▜█▙   █▌  ▐█▌     ██    ██     ██  ",
+    "  ▜█████▛  ▐█▌     ██    ▀██▙   ▀██▙",
 ];
 
 fn entry_style(theme: &Theme, kind: EntryKind) -> Style {
@@ -314,7 +314,7 @@ fn home_status(app: &App, width: u16) -> Vec<Line<'static>> {
             },
         ));
         parts.push(Span::styled(
-            format!("  effort {}", app.status.effort),
+            format!("  {} · effort {}", app.status.phase, app.status.effort),
             theme.muted(),
         ));
         if let Some(label) = &app.fixture {
@@ -1082,6 +1082,7 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, scroll: usize, area: Rect) {
         ("Tab", "move focus, or complete a suggestion"),
         ("Esc", "close the top overlay, then cancel a running turn"),
         ("Ctrl-P", "the command palette"),
+        ("Shift+Tab", "cycle execution modes"),
         ("Ctrl-G", "return to the latest output"),
         ("Ctrl-Y", "copy the draft or transcript to the Gritt buffer"),
         (

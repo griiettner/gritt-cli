@@ -143,10 +143,14 @@ pub async fn fetch_models(
     if !(200..300).contains(&status) {
         return Err(provider_error(status, &body, &[key]));
     }
+    // The status travels in the diagnostic, as it does for an error body,
+    // so a caller can tell an answered request from one that never was.
     let value: serde_json::Value = serde_json::from_slice(&body).map_err(|error| {
         Error::provider(Some(status), format!("invalid model list JSON: {error}"))
+            .with_diagnostic(serde_json::json!({ "status": status }))
     })?;
     parse_model_list(profile.protocol, &value)
+        .map_err(|error| error.with_diagnostic(serde_json::json!({ "status": status })))
 }
 
 /// Loads the list, refreshing at most once per `policy.refresh_interval`.
@@ -184,7 +188,28 @@ pub async fn load_models(
             return from_cache_after_failure(profile, policy, cached, None);
         }
     }
-    match fetch_models(transport, keys, profile).await {
+    let fetched = fetch_models(transport, keys, profile).await;
+    match record_fetch(cache, profile, cached, now, fetched)? {
+        Ok(list) => Ok(list),
+        Err((attempted, error)) => {
+            from_cache_after_failure(profile, policy, &attempted, Some(error))
+        }
+    }
+}
+
+/// Writes the outcome of a fetch to the cache: the fresh list with its
+/// timestamps, or the previous entry with the attempt stamped on it. The
+/// fetch error comes back with that entry so the caller decides what a
+/// failure means.
+#[allow(clippy::type_complexity)]
+fn record_fetch(
+    cache: &ModelCache,
+    profile: &ProviderProfile,
+    cached: Option<CachedModelList>,
+    now: DateTime<Utc>,
+    fetched: Result<Vec<ModelInfo>>,
+) -> Result<std::result::Result<ModelList, (CachedModelList, Error)>> {
+    match fetched {
         Ok(models) => {
             let fresh = CachedModelList {
                 fetched_at: Some(now),
@@ -192,11 +217,11 @@ pub async fn load_models(
                 models,
             };
             cache.write(&profile.name, &fresh)?;
-            Ok(ModelList {
+            Ok(Ok(ModelList {
                 profile: profile.name.clone(),
                 status: ModelListStatus::Fresh { fetched_at: now },
                 models: fresh.models,
-            })
+            }))
         }
         Err(error) => {
             let mut attempted = cached.unwrap_or(CachedModelList {
@@ -206,8 +231,28 @@ pub async fn load_models(
             });
             attempted.last_attempt_at = Some(now);
             cache.write(&profile.name, &attempted)?;
-            from_cache_after_failure(profile, policy, &attempted, Some(error))
+            Ok(Err((attempted, error)))
         }
+    }
+}
+
+/// Fetches the list now, whatever the refresh interval says, and records
+/// the outcome in the cache. Startup failover probes a profile's endpoint
+/// with it: a list answered from the cache would hide an endpoint that is
+/// down right now. The raw fetch error comes back unwrapped so the caller
+/// can classify it; the cache keeps its last good list either way.
+pub async fn probe_models(
+    cache: &ModelCache,
+    transport: &dyn HttpTransport,
+    keys: &dyn KeyProvider,
+    profile: &ProviderProfile,
+    now: DateTime<Utc>,
+) -> Result<ModelList> {
+    let cached = cache.read(&profile.name)?;
+    let fetched = fetch_models(transport, keys, profile).await;
+    match record_fetch(cache, profile, cached, now, fetched)? {
+        Ok(list) => Ok(list),
+        Err((_, error)) => Err(error),
     }
 }
 

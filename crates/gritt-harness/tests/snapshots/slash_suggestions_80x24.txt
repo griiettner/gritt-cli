@@ -3,11 +3,11 @@
 ## text
 
 
-                    ▟█████▙  ▗█▙  ▗█▙  █▄▄▄▄  █▄▄▄▄  ▗█▙  ▗█▙
-                   ▟█▛▘      ▐█▌  ▐█▌  █▌  █  █▌  █    ██▛▛
-                   ██▌  ▟██  ▐█████▛▌  █▛▀▀   █▛▀▀      ██
-                   ▜█▙   █▌  ▐█▌  ▐█▌  █▌     █▌        ██
-                    ▜█████▛  ▐█▌  ▐█▌  █▌     █▌        ██
+                        ▟█████▙          ▄▄    ██     ██
+                       ▟█▛▘      ▐█▟█▙       █████  █████
+                       ██▌  ▟██  ▐█▛     ██    ██     ██
+                       ▜█▙   █▌  ▐█▌     ██    ██     ██
+                        ▜█████▛  ▐█▌     ██    ▀██▙   ▀██▙
 
                           Use /connect to get started.
 
@@ -20,9 +20,9 @@
  │ /effort     Choose the reasoning effort for native turns                   │
  │ /plan       Switch to the planning phase                                   │
  │ /code       Switch to the coding phase                                     │
- │ /sessions   Search and resume sessions for this workspace                  │
+ │ /mode       Choose Planning, Supervised, Auto Approve, or Full Access      │
  ╰────────────────────────────────────────────────────────────────────────────╯
-                       not connected  effort auto  fixture
+               not connected   · effort provider default  fixture
 
 
 

@@ -14,7 +14,7 @@ use gritt_core::{Error, Result};
 use turso::{Builder, Connection};
 
 /// Ordered product migrations. Append; never edit an applied entry.
-pub const MIGRATIONS: [(&str, &str); 4] = [
+pub const MIGRATIONS: [(&str, &str); 5] = [
     ("0001_product_tables", include_str!("product_schema.sql")),
     ("0002_content_log", include_str!("content_log.sql")),
     (
@@ -22,6 +22,7 @@ pub const MIGRATIONS: [(&str, &str); 4] = [
         include_str!("session_told_phase.sql"),
     ),
     ("0004_mcp_trust", include_str!("mcp_trust.sql")),
+    ("0005_last_used", include_str!("last_used.sql")),
 ];
 
 /// Tables and indexes owned by `gritt-agent`. The store must never touch
@@ -384,6 +385,7 @@ mod tests {
             "gritt_session_continuations",
             "gritt_telemetry_events",
             "gritt_analytics_records",
+            "gritt_last_used",
         ] {
             assert!(
                 names.iter().any(|n| n == table),

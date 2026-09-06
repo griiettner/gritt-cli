@@ -2,11 +2,11 @@
 
 ## text
 
-          ▟█████▙  ▗█▙  ▗█▙  █▄▄▄▄  █▄▄▄▄  ▗█▙  ▗█▙
-         ▟█▛▘      ▐█▌  ▐█▌  █▌  █  █▌  █    ██▛▛
-         ██▌  ▟██  ▐█████▛▌  █▛▀▀   █▛▀▀      ██
-         ▜█▙   █▌  ▐█▌  ▐█▌  █▌     █▌        ██
-          ▜█████▛  ▐█▌  ▐█▌  █▌     █▌        ██
+              ▟█████▙          ▄▄    ██     ██
+             ▟█▛▘      ▐█▟█▙       █████  █████
+             ██▌  ▟██  ▐█▛     ██    ██     ██
+             ▜█▙   █▌  ▐█▌     ██    ██     ██
+              ▜█████▛  ▐█▌     ██    ▀██▙   ▀██▙
 
                 Use /connect to get started.
 
@@ -19,7 +19,7 @@
 │ /effort     Choose the reasoning effort for native turns │
 │ /plan       Switch to the planning phase                 │
 ╰──────────────────────────────────────────────────────────╯
-             not connected  effort auto  fixture
+     not connected   · effort provider default  fixture
 
 
 

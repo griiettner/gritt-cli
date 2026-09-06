@@ -63,6 +63,7 @@ fn config(policy: PolicyConfig) -> Config {
             base_url: "https://openrouter.ai/api/v1".into(),
             key: SecretRef::for_profile("openrouter", "OPENROUTER_API_KEY"),
             aliases: Default::default(),
+            fallback_model: None,
         },
     );
     config.default_profile = Some("openrouter".into());
@@ -320,7 +321,9 @@ async fn mcp_tools_reach_the_provider_in_coding_and_never_in_planning() {
         )
         .await
         .unwrap();
-    assert!(planning.request_preview("do the thing").tools.is_empty());
+    let tools = planning.request_preview("do the thing").tools;
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "file_read");
     let _ = &fixture.dir;
     fixture.plane.builder.mcp().unwrap().shutdown().await;
 }

@@ -2,7 +2,7 @@
 
 ## text
 
-api-cleanup  coding  fixture
+api-cleanup  supervised  fixture
 you   Tidy the public API of the store module.
  ╭ Connect ───────────────────────────────────────────────╮
 t│› ▏                                                     │

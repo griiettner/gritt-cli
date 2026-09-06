@@ -2,7 +2,7 @@
 
 ## text
 
-api-cleanup  coding  fixture
+api-cleanup  supervised  fixture
 think Reading the module, then the callers.
 
 gritt I read `store/mod.rs` and found three exported

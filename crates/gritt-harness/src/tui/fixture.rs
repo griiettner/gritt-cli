@@ -254,6 +254,7 @@ pub fn conversation(theme: Theme) -> App {
     let mut app = base(theme);
     let session = session("api-cleanup", "openai/gpt-5-nano");
     app.set_session(&session);
+    app.set_effective_mode(Some(gritt_core::session::ExecutionMode::Supervised));
     app.session_pinned = true;
     app.draft = SessionDraft::default()
         .with_profile("openai")

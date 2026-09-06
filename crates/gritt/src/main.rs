@@ -12,14 +12,16 @@ use gritt_connector::{default_connectors_with_secrets, environment_secrets, pars
 use gritt_core::connector::{AuthState, ConnectorId};
 use gritt_core::event::{ApprovalDecision, EventKind};
 use gritt_core::mcp::{McpRuntimeSettings, McpServerState, TrustDecision};
-use gritt_core::session::{Phase, SessionKind, SessionStore};
+use gritt_core::provider::ReasoningEffort;
+use gritt_core::session::{ExecutionMode, Phase, SessionKind, SessionStore};
 use gritt_core::{Error, Result};
 use gritt_harness::agent::{AgentBuilder, ApprovalMode, SessionSelector, TurnStatus, Ui};
-use gritt_harness::control::ControlPlane;
-use gritt_harness::draft::SessionDraft;
+use gritt_harness::control::{ControlPlane, Opened};
+use gritt_harness::draft::{CatalogState, DraftWarning, SessionDraft};
 use gritt_harness::mcp::McpRuntime;
 use gritt_harness::modes::print::{PrintUi, PrintUiOptions};
 use gritt_harness::modes::repl::{line_prompter, run_repl, CancelSlot, LineInput};
+use gritt_harness::startup::StartupRequest;
 use gritt_harness::store::{resolve_location, Store, StoreTrustStore};
 use gritt_harness::telemetry::Telemetry;
 use gritt_harness::tools::Workspace;
@@ -77,6 +79,12 @@ enum Command {
         /// Provider profile name.
         profile: String,
     },
+    /// Validate the provider key from its configured environment variable
+    /// and replace the matching OS keychain entry when it works.
+    KeyRefresh {
+        /// Provider profile name.
+        profile: String,
+    },
     /// Print mode: one prompt in, streamed text out.
     Run {
         /// The prompt.
@@ -128,6 +136,9 @@ enum Command {
 
 #[derive(Args, Clone, Default)]
 struct SessionArgs {
+    /// Native execution mode: planning, supervised, auto-approve, full-access.
+    #[arg(long, conflicts_with_all = ["plan", "code", "approve_all", "deny_all", "ask", "connector"])]
+    mode: Option<ExecutionMode>,
     /// Session name to create or resume.
     #[arg(long)]
     session: Option<String>,
@@ -137,7 +148,11 @@ struct SessionArgs {
     /// Model id or alias. Defaults to the configured default.
     #[arg(long)]
     model: Option<String>,
-    /// Start in the planning phase (conversation only).
+    /// Reasoning effort for a new native session: auto, low, medium, or
+    /// high. Defaults to the last successful session's level, else auto.
+    #[arg(long)]
+    effort: Option<ReasoningEffort>,
+    /// Start in Planning (read files; no writes or shell calls).
     #[arg(long, conflicts_with = "code")]
     plan: bool,
     /// Start in the coding phase (tools available).
@@ -208,7 +223,9 @@ async fn builder(
     // Retention applies whether or not logging is still on: turning it off
     // must not preserve old content past the window.
     telemetry.purge_content(chrono::Utc::now()).await?;
-    let approval = if args.approve_all {
+    let approval = if args.mode == Some(ExecutionMode::FullAccess) {
+        ApprovalMode::FullAccess
+    } else if args.mode == Some(ExecutionMode::AutoApprove) || args.approve_all {
         ApprovalMode::ApproveAll
     } else if args.deny_all {
         ApprovalMode::DenyAll
@@ -409,7 +426,9 @@ fn connector_flag(args: &SessionArgs) -> Result<Option<ConnectorId>> {
 }
 
 fn phase_flag(args: &SessionArgs) -> Option<Phase> {
-    if args.plan {
+    if let Some(mode) = args.mode {
+        Some(mode.phase())
+    } else if args.plan {
         Some(Phase::Planning)
     } else if args.code {
         Some(Phase::Coding)
@@ -425,36 +444,58 @@ fn selector(args: &SessionArgs) -> SessionSelector {
     }
 }
 
-/// Loads the model list for the profile the session will actually use
-/// (a resumed session's own profile, or the one the alias or qualified
-/// model resolves to), reporting a stale or missing list on stderr
-/// without stopping.
-async fn warm_catalog(builder: &AgentBuilder, args: &SessionArgs) {
-    let profile = match builder
-        .session_profile(
-            &selector(args),
-            args.profile.as_deref(),
-            args.model.as_deref(),
-        )
-        .await
+/// The flags a new native session starts from.
+fn startup_request(args: &SessionArgs) -> StartupRequest {
+    StartupRequest::from_flags(args.profile.as_deref(), args.model.as_deref(), args.effort)
+}
+
+/// The startup notes for print and REPL mode, on stderr: the state of the
+/// model list a new session resolved against when it was not fresh, every
+/// skipped profile, the remembered choices, and the model warnings, then
+/// the profile and model the session really runs on whenever the chain
+/// moved.
+fn startup_notes(opened: &Opened) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    if let (
+        Some(catalog),
+        SessionKind::Native {
+            provider_profile, ..
+        },
+    ) = (&opened.catalog, &opened.driver.session().kind)
     {
-        Ok(profile) => profile,
-        // `open` reports the same problem with its full context.
-        Err(_) => return,
-    };
-    match builder.load_catalog(&profile).await {
-        Ok(None) => {
-            if let Some(gritt_core::provider::ModelListStatus::Stale { fetched_at }) =
-                builder.catalog.status(&profile)
-            {
-                eprintln!(
-                    "warning: using the stale model list for `{profile}` cached at {fetched_at}"
-                );
+        match catalog {
+            CatalogState::Stale { fetched_at } => lines.push(format!(
+                "warning: using the stale model list for `{provider_profile}` cached at {fetched_at}"
+            )),
+            CatalogState::Missing { reason } | CatalogState::RefreshFailed { reason } => {
+                lines.push(format!("warning: {reason}; capabilities are unreported"))
             }
+            CatalogState::Fresh { .. } | CatalogState::Skipped => {}
         }
-        Ok(Some(error)) => eprintln!("warning: {error}; capabilities are unreported"),
-        Err(error) => eprintln!("warning: {error}"),
     }
+    lines.extend(
+        opened
+            .warnings
+            .iter()
+            .map(|warning| format!("note: {warning}")),
+    );
+    let moved = opened
+        .warnings
+        .iter()
+        .any(|warning| matches!(warning, DraftWarning::ProfileSkipped(_)));
+    if moved {
+        if let SessionKind::Native {
+            provider_profile,
+            model,
+            ..
+        } = &opened.driver.session().kind
+        {
+            lines.push(format!(
+                "note: the session runs on profile `{provider_profile}` with model `{model}`"
+            ));
+        }
+    }
+    lines
 }
 
 /// Answers approvals from the shared stdin owner. The harness prompter
@@ -478,7 +519,7 @@ fn print_options(
             verbose,
             prompter: stdin_prompter(input.clone(), Arc::clone(slot)),
         },
-        ApprovalMode::ApproveAll => PrintUiOptions {
+        ApprovalMode::ApproveAll | ApprovalMode::FullAccess => PrintUiOptions {
             verbose,
             prompter: Arc::new(|_, _, _| ApprovalDecision::Approved),
         },
@@ -534,10 +575,10 @@ async fn run_print(
 ) -> Result<ExitCode> {
     let connector = connector_flag(args)?;
     warn_approval_flags(args, connector);
+    // The startup resolver loads or probes the model list for the profile
+    // the session opens on and reports its state with the other notes, so
+    // nothing is warmed ahead of it here.
     let builder = builder(workspace, database, args).await?;
-    if connector.is_none() {
-        warm_catalog(&builder, args).await;
-    }
     let mcp = builder.mcp().cloned();
     // The slot and its signal handler exist before the first server is
     // launched, so a Ctrl-C during startup still releases what already
@@ -564,15 +605,18 @@ async fn print_turn(
 ) -> Result<ExitCode> {
     let approval = builder.approval;
     let plane = plane(builder)?;
-    let mut agent = plane
-        .open(
+    let opened = plane
+        .open_with(
             selector(args),
             connector,
-            args.profile.as_deref(),
-            args.model.as_deref(),
+            startup_request(args),
             phase_flag(args),
         )
         .await?;
+    for line in startup_notes(&opened) {
+        eprintln!("{line}");
+    }
+    let mut agent = opened.driver;
     *slot.lock().expect("cancel slot") = Some(agent.handle());
     let input = LineInput::from_reader(std::io::BufReader::new(std::io::stdin()));
     let mut ui = PrintUi::new(
@@ -622,9 +666,6 @@ async fn run_repl_mode(
     let connector = connector_flag(args)?;
     warn_approval_flags(args, connector);
     let builder = builder(workspace, database, args).await?;
-    if connector.is_none() {
-        warm_catalog(&builder, args).await;
-    }
     let mcp = builder.mcp().cloned();
     let slot: CancelSlot = Arc::new(Mutex::new(None));
     let _ = install_ctrl_c(Arc::clone(&slot), mcp.clone());
@@ -643,17 +684,26 @@ async fn repl_loop(
     connector: Option<ConnectorId>,
     slot: CancelSlot,
 ) -> Result<ExitCode> {
-    let approval = builder.approval;
+    // The driver decides whether to ask on each call. Keep a real prompter
+    // available when a later /mode switch returns to Supervised.
+    let approval = if std::io::stdin().is_terminal() {
+        ApprovalMode::Ask
+    } else {
+        ApprovalMode::DenyAll
+    };
     let plane = plane(builder)?;
-    let agent = plane
-        .open(
+    let opened = plane
+        .open_with(
             selector(args),
             connector,
-            args.profile.as_deref(),
-            args.model.as_deref(),
+            startup_request(args),
             phase_flag(args),
         )
         .await?;
+    for line in startup_notes(&opened) {
+        eprintln!("{line}");
+    }
+    let agent = opened.driver;
     println!("gritt repl: {} (/help for commands)", agent.session().name);
     // One reader owns stdin: the loop takes commands from it and the
     // approval prompter takes answers from it, never both at once.
@@ -702,42 +752,34 @@ async fn run_tui_mode(
     // process groups: without this they would survive it.
     let slot: CancelSlot = Arc::new(Mutex::new(None));
     let _ = install_ctrl_c(Arc::clone(&slot), mcp.clone());
-    // The MCP servers are never waited for here, and the model list is
-    // waited for only when this run resolves a model before the first
-    // frame. The plan's launch budget is a usable composer independent of
-    // provider and MCP readiness, and an unreachable endpoint or a server
-    // that never answers `initialize` would otherwise hold a blank terminal
-    // for its whole deadline (TKT-0020).
+    // The MCP servers and the model list are never waited for here. The
+    // plan's launch budget is a usable composer independent of provider and
+    // MCP readiness, and an unreachable endpoint or a server that never
+    // answers `initialize` would otherwise hold a blank terminal for its
+    // whole deadline (TKT-0020).
     //
-    // The exception is the eager path. `plane.open` resolves `--model`
-    // against the catalog and persists the result on the new session, so a
-    // catalog that has not arrived yet would let a retired id be stored
-    // unremapped, or an unknown one be accepted. That resolution has to see
-    // the list, so this run pays for it. The lazy path does not: it opens
-    // nothing until a prompt is submitted, and draft validation performs
-    // its own warm before it resolves anything.
+    // The eager path resolves `--model` against the list when it opens the
+    // session, because the startup resolver loads or probes the list for
+    // the profile it settles on before it resolves anything. The lazy path
+    // opens nothing until a prompt is submitted and its draft validation
+    // does the same, so the list is only warmed in the background for the
+    // `/models` picker, silently: stderr belongs to the alternate screen
+    // from here on and a stale or missing list is reported inside the
+    // interface instead.
     let lazy = args.session.is_none() && matches!(connector, None | Some(ConnectorId::Native));
-    if connector.is_none() && !args.no_models {
+    if lazy && !args.no_models {
         let warming = builder.clone();
         let selector = selector(args);
         let profile = args.profile.clone();
         let model = args.model.clone();
-        // Deliberately silent in both forms: stderr belongs to the
-        // alternate screen from here on, and a stale or missing list is
-        // reported inside the interface instead.
-        let warm = async move {
+        tokio::spawn(async move {
             if let Ok(profile) = warming
                 .session_profile(&selector, profile.as_deref(), model.as_deref())
                 .await
             {
                 let _ = warming.load_catalog(&profile).await;
             }
-        };
-        if lazy {
-            tokio::spawn(warm);
-        } else {
-            warm.await;
-        }
+        });
     }
     // Handed to the interface rather than opened here: it starts the
     // runtime in the background and reports a configuration failure as a
@@ -775,8 +817,14 @@ async fn tui_session(
     if let Some(model) = args.model.as_deref() {
         draft = draft.with_model(model);
     }
+    if let Some(effort) = args.effort {
+        draft = draft.with_effort(effort);
+    }
     if let Some(phase) = phase_flag(args) {
         draft = draft.with_phase(phase);
+    }
+    if let Some(mode) = args.mode {
+        draft = draft.with_mode(mode);
     }
     // No configured profile is the strongest reason to take the lazy
     // path: `/connect` has to work before anything is set up.
@@ -962,9 +1010,11 @@ async fn session_command(
 
 async fn connectors_command(workspace: &Path, database: Option<&Path>) -> Result<ExitCode> {
     let args = SessionArgs {
+        mode: None,
         session: None,
         profile: None,
         model: None,
+        effort: None,
         plan: false,
         code: false,
         approve_all: false,
@@ -1024,9 +1074,11 @@ async fn connectors_command(workspace: &Path, database: Option<&Path>) -> Result
 async fn doctor_command(workspace: &Path, database: Option<&Path>) -> Result<ExitCode> {
     let store = open_store(workspace, database).await?;
     let args = SessionArgs {
+        mode: None,
         session: None,
         profile: None,
         model: None,
+        effort: None,
         plan: false,
         code: false,
         approve_all: false,
@@ -1070,6 +1122,14 @@ fn show_config(workspace: &Path) -> Result<ExitCode> {
         config.default_model.as_deref().unwrap_or("-")
     );
     println!(
+        "fallback profiles: {}",
+        if config.fallback_profiles.is_empty() {
+            "none".to_owned()
+        } else {
+            config.fallback_profiles.join(", ")
+        }
+    );
+    println!(
         "content logging: {} ({} day retention)",
         config.logging.content_logging, config.logging.content_retention_days
     );
@@ -1106,6 +1166,31 @@ fn key_set(workspace: &Path, profile: &str) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+async fn key_refresh(workspace: &Path, profile: &str) -> Result<ExitCode> {
+    let config = config::load(workspace, std::env::vars())?;
+    let found = config
+        .profiles
+        .get(profile)
+        .ok_or_else(|| Error::config(format!("unknown profile `{profile}`")))?;
+    let value = std::env::var(&found.key.env_var_name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::missing_key(profile, &found.key.env_var_name))?;
+    let key = gritt_core::secret::Secret::new(value.trim());
+    let candidate = gritt_provider::StaticKey(key);
+    gritt_provider::models::fetch_models(&ReqwestTransport::new()?, &candidate, found)
+        .await
+        .map_err(|error| {
+            Error::config(format!(
+                "key from {} was rejected by profile `{profile}`: {}",
+                found.key.env_var_name, error.message
+            ))
+        })?;
+    resolver().store(&found.key, &candidate.0)?;
+    println!("validated the environment key and replaced the keychain entry for `{profile}`");
+    Ok(ExitCode::SUCCESS)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -1116,6 +1201,7 @@ async fn main() -> ExitCode {
     let database = cli.database.as_deref();
     let result = match cli.command {
         Some(Command::KeySet { profile }) => key_set(&workspace, &profile),
+        Some(Command::KeyRefresh { profile }) => key_refresh(&workspace, &profile).await,
         Some(Command::Config) => show_config(&workspace),
         None => run_tui_mode(&workspace, database, &SessionArgs::default(), None).await,
         Some(Command::Run {
@@ -1154,9 +1240,11 @@ mod tests {
 
     fn args(approve_all: bool, deny_all: bool, ask: bool, connector: Option<&str>) -> SessionArgs {
         SessionArgs {
+            mode: None,
             session: None,
             profile: None,
             model: None,
+            effort: None,
             plan: false,
             code: false,
             approve_all,
@@ -1165,6 +1253,60 @@ mod tests {
             no_models: true,
             connector: connector.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn execution_mode_flags_are_explicit_and_conflicting_authority_is_rejected() {
+        for mode in ExecutionMode::ALL {
+            let cli =
+                Cli::try_parse_from(["gritt", "run", "--mode", mode.as_str(), "hello"]).unwrap();
+            let Some(Command::Run { session, .. }) = cli.command else {
+                panic!("run command")
+            };
+            assert_eq!(session.mode, Some(mode));
+            assert_eq!(phase_flag(&session), Some(mode.phase()));
+        }
+        for flag in ["--plan", "--code", "--approve-all", "--deny-all", "--ask"] {
+            assert!(
+                Cli::try_parse_from(["gritt", "run", "--mode", "full-access", flag, "hello"])
+                    .is_err()
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "gritt",
+            "run",
+            "--mode",
+            "full-access",
+            "--connector",
+            "claude",
+            "hello"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn the_effort_flag_parses_the_four_levels_and_refuses_others() {
+        for (text, level) in [
+            ("auto", ReasoningEffort::Auto),
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("high", ReasoningEffort::High),
+        ] {
+            let cli = Cli::try_parse_from(["gritt", "run", "--effort", text, "hello"]).unwrap();
+            let Some(Command::Run { session, .. }) = cli.command else {
+                panic!("run command")
+            };
+            assert_eq!(session.effort, Some(level));
+            let request = startup_request(&session);
+            assert_eq!(request.effort, Some(level));
+            assert!(!request.pinned);
+        }
+        assert!(Cli::try_parse_from(["gritt", "run", "--effort", "max", "hello"]).is_err());
+        let cli = Cli::try_parse_from(["gritt", "repl", "--profile", "openai"]).unwrap();
+        let Some(Command::Repl { session, .. }) = cli.command else {
+            panic!("repl command")
+        };
+        assert!(startup_request(&session).pinned);
     }
 
     #[test]

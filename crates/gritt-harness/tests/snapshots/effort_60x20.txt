@@ -2,12 +2,12 @@
 
 ## text
 
-api-cleanup  coding  fixture
+api-cleanup  supervised  fixture
 you   Tidy the public API of the store module.
  ╭ Effort ────────────────────────────────────────────────╮
 t│› ▏                                                     │
  │Effort applies to native turns and can change between th│
-g│  Model default                                  [auto] │
+g│  Provider default                            [default] │
  │    no explicit effort is sent                          │
  │  low                                             [low] │
  │● medium                                       [medium] │

@@ -2,7 +2,7 @@
 
 ## text
 
- api-cleanup  coding  /work/gritt  fixture
+ api-cleanup  supervised  /work/gritt  fixture
  you   Tidy the public API of the store module.                                          │ now  streaming
                                                                                          │
  think Reading the module, then the callers.                                             │ Model

@@ -50,6 +50,11 @@ fn type_text(app: &mut App, text: &str) {
 fn build(name: &str, theme: Theme) -> App {
     match name {
         "home" => fixture::home(theme),
+        "execution_modes" => {
+            let mut app = fixture::conversation(theme);
+            app.dispatch(Command::Mode, None);
+            app
+        }
         "conversation" => {
             let mut app = fixture::conversation(theme);
             app.tool_details = true;
@@ -301,7 +306,8 @@ fn check(name: &str, width: u16, height: u16) {
     );
 }
 
-const SCREENS: [&str; 16] = [
+const SCREENS: [&str; 17] = [
+    "execution_modes",
     "home",
     "conversation",
     "command_search",

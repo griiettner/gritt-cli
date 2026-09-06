@@ -75,6 +75,7 @@ async fn incremental_sse_over_a_real_http_connection() {
         base_url: format!("http://127.0.0.1:{port}/v1"),
         key: SecretRef::for_profile("local", "LOCAL_KEY"),
         aliases: Default::default(),
+        fallback_model: None,
     };
     let context = AdapterContext {
         profile,

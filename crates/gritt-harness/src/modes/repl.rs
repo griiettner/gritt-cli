@@ -100,6 +100,7 @@ pub fn line_prompter(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplCommand {
+    Mode(String),
     Prompt(String),
     Plan,
     Code,
@@ -124,6 +125,7 @@ pub fn parse_command(line: &str) -> ReplCommand {
     let command = parts.next().unwrap_or_default();
     let argument = parts.next().map(str::trim).unwrap_or_default();
     match command {
+        "/mode" => ReplCommand::Mode(argument.to_owned()),
         "/plan" => ReplCommand::Plan,
         "/code" => ReplCommand::Code,
         "/sessions" => ReplCommand::Sessions,
@@ -135,7 +137,7 @@ pub fn parse_command(line: &str) -> ReplCommand {
     }
 }
 
-pub const HELP: &str = "commands: /plan  /code  /sessions  /resume NAME  /history  /help  /quit\n\
+pub const HELP: &str = "commands: /mode [planning|supervised|auto-approve|full-access]  /plan  /code  /sessions  /resume NAME  /history  /help  /quit\n\
 Ctrl-C cancels a running turn; a second Ctrl-C at the prompt quits.";
 
 /// Runs the loop until `/quit` or end of input. Returns the driver so the
@@ -159,10 +161,13 @@ pub async fn run_repl<O: Write + Send, E: Write + Send>(
                 out,
                 "[{} {}] > ",
                 agent.session().name,
-                match agent.phase() {
-                    Phase::Planning => "plan",
-                    Phase::Coding => "code",
-                }
+                agent
+                    .mode()
+                    .map(|mode| mode.as_str())
+                    .unwrap_or(match agent.phase() {
+                        Phase::Planning => "plan",
+                        Phase::Coding => "code",
+                    })
             );
             let _ = out.flush();
         }
@@ -171,6 +176,25 @@ pub async fn run_repl<O: Write + Send, E: Write + Send>(
             break;
         };
         match parse_command(&line) {
+            ReplCommand::Mode(argument) => {
+                let result = if argument.is_empty() {
+                    Ok(agent
+                        .mode()
+                        .map(|mode| format!("mode: {mode}. {}", mode.description()))
+                        .unwrap_or_else(|| "the external agent manages its own permissions".into()))
+                } else {
+                    match argument.parse::<gritt_core::session::ExecutionMode>() {
+                        Ok(mode) => agent
+                            .set_mode(mode)
+                            .await
+                            .map(|()| format!("mode: {mode}"))
+                            .map_err(|error| error.message),
+                        Err(reason) => Err(reason),
+                    }
+                };
+                let (out, _) = ui.parts_mut();
+                let _ = writeln!(out, "{}", result.unwrap_or_else(|reason| reason));
+            }
             ReplCommand::Empty => {}
             ReplCommand::Quit => break,
             ReplCommand::Help => {
@@ -184,12 +208,24 @@ pub async fn run_repl<O: Write + Send, E: Write + Send>(
                 }
             }
             ReplCommand::Plan => {
-                agent.set_phase(Phase::Planning).await?;
+                if agent.mode().is_some() {
+                    agent
+                        .set_mode(gritt_core::session::ExecutionMode::Planning)
+                        .await?;
+                } else {
+                    agent.set_phase(Phase::Planning).await?;
+                }
                 let (out, _) = ui.parts_mut();
                 let _ = writeln!(out, "phase: planning");
             }
             ReplCommand::Code => {
-                agent.set_phase(Phase::Coding).await?;
+                if agent.mode().is_some() {
+                    agent
+                        .set_mode(gritt_core::session::ExecutionMode::Supervised)
+                        .await?;
+                } else {
+                    agent.set_phase(Phase::Coding).await?;
+                }
                 let (out, _) = ui.parts_mut();
                 let _ = writeln!(out, "phase: coding");
             }

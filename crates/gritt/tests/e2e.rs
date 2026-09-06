@@ -101,12 +101,25 @@ fn tool_call_sse(tool: &str, arguments: serde_json::Value) -> Vec<u8> {
     format!("data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n").into_bytes()
 }
 
+/// The model list the stand-in answers `GET /models` with: one model
+/// that reports reasoning, so an explicit effort is accepted on Chat
+/// Completions.
+const MODELS_JSON: &str =
+    r#"{"data":[{"id":"openai/gpt-5-nano","supported_parameters":["reasoning","tools"]}]}"#;
+
 /// A provider stand-in: answers each POST in order with the next canned
-/// body and records every request body. `stall` keeps a connection open
-/// without answering, for the cancellation test.
+/// body and records every request body; answers every GET with the model
+/// list. `stall` keeps a connection open without answering, for the
+/// cancellation test.
 struct Provider {
     port: u16,
     bodies: Arc<Mutex<Vec<String>>>,
+}
+
+/// A port nothing listens on, for an unreachable profile.
+fn closed_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
 }
 
 fn serve(responses: Vec<Vec<u8>>, stall: bool) -> Provider {
@@ -120,6 +133,10 @@ fn serve(responses: Vec<Vec<u8>>, stall: bool) -> Provider {
             let Ok(stream) = stream else { break };
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut content_length = 0usize;
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                return;
+            }
             loop {
                 let mut line = String::new();
                 if reader.read_line(&mut line).unwrap_or(0) == 0 {
@@ -134,6 +151,16 @@ fn serve(responses: Vec<Vec<u8>>, stall: bool) -> Provider {
             }
             let mut body = vec![0u8; content_length];
             reader.read_exact(&mut body).unwrap();
+            if request_line.starts_with("GET ") {
+                let mut stream = stream;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{MODELS_JSON}",
+                    MODELS_JSON.len()
+                );
+                let _ = stream.flush();
+                continue;
+            }
             seen.lock()
                 .unwrap()
                 .push(String::from_utf8_lossy(&body).into_owned());
@@ -165,20 +192,27 @@ struct Space {
     dir: tempfile::TempDir,
 }
 
+/// The `[profiles.<name>]` table for a local Chat Completions endpoint.
+fn local_profile(name: &str, port: u16) -> String {
+    format!(
+        "[profiles.{name}]\nname = \"{name}\"\nprotocol = \"chat_completions\"\n\
+         base_url = \"http://127.0.0.1:{port}/v1\"\n\
+         [profiles.{name}.key]\nkeychain_service_entry = \"gritt-e2e-no-such-entry/{name}\"\n\
+         env_var_name = \"{KEY_VAR}\"\n"
+    )
+}
+
 impl Space {
     fn new(port: u16) -> Self {
+        Self::with_config(format!(
+            "default_profile = \"local\"\ndefault_model = \"openai/gpt-5-nano\"\n{}",
+            local_profile("local", port)
+        ))
+    }
+
+    fn with_config(config: String) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.toml"),
-            format!(
-                "default_profile = \"local\"\ndefault_model = \"openai/gpt-5-nano\"\n\
-                 [profiles.local]\nname = \"local\"\nprotocol = \"chat_completions\"\n\
-                 base_url = \"http://127.0.0.1:{port}/v1\"\n\
-                 [profiles.local.key]\nkeychain_service_entry = \"gritt-e2e-no-such-entry/local\"\n\
-                 env_var_name = \"{KEY_VAR}\"\n"
-            ),
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("config.toml"), config).unwrap();
         std::fs::write(dir.path().join("README.md"), "# Readme\nhello\n").unwrap();
         Self { dir }
     }
@@ -191,6 +225,8 @@ impl Space {
         self.dir.path().join("gritt.db")
     }
 
+    /// The child's home is the workspace, so its model cache and user
+    /// config live in the temporary directory rather than the developer's.
     fn command(&self, args: &[&str]) -> Command {
         let mut command = gritt();
         command
@@ -200,6 +236,9 @@ impl Space {
             .arg(self.database())
             .args(args)
             .env(KEY_VAR, KEY)
+            .env("HOME", self.path())
+            .env("XDG_CACHE_HOME", self.path().join("cache"))
+            .env("XDG_CONFIG_HOME", self.path().join("config"))
             .env_remove("NO_COLOR")
             .stdin(Stdio::null());
         command
@@ -227,7 +266,10 @@ fn planning_turn_streams_text_and_exits_zero() {
     assert_eq!(stdout(&output).trim_end(), "Hello, world");
     let body = provider.bodies.lock().unwrap()[0].clone();
     assert!(body.contains("say hello"));
-    assert!(!body.contains("\"tools\""), "planning must not offer tools");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let tools = body["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["function"]["name"], "file_read");
     assert!(!stdout(&output).contains(KEY) && !stderr(&output).contains(KEY));
 }
 
@@ -325,6 +367,218 @@ fn a_session_resumes_after_the_process_exits() {
 }
 
 #[cfg(unix)]
+#[test]
+fn startup_falls_over_to_the_next_profile_when_the_default_is_unreachable() {
+    let provider = serve(
+        vec![text_sse("From the fallback."), text_sse("Still here.")],
+        false,
+    );
+    let space = Space::with_config(format!(
+        "default_profile = \"dead\"\ndefault_model = \"openai/gpt-5-nano\"\n\
+         fallback_profiles = [\"local\"]\n{}{}",
+        local_profile("dead", closed_port()),
+        local_profile("local", provider.port)
+    ));
+    // No `--no-models`: the chain probes each endpoint live.
+    let output = space.run(&["run", "--plan", "--session", "moved", "say hello"]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output).trim_end(), "From the fallback.");
+    let err = stderr(&output);
+    assert!(
+        err.contains("skipped profile dead (connection failed"),
+        "{err}"
+    );
+    assert!(
+        err.contains("runs on profile `local` with model `openai/gpt-5-nano`"),
+        "{err}"
+    );
+    assert!(!err.contains(KEY) && !stdout(&output).contains(KEY));
+    let list = space.run(&["session", "list"]);
+    assert!(
+        stdout(&list).contains("local/openai/gpt-5-nano"),
+        "{}",
+        stdout(&list)
+    );
+
+    // Resuming keeps the session on the fallback profile without probing
+    // the dead default again, and says nothing about a chain.
+    let second = space.run(&["run", "--session", "moved", "again"]);
+    assert!(second.status.success(), "stderr: {}", stderr(&second));
+    assert_eq!(stdout(&second).trim_end(), "Still here.");
+    assert!(
+        !stderr(&second).contains("skipped profile"),
+        "{}",
+        stderr(&second)
+    );
+
+    // With nothing usable the aggregate error names every profile and
+    // its failure class.
+    let none = Space::with_config(format!(
+        "default_profile = \"dead\"\ndefault_model = \"openai/gpt-5-nano\"\n\
+         fallback_profiles = [\"also-dead\"]\n{}{}",
+        local_profile("dead", closed_port()),
+        local_profile("also-dead", closed_port())
+    ));
+    let output = none.run(&["run", "--plan", "say hello"]);
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(err.contains("no usable provider profile"), "{err}");
+    assert!(err.contains("dead (connection failed"), "{err}");
+    assert!(err.contains("also-dead (connection failed"), "{err}");
+    assert!(!err.contains(KEY));
+
+    // A fallback list naming an unknown profile fails at load, loudly.
+    let typo = Space::with_config(format!(
+        "default_profile = \"local\"\nfallback_profiles = [\"nope\"]\n{}",
+        local_profile("local", provider.port)
+    ));
+    let output = typo.run(&["config"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("`nope`"), "{}", stderr(&output));
+}
+
+#[test]
+fn a_new_session_reuses_the_last_successful_choices_and_flags_win() {
+    let provider = serve(
+        vec![
+            text_sse("One."),
+            text_sse("Two."),
+            text_sse("Three."),
+            text_sse("Four."),
+        ],
+        false,
+    );
+    // No defaults configured: the first run has to say what it wants.
+    let space = Space::with_config(local_profile("local", provider.port));
+    let output = space.run(&["run", "--plan", "say one"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("no profile given"),
+        "{}",
+        stderr(&output)
+    );
+
+    let first = space.run(&[
+        "run",
+        "--plan",
+        "--profile",
+        "local",
+        "--model",
+        "openai/gpt-5-nano",
+        "--effort",
+        "high",
+        "say one",
+    ]);
+    assert!(first.status.success(), "stderr: {}", stderr(&first));
+    assert_eq!(stdout(&first).trim_end(), "One.");
+
+    // Nothing asked for: the remembered profile, model, and effort apply
+    // and the notes say so.
+    let second = space.run(&["run", "--plan", "say two"]);
+    assert!(second.status.success(), "stderr: {}", stderr(&second));
+    assert_eq!(stdout(&second).trim_end(), "Two.");
+    let err = stderr(&second);
+    assert!(
+        err.contains(
+            "using the last session's profile local, model openai/gpt-5-nano, effort high"
+        ),
+        "{err}"
+    );
+
+    // A flag wins for its own field; the rest stays remembered.
+    let third = space.run(&["run", "--plan", "--effort", "low", "say three"]);
+    assert!(third.status.success(), "stderr: {}", stderr(&third));
+    assert!(
+        stderr(&third).contains("using the last session's profile local, model openai/gpt-5-nano"),
+        "{}",
+        stderr(&third)
+    );
+    assert!(
+        !stderr(&third).contains("effort high"),
+        "{}",
+        stderr(&third)
+    );
+
+    // The remembered choices beat a configured default that arrives later.
+    std::fs::write(
+        space.path().join("config.toml"),
+        format!(
+            "default_profile = \"local\"\ndefault_model = \"openai/gpt-5-nano\"\n{}",
+            local_profile("local", provider.port)
+        ),
+    )
+    .unwrap();
+    let fourth = space.run(&["run", "--plan", "say four"]);
+    assert!(fourth.status.success(), "stderr: {}", stderr(&fourth));
+    assert!(
+        stderr(&fourth).contains(
+            "using the last session's profile local, model openai/gpt-5-nano, effort low"
+        ),
+        "{}",
+        stderr(&fourth)
+    );
+
+    let bodies: Vec<serde_json::Value> = provider
+        .bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| serde_json::from_str(body).unwrap())
+        .collect();
+    assert_eq!(bodies.len(), 4);
+    assert_eq!(bodies[0]["reasoning"]["effort"], "high");
+    assert_eq!(bodies[1]["reasoning"]["effort"], "high");
+    assert_eq!(bodies[2]["reasoning"]["effort"], "low");
+    assert_eq!(bodies[3]["reasoning"]["effort"], "low");
+    for output in [&first, &second, &third, &fourth] {
+        assert!(!stderr(output).contains(KEY) && !stdout(output).contains(KEY));
+    }
+    let doctor = space.run(&["doctor"]);
+    assert!(
+        stdout(&doctor).contains("0005_last_used: applied"),
+        "{}",
+        stdout(&doctor)
+    );
+}
+
+#[test]
+fn the_repl_starts_on_the_fallback_profile_and_says_so() {
+    let provider = serve(vec![text_sse("Hi from the fallback.")], false);
+    let space = Space::with_config(format!(
+        "default_profile = \"dead\"\ndefault_model = \"openai/gpt-5-nano\"\n\
+         fallback_profiles = [\"local\"]\n{}{}",
+        local_profile("dead", closed_port()),
+        local_profile("local", provider.port)
+    ));
+    let mut child = space
+        .command(&["repl", "--plan"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"say hi\n/quit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(
+        stdout(&output).contains("Hi from the fallback."),
+        "{}",
+        stdout(&output)
+    );
+    let err = stderr(&output);
+    assert!(
+        err.contains("skipped profile dead (connection failed"),
+        "{err}"
+    );
+    assert!(err.contains("runs on profile `local`"), "{err}");
+    assert!(!err.contains(KEY));
+}
+
 #[test]
 fn ctrl_c_cancels_a_running_turn_with_exit_130() {
     let provider = serve(Vec::new(), true);
@@ -469,7 +723,7 @@ fn an_old_database_upgrades_in_place_and_keeps_its_rows() {
     let doctor = space.run(&["doctor"]);
     assert!(doctor.status.success(), "stderr: {}", stderr(&doctor));
     let text = stdout(&doctor);
-    assert!(text.contains("product migrations: 4/4 applied"), "{text}");
+    assert!(text.contains("product migrations: 5/5 applied"), "{text}");
     assert!(text.contains("0003_session_told_phase: applied"), "{text}");
     assert!(text.contains("0004_mcp_trust: applied"), "{text}");
     assert!(text.contains("sessions: 1"), "{text}");

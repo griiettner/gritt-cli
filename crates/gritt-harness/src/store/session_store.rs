@@ -3,11 +3,14 @@
 //! payloads are the full serialized event; the store never derives
 //! telemetry from them.
 
+use std::path::Path;
+
 use chrono::{DateTime, Utc};
 use gritt_core::event::Event;
 use gritt_core::provider::ReasoningEffort;
 use gritt_core::session::{
-    BoxFuture, ContinuationState, Phase, Session, SessionId, SessionKind, SessionStore,
+    BoxFuture, ContinuationState, LastUsedNative, Phase, Session, SessionId, SessionKind,
+    SessionStore,
 };
 use gritt_core::{Error, Result};
 
@@ -151,6 +154,55 @@ impl Store {
             Some(row) => Ok(Some(row_to_session(&row)?)),
             None => Ok(None),
         }
+    }
+
+    /// The native choices of the last successful new session in
+    /// `workspace`, `None` before any succeeded there or on a database
+    /// written before the table existed.
+    pub async fn last_used(&self, workspace: &Path) -> Result<Option<LastUsedNative>> {
+        let mut rows = self
+            .connection()
+            .query(
+                "SELECT provider_profile, model, effort FROM gritt_last_used WHERE workspace = ?1",
+                turso::params![workspace.to_string_lossy().into_owned()],
+            )
+            .await
+            .map_err(storage_error)?;
+        match rows.next().await.map_err(storage_error)? {
+            Some(row) => {
+                let effort: String = row.get(2).map_err(storage_error)?;
+                Ok(Some(LastUsedNative {
+                    provider_profile: row.get(0).map_err(storage_error)?,
+                    model: row.get(1).map_err(storage_error)?,
+                    effort: effort.parse().map_err(|error: Error| {
+                        Error::storage(format!("invalid stored effort: {}", error.message))
+                    })?,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Records the choices a new session succeeded with. One row per
+    /// workspace; a later success replaces the earlier one.
+    pub async fn set_last_used(&self, workspace: &Path, last: &LastUsedNative) -> Result<()> {
+        self.connection()
+            .execute(
+                "INSERT INTO gritt_last_used (workspace, provider_profile, model, effort, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(workspace) DO UPDATE SET provider_profile = excluded.provider_profile,
+                   model = excluded.model, effort = excluded.effort, updated_at = excluded.updated_at",
+                turso::params![
+                    workspace.to_string_lossy().into_owned(),
+                    last.provider_profile.clone(),
+                    last.model.clone(),
+                    last.effort.as_str(),
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .await
+            .map_err(storage_error)?;
+        Ok(())
     }
 
     /// Next free event sequence for a session.
@@ -455,6 +507,50 @@ mod tests {
             .unwrap();
         let session = store.get(&SessionId("old".into())).await.unwrap().unwrap();
         assert_eq!(session.kind.effort(), Some(ReasoningEffort::Auto));
+    }
+
+    #[tokio::test]
+    async fn last_used_choices_round_trip_per_workspace_and_hold_no_secret() {
+        let (_dir, store) = store().await;
+        let here = Path::new("/tmp/ws");
+        assert_eq!(store.last_used(here).await.unwrap(), None);
+        let first = LastUsedNative {
+            provider_profile: "openrouter".into(),
+            model: "openai/gpt-5-nano".into(),
+            effort: ReasoningEffort::High,
+        };
+        store.set_last_used(here, &first).await.unwrap();
+        assert_eq!(store.last_used(here).await.unwrap(), Some(first));
+        assert_eq!(
+            store.last_used(Path::new("/tmp/other")).await.unwrap(),
+            None
+        );
+        let second = LastUsedNative {
+            provider_profile: "anthropic".into(),
+            model: "claude-x".into(),
+            effort: ReasoningEffort::Auto,
+        };
+        store.set_last_used(here, &second).await.unwrap();
+        assert_eq!(store.last_used(here).await.unwrap(), Some(second));
+        let mut rows = store
+            .connection()
+            .query("PRAGMA table_info(gritt_last_used)", ())
+            .await
+            .unwrap();
+        let mut columns = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            columns.push(row.get::<String>(1).unwrap());
+        }
+        assert_eq!(
+            columns,
+            vec![
+                "workspace",
+                "provider_profile",
+                "model",
+                "effort",
+                "updated_at"
+            ]
+        );
     }
 
     #[tokio::test]

@@ -11,3 +11,4 @@ __pycache__/
 # at the repository root. Only the committed `gritt` binary belongs here.
 /gritt-mcp-fixture
 /libgritt_*.rlib
+config.toml

@@ -19,6 +19,7 @@ pub mod modes;
 pub mod native_connector;
 pub mod policy;
 pub mod setup;
+pub mod startup;
 pub mod store;
 pub mod telemetry;
 pub mod tools;

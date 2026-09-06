@@ -3,7 +3,7 @@
 
 use gritt_core::connector::ConnectorId;
 use gritt_core::provider::{EffortUnsupportedReason, ReasoningEffort};
-use gritt_core::session::{BoxFuture, Phase, Session, SessionKind};
+use gritt_core::session::{BoxFuture, ExecutionMode, Phase, Session, SessionKind};
 use gritt_core::Result;
 
 use crate::agent::{CancelHandle, NativeAgent, TurnOutcome, Ui};
@@ -35,6 +35,16 @@ pub struct DriverInfo {
 }
 
 pub trait Driver: Send {
+    fn mode(&self) -> Option<ExecutionMode> {
+        None
+    }
+    fn set_mode(&mut self, _mode: ExecutionMode) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async {
+            Err(gritt_core::Error::config(
+                "the external agent manages its own permissions",
+            ))
+        })
+    }
     fn session(&self) -> &Session;
     fn phase(&self) -> Phase;
     fn set_phase(&mut self, phase: Phase) -> BoxFuture<'_, Result<()>>;
@@ -54,6 +64,12 @@ pub trait Driver: Send {
 }
 
 impl Driver for NativeAgent {
+    fn mode(&self) -> Option<ExecutionMode> {
+        Some(NativeAgent::mode(self))
+    }
+    fn set_mode(&mut self, mode: ExecutionMode) -> BoxFuture<'_, Result<()>> {
+        Box::pin(NativeAgent::set_mode(self, mode))
+    }
     fn session(&self) -> &Session {
         NativeAgent::session(self)
     }

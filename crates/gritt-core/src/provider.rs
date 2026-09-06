@@ -35,6 +35,11 @@ pub struct ProviderProfile {
     /// Alias to model id, scoped to this profile.
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
+    /// The model a new session uses when startup falls back to this
+    /// profile and the requested model is not in its list. Absent means
+    /// the requested model must appear in the profile's catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_model: Option<String>,
 }
 
 /// User-facing reasoning intensity for one native turn. Provider neutral:
@@ -67,7 +72,7 @@ impl ReasoningEffort {
         ReasoningEffort::High,
     ];
 
-    /// The serde name, which is also the user-facing spelling.
+    /// The stable serde/config name.
     pub fn as_str(self) -> &'static str {
         match self {
             ReasoningEffort::Auto => "auto",
@@ -80,11 +85,22 @@ impl ReasoningEffort {
     pub fn is_explicit(self) -> bool {
         self != ReasoningEffort::Auto
     }
+
+    /// Clear UI wording. `Auto` means the provider/model default; it does not
+    /// select an effort dynamically from the task.
+    pub fn label(self) -> &'static str {
+        match self {
+            ReasoningEffort::Auto => "provider default",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
+    }
 }
 
 impl std::fmt::Display for ReasoningEffort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(self.label())
     }
 }
 
@@ -376,6 +392,25 @@ mod tests {
         let error = intent(Some(false), ReasoningEffort::Medium).unwrap_err();
         assert_eq!(error.kind, crate::ErrorKind::Config);
         assert!(error.message.contains("medium"));
+    }
+
+    #[test]
+    fn profiles_written_before_fallback_model_still_load_and_omit_it() {
+        let old = serde_json::json!({
+            "name": "openrouter", "protocol": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "key": {"keychain_service_entry": "gritt/openrouter", "env_var_name": "OPENROUTER_API_KEY"}
+        });
+        let profile: ProviderProfile = serde_json::from_value(old).unwrap();
+        assert_eq!(profile.fallback_model, None);
+        let json = serde_json::to_value(&profile).unwrap();
+        assert!(json.get("fallback_model").is_none());
+        let with = ProviderProfile {
+            fallback_model: Some("claude-sonnet-5".into()),
+            ..profile
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["fallback_model"], "claude-sonnet-5");
     }
 
     #[test]

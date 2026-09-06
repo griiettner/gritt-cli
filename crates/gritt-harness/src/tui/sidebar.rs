@@ -248,7 +248,7 @@ impl SidebarModel {
         lines.push(heading(theme, "Session"));
         lines.push(field(theme, "name", value(&self.session.name), width));
         lines.push(field(theme, "dir ", value(&self.session.workspace), width));
-        lines.push(field(theme, "phase", value(&self.session.phase), width));
+        lines.push(field(theme, "mode", value(&self.session.phase), width));
         lines.push(field(theme, "now ", value(&self.session.activity), width));
         lines.push(Line::default());
 
@@ -436,7 +436,7 @@ mod tests {
         let model = SidebarModel::default();
         let text = text_of(&model.lines(&Theme::new(ThemeMode::NoColor), 30));
         for label in [
-            "name", "dir", "phase", "now", "via", "id", "effort", "in", "out", "ctx", "est",
+            "name", "dir", "mode", "now", "via", "id", "effort", "in", "out", "ctx", "est",
         ] {
             assert!(
                 text.lines()

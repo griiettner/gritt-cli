@@ -24,6 +24,198 @@ use gritt_provider::{FixtureResponse, FixtureTransport, StaticKey};
 
 const KEY: &str = "fixture-key-never-printed";
 
+#[tokio::test]
+async fn a_lazy_draft_applies_its_selected_mode_to_the_driver() {
+    use gritt_core::session::ExecutionMode;
+    use gritt_harness::control::DraftOpen;
+    use gritt_harness::draft::SessionDraft;
+    for mode in ExecutionMode::ALL {
+        let fx = fixture_builder(vec![], ApprovalMode::DenyAll, None).await;
+        let result = fx
+            .plane
+            .open_draft(SessionDraft::default().with_mode(mode))
+            .await
+            .unwrap();
+        let DraftOpen::Opened { driver, .. } = result else {
+            panic!("draft rejected")
+        };
+        assert_eq!(driver.mode(), Some(mode));
+        assert_eq!(driver.phase(), mode.phase());
+    }
+}
+
+#[tokio::test]
+async fn execution_modes_gate_writes_at_execution_and_record_approvals() {
+    use gritt_core::session::ExecutionMode;
+    for mode in ExecutionMode::ALL {
+        let fx = fixture_builder(
+            vec![
+                FixtureResponse::sse(tool_call_sse(
+                    native::FILE_WRITE,
+                    serde_json::json!({
+                        "path": "mode.txt", "content": "written"
+                    }),
+                )),
+                FixtureResponse::sse(fixture("stream-text.sse")),
+            ],
+            ApprovalMode::Ask,
+            None,
+        )
+        .await;
+        let mut agent = fx
+            .plane
+            .builder
+            .open(SessionSelector::Named("mode-test".into()), None, None, None)
+            .await
+            .unwrap();
+        agent.set_mode(mode).await.unwrap();
+        let mut ui = RecordingUi::default();
+        agent.run_turn("write the file", &mut ui).await.unwrap();
+        let written = fx.plane.builder.workspace.root().join("mode.txt").exists();
+        assert_eq!(
+            written,
+            matches!(mode, ExecutionMode::AutoApprove | ExecutionMode::FullAccess),
+            "{mode}"
+        );
+        assert_eq!(
+            ui.asked.len(),
+            usize::from(mode == ExecutionMode::Supervised),
+            "{mode}"
+        );
+        let result = tool_results(&ui.events);
+        assert_eq!(result[0].1, !written, "{mode}");
+    }
+}
+
+#[tokio::test]
+async fn only_full_access_can_override_policy_denials_and_file_boundaries() {
+    use gritt_core::session::ExecutionMode;
+    for mode in ExecutionMode::ALL {
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("outside.txt");
+        let fx = fixture_builder(
+            vec![
+                FixtureResponse::sse(tool_call_sse(
+                    native::FILE_WRITE,
+                    serde_json::json!({
+                        "path": path, "content": "written"
+                    }),
+                )),
+                FixtureResponse::sse(fixture("stream-text.sse")),
+                FixtureResponse::sse(tool_call_sse(
+                    native::FILE_WRITE,
+                    serde_json::json!({
+                        "path": "denied.txt", "content": "written"
+                    }),
+                )),
+                FixtureResponse::sse(fixture("stream-text.sse")),
+            ],
+            ApprovalMode::Ask,
+            Some(PolicyConfig {
+                rules: vec![],
+                fallback: PolicyOutcome::Deny,
+            }),
+        )
+        .await;
+        let mut agent = fx
+            .plane
+            .builder
+            .open(SessionSelector::Named("mode-test".into()), None, None, None)
+            .await
+            .unwrap();
+        agent.set_mode(mode).await.unwrap();
+        let mut ui = RecordingUi::default();
+        agent.run_turn("write outside", &mut ui).await.unwrap();
+        agent.run_turn("write inside", &mut ui).await.unwrap();
+        assert_eq!(path.exists(), mode == ExecutionMode::FullAccess, "{mode}");
+        assert_eq!(
+            fx.plane
+                .builder
+                .workspace
+                .root()
+                .join("denied.txt")
+                .exists(),
+            mode == ExecutionMode::FullAccess,
+            "{mode}"
+        );
+        assert!(ui.asked.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn leaving_full_access_restores_boundaries_and_resume_does_not_restore_elevation() {
+    use gritt_core::session::ExecutionMode;
+    let outside = tempfile::tempdir().unwrap();
+    let path = outside.path().join("outside.txt");
+    let fx = fixture_builder(
+        vec![
+            FixtureResponse::sse(tool_call_sse(
+                native::FILE_WRITE,
+                serde_json::json!({"path": path, "content": "no"}),
+            )),
+            FixtureResponse::sse(fixture("stream-text.sse")),
+        ],
+        ApprovalMode::Ask,
+        None,
+    )
+    .await;
+    let mut agent = fx
+        .plane
+        .builder
+        .open(SessionSelector::Named("mode-test".into()), None, None, None)
+        .await
+        .unwrap();
+    agent.set_mode(ExecutionMode::FullAccess).await.unwrap();
+    let resumed = fx
+        .plane
+        .builder
+        .open(SessionSelector::Named("mode-test".into()), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(resumed.mode(), ExecutionMode::Supervised);
+    agent.set_mode(ExecutionMode::AutoApprove).await.unwrap();
+    let mut ui = RecordingUi::default();
+    agent.run_turn("write outside", &mut ui).await.unwrap();
+    assert!(!path.exists());
+    assert!(tool_results(&ui.events)[0].1);
+}
+
+#[tokio::test]
+async fn planning_can_read_but_refuses_a_hallucinated_shell_call() {
+    use gritt_core::session::ExecutionMode;
+    let fx = fixture_builder(
+        vec![
+            FixtureResponse::sse(tool_call_sse(
+                native::FILE_READ,
+                serde_json::json!({"path":"README.md"}),
+            )),
+            FixtureResponse::sse(tool_call_sse(
+                native::SHELL,
+                serde_json::json!({"command":"echo should-not-run"}),
+            )),
+            FixtureResponse::sse(fixture("stream-text.sse")),
+        ],
+        ApprovalMode::ApproveAll,
+        None,
+    )
+    .await;
+    let mut agent = fx
+        .plane
+        .builder
+        .open(SessionSelector::Named("mode-test".into()), None, None, None)
+        .await
+        .unwrap();
+    agent.set_mode(ExecutionMode::Planning).await.unwrap();
+    let mut ui = RecordingUi::default();
+    agent.run_turn("inspect", &mut ui).await.unwrap();
+    let results = tool_results(&ui.events);
+    assert!(!results[0].1);
+    assert!(results[0].2.contains("# Readme"));
+    assert!(results[1].1);
+    assert!(results[1].2.contains("planning mode only allows file_read"));
+    assert!(ui.asked.is_empty());
+}
+
 fn fixture(name: &str) -> Vec<u8> {
     let path = format!(
         "{}/../gritt-provider/tests/fixtures/chat-completions/{name}",
@@ -58,6 +250,7 @@ fn config(policy: Option<PolicyConfig>) -> Config {
             base_url: "https://openrouter.ai/api/v1".into(),
             key: SecretRef::for_profile("openrouter", "OPENROUTER_API_KEY"),
             aliases: Default::default(),
+            fallback_model: None,
         },
     );
     config.default_profile = Some("openrouter".into());
@@ -173,7 +366,7 @@ fn tool_results(events: &[Event]) -> Vec<(String, bool, String)> {
 }
 
 #[tokio::test]
-async fn planning_turn_streams_text_without_tools_and_keeps_telemetry_content_free() {
+async fn planning_turn_offers_only_reading_and_keeps_telemetry_content_free() {
     let fx = fixture_builder(
         vec![FixtureResponse::sse(fixture("stream-text.sse"))],
         ApprovalMode::Ask,
@@ -195,7 +388,9 @@ async fn planning_turn_streams_text_without_tools_and_keeps_telemetry_content_fr
     assert_eq!(outcome.usage.input_tokens, Some(10));
     let request = fx.transport.requests().remove(0);
     let body = request.body_json().unwrap();
-    assert!(body.get("tools").is_none(), "planning sends no tools");
+    let tools = body["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["function"]["name"], "file_read");
     assert_eq!(body["messages"][0]["role"], "system");
     assert!(body["messages"][0]["content"]
         .as_str()
@@ -937,7 +1132,7 @@ async fn a_phase_change_sends_a_transition_note_on_the_next_turn() {
     agent.run_turn("keep going", &mut ui).await.unwrap();
     let requests = fx.transport.requests();
     let first = requests[0].body_json().unwrap();
-    assert!(first.get("tools").is_none());
+    assert_eq!(first["tools"].as_array().unwrap().len(), 1);
     let second = requests[1].body_json().unwrap();
     assert_eq!(second["tools"].as_array().unwrap().len(), 3);
     let user = second["messages"].as_array().unwrap().last().unwrap();
@@ -966,7 +1161,7 @@ async fn a_phase_change_sends_a_transition_note_on_the_next_turn() {
         .unwrap();
     resumed.run_turn("rethink", &mut ui).await.unwrap();
     let fourth = fx.transport.requests()[3].body_json().unwrap();
-    assert!(fourth.get("tools").is_none());
+    assert_eq!(fourth["tools"].as_array().unwrap().len(), 1);
     let user = fourth["messages"].as_array().unwrap().last().unwrap();
     assert!(user["content"]
         .as_str()
@@ -1025,7 +1220,7 @@ async fn a_phase_change_survives_exit_before_the_next_turn() {
     );
     drop(resumed);
 
-    // Once told, a later resume in the same phase sends no note.
+    // A later resume reasserts this run's authority, even in the same phase.
     let mut again = fx
         .plane
         .builder
@@ -1035,7 +1230,9 @@ async fn a_phase_change_survives_exit_before_the_next_turn() {
     again.run_turn("continue", &mut ui).await.unwrap();
     let third = fx.transport.requests()[2].body_json().unwrap();
     let user = third["messages"].as_array().unwrap().last().unwrap();
-    assert_eq!(user["content"], "continue");
+    let content = user["content"].as_str().unwrap();
+    assert!(content.contains("Mode: Supervised."));
+    assert!(content.ends_with("continue"));
 
     // An unknown told phase (a session from before the column existed)
     // is treated conservatively: the note goes out.
@@ -1470,9 +1667,9 @@ async fn repl_runs_a_scripted_session_end_to_end() {
     .unwrap();
     let stdout = out.contents();
     let stderr = err.contents();
-    assert!(stdout.contains("[first plan] > "));
+    assert!(stdout.contains("[first planning] > "));
     assert!(stdout.contains("phase: coding"));
-    assert!(stdout.contains("[first code] > "));
+    assert!(stdout.contains("[first supervised] > "));
     assert_eq!(stdout.matches("Hello, world").count(), 3, "{stdout}");
     assert!(stdout.contains("resumed `first`"));
     assert!(stdout.contains("  1  plan this"));
@@ -1502,7 +1699,13 @@ async fn repl_runs_a_scripted_session_end_to_end() {
     assert_eq!(agent.phase(), Phase::Coding);
     let requests = fx.transport.requests();
     assert_eq!(requests.len(), 5);
-    assert!(requests[0].body_json().unwrap().get("tools").is_none());
+    assert_eq!(
+        requests[0].body_json().unwrap()["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     assert!(requests[1].body_json().unwrap()["tools"].is_array());
     let stored = fx
         .plane
@@ -1635,6 +1838,7 @@ async fn two_profile_builder(dir: &std::path::Path) -> AgentBuilder {
             base_url: "https://other.example/v1".into(),
             key: SecretRef::for_profile("other", "OTHER_API_KEY"),
             aliases: Default::default(),
+            fallback_model: None,
         },
     );
     config.aliases.insert("fast".into(), "other/model-x".into());

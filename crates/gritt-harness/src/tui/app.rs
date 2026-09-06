@@ -133,6 +133,7 @@ pub enum Action {
     Cancel,
     Quit,
     SetPhase(Phase),
+    SetMode(gritt_core::session::ExecutionMode),
     Resume(SessionId),
     Approve(ApprovalDecision),
     RefreshSessions,
@@ -241,6 +242,7 @@ pub enum Work {
 /// Which searchable list an overlay is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
+    Mode,
     Commands,
     Connect,
     Models,
@@ -473,6 +475,7 @@ impl SetupForm {
             base_url,
             key: SecretRef::for_profile(&name, &env_var),
             aliases: Default::default(),
+            fallback_model: None,
         })
     }
 
@@ -591,6 +594,10 @@ pub struct App {
     pub clipboard: Option<String>,
     // Session-draft state the pickers read and write.
     pub draft: SessionDraft,
+    /// The last successful session's effort, shown as the selection while
+    /// the draft names none. It stays out of the draft so the resolver can
+    /// return it to the provider default where the model cannot take it.
+    pub remembered_effort: Option<ReasoningEffort>,
     pub profiles: Vec<ProfileSummary>,
     pub agents: Vec<AgentSummary>,
     pub catalog: ModelCatalogView,
@@ -639,7 +646,7 @@ pub struct App {
     /// catalog reports them. Cost is shown only when both halves and the
     /// reported usage exist, and it is always labelled an estimate.
     pricing: Option<(f64, f64)>,
-    assistant_open: bool,
+    stream_open: Option<EntryKind>,
     revision: u64,
     cache: RefCell<LayoutCache>,
     /// What the last frame measured: wrapped transcript lines, the height
@@ -694,6 +701,7 @@ impl App {
             suggestions_dismissed: false,
             clipboard: None,
             draft: SessionDraft::default(),
+            remembered_effort: None,
             profiles: Vec::new(),
             agents: Vec::new(),
             catalog: ModelCatalogView::default(),
@@ -709,7 +717,7 @@ impl App {
             pricing: None,
             pending_writes: std::collections::BTreeMap::new(),
             observed_writes: Vec::new(),
-            assistant_open: false,
+            stream_open: None,
             revision: 0,
             cache: RefCell::new(LayoutCache::default()),
             metrics: Cell::new(Metrics::default()),
@@ -861,12 +869,14 @@ impl App {
 
     pub fn push(&mut self, kind: EntryKind, text: impl Into<String>) {
         self.entries.push(Entry::new(kind, text));
-        self.assistant_open = kind == EntryKind::Assistant;
+        self.stream_open =
+            matches!(kind, EntryKind::Assistant | EntryKind::Reasoning).then_some(kind);
         self.touch();
     }
 
     fn push_entry(&mut self, entry: Entry) {
-        self.assistant_open = entry.kind == EntryKind::Assistant;
+        self.stream_open =
+            matches!(entry.kind, EntryKind::Assistant | EntryKind::Reasoning).then_some(entry.kind);
         self.entries.push(entry);
         self.touch();
     }
@@ -884,7 +894,7 @@ impl App {
         for event in events {
             self.on_event(event);
         }
-        self.assistant_open = false;
+        self.stream_open = None;
         self.running = false;
         self.follow = true;
         self.top = 0;
@@ -893,17 +903,21 @@ impl App {
 
     pub fn on_event(&mut self, event: &Event) {
         match &event.kind {
-            EventKind::TextDelta { text } => {
-                if self.assistant_open {
+            EventKind::TextDelta { text } | EventKind::ReasoningSummary { text } => {
+                let kind = if matches!(event.kind, EventKind::ReasoningSummary { .. }) {
+                    EntryKind::Reasoning
+                } else {
+                    EntryKind::Assistant
+                };
+                if self.stream_open == Some(kind) {
                     if let Some(last) = self.entries.last_mut() {
                         last.text.push_str(&sanitize(text));
                     }
                     self.touch();
                 } else {
-                    self.push(EntryKind::Assistant, text.clone());
+                    self.push(kind, text.clone());
                 }
             }
-            EventKind::ReasoningSummary { text } => self.push(EntryKind::Reasoning, text.clone()),
             EventKind::ToolCall { call } => {
                 // A write is remembered, not reported: only its result
                 // proves the file changed, and the plan forbids claiming
@@ -998,11 +1012,11 @@ impl App {
                     status,
                     SessionStatus::Finished | SessionStatus::Failed | SessionStatus::Idle
                 ) {
-                    self.assistant_open = false;
+                    self.stream_open = None;
                 }
             }
             EventKind::Error { message, .. } => self.push(EntryKind::Error, message.clone()),
-            EventKind::Completed { .. } => self.assistant_open = false,
+            EventKind::Completed { .. } => self.stream_open = None,
             EventKind::Cancelled => self.push(EntryKind::System, "cancelled"),
         }
         if let Some(warning) = event
@@ -1239,7 +1253,7 @@ impl App {
             .with_status(status)
     }
 
-    /// The effort picker: `Model default` plus only the levels the
+    /// The effort picker: `Provider default` plus only the levels the
     /// adapter has a verified mapping for on this model.
     pub fn effort_picker(&self) -> Picker {
         let protocol = self
@@ -1254,10 +1268,14 @@ impl App {
             .as_deref()
             .and_then(|id| self.catalog.models.iter().find(|model| model.id == id))
             .map(|model| &model.capabilities);
-        let selected = self.draft.effort.unwrap_or_default();
-        let mut rows = vec![PickerRow::new("auto", "Model default")
+        let selected = self
+            .draft
+            .effort
+            .or(self.remembered_effort)
+            .unwrap_or_default();
+        let mut rows = vec![PickerRow::new("auto", "Provider default")
             .detail("no explicit effort is sent")
-            .badge("auto")
+            .badge("default")
             .current(selected == ReasoningEffort::Auto)];
         for level in ReasoningEffort::EXPLICIT {
             let mut row = PickerRow::new(level.as_str(), level.as_str())
@@ -1422,10 +1440,53 @@ impl App {
         Picker::new("Commands", rows).with_hint("The same registry as / and the shortcuts")
     }
 
+    fn mode_picker(&self) -> Picker {
+        use gritt_core::session::ExecutionMode;
+        Picker::new(
+            "Execution mode",
+            ExecutionMode::ALL
+                .into_iter()
+                .map(|mode| {
+                    PickerRow::new(mode.as_str(), mode.label())
+                        .detail(match mode {
+                            ExecutionMode::Planning => "Read files only. No writes, shell, or MCP.",
+                            ExecutionMode::Supervised => {
+                                "Use configured policy and approval prompts."
+                            }
+                            ExecutionMode::AutoApprove => {
+                                "Approve prompts. Keep denials and file limits."
+                            }
+                            ExecutionMode::FullAccess => {
+                                "Files anywhere; commands without policy checks."
+                            }
+                        })
+                        .current(
+                            self.status
+                                .phase
+                                .parse::<ExecutionMode>()
+                                .unwrap_or_default()
+                                == mode,
+                        )
+                })
+                .collect(),
+        )
+        .with_hint("Between turns. Resume resets elevated access.")
+    }
+
+    pub fn set_effective_mode(&mut self, mode: Option<gritt_core::session::ExecutionMode>) {
+        self.draft.mode = mode;
+        if let Some(mode) = mode {
+            self.draft.phase = Some(mode.phase());
+            self.status.phase = mode.as_str().into();
+            self.sidebar.session.phase = Some(mode.label().into());
+        }
+    }
+
     // -- command dispatch ----------------------------------------------
 
     fn open_picker(&mut self, kind: PickerKind) {
         let picker = match kind {
+            PickerKind::Mode => self.mode_picker(),
             PickerKind::Commands => self.command_picker(),
             PickerKind::Connect => self.connection_picker(),
             PickerKind::Models => self.model_picker(),
@@ -1482,12 +1543,25 @@ impl App {
         // say so rather than pretending to change anything.
         if let (Some(id), true) = (self.connector, is_native_setting(cmd)) {
             self.notice = Some(format!(
-                "this session runs on {}; its model and effort are managed by the agent",
+                "this session runs on {}; its model, effort, and permissions are managed by the agent",
                 id.as_str()
             ));
             return Action::None;
         }
         match cmd {
+            Command::Mode => {
+                if let Some(argument) = argument {
+                    return match argument.parse() {
+                        Ok(mode) => Action::SetMode(mode),
+                        Err(reason) => {
+                            self.notice = Some(reason);
+                            Action::None
+                        }
+                    };
+                }
+                self.open_picker(PickerKind::Mode);
+                Action::None
+            }
             Command::Connect => {
                 self.open_picker(PickerKind::Connect);
                 Action::None
@@ -1661,6 +1735,27 @@ impl App {
         }
         if !self.overlays.is_empty() {
             return self.overlay_key(key);
+        }
+        // Terminals report Shift+Tab as BackTab or as Tab with SHIFT.
+        if !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && (key.code == KeyCode::BackTab
+                || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT)))
+        {
+            use gritt_core::session::ExecutionMode;
+            let next = match self
+                .status
+                .phase
+                .parse::<ExecutionMode>()
+                .unwrap_or_default()
+            {
+                ExecutionMode::Planning => ExecutionMode::Supervised,
+                ExecutionMode::Supervised => ExecutionMode::AutoApprove,
+                ExecutionMode::AutoApprove => ExecutionMode::FullAccess,
+                ExecutionMode::FullAccess => ExecutionMode::Planning,
+            };
+            return self.dispatch(Command::Mode, Some(next.as_str().into()));
         }
         if !self.suggestions().is_empty() {
             if let Some(action) = self.suggestion_key(key) {
@@ -2003,7 +2098,7 @@ impl App {
                     Ok(effort) => {
                         self.draft.effort = Some(effort);
                         self.status.effort = effort;
-                        self.sidebar.model.effort = Some(effort.as_str().to_owned());
+                        self.sidebar.model.effort = Some(effort.label().to_owned());
                         // Effort is a session setting and can change
                         // between turns, so a live session persists it
                         // rather than waiting for a new one.
@@ -2014,6 +2109,10 @@ impl App {
                     }
                     Err(_) => Action::None,
                 }
+            }
+            PickerKind::Mode => {
+                self.overlays.pop();
+                self.dispatch(Command::Mode, Some(id))
             }
             PickerKind::Sessions => {
                 self.overlays.pop();
@@ -2188,7 +2287,7 @@ impl App {
         if !still_valid {
             self.draft.effort = Some(ReasoningEffort::Auto);
             self.status.effort = ReasoningEffort::Auto;
-            self.sidebar.model.effort = Some("auto".into());
+            self.sidebar.model.effort = Some(ReasoningEffort::Auto.label().into());
             let explanation = format!(
                 "effort returned to the model default: {effort} is not available on this model"
             );
@@ -2279,10 +2378,6 @@ impl App {
             // Tab can never park the keyboard on a hidden sidebar.
             (KeyCode::Tab, _) => {
                 self.focus = self.next_focus(true);
-                Action::None
-            }
-            (KeyCode::BackTab, _) => {
-                self.focus = self.next_focus(false);
                 Action::None
             }
             (KeyCode::Enter, _) => {
@@ -2411,7 +2506,7 @@ impl App {
                 self.composer.clear();
                 self.push(EntryKind::User, prompt.clone());
                 self.running = true;
-                self.assistant_open = false;
+                self.stream_open = None;
                 self.follow_latest();
                 Action::Submit(prompt)
             }
@@ -2704,16 +2799,15 @@ impl App {
         }));
     }
 
+    /// Startup notes as transcript lines. A skipped profile is the one
+    /// note that is also raised as a notice, because the session runs on
+    /// a provider other than the one the draft named.
     pub fn show_draft_warnings(&mut self, warnings: &[DraftWarning]) {
         for warning in warnings {
-            let text = match warning {
-                DraftWarning::ModelNotInCatalog { profile, model } => {
-                    format!("{model} is not in {profile}'s list; its capabilities are unreported")
-                }
-                DraftWarning::DeprecatedModelRemapped { from, to } => {
-                    format!("{from} is deprecated; using {to}")
-                }
-            };
+            let text = warning.to_string();
+            if let DraftWarning::ProfileSkipped(_) = warning {
+                self.notice = Some(text.clone());
+            }
             self.push(EntryKind::System, text);
         }
     }
@@ -2779,7 +2873,7 @@ impl App {
         match effort {
             Some(effort) => {
                 self.status.effort = effort;
-                self.sidebar.model.effort = Some(effort.as_str().to_owned());
+                self.sidebar.model.effort = Some(effort.label().to_owned());
                 self.draft.effort = Some(effort);
             }
             None => self.sidebar.model.effort = None,
@@ -2805,6 +2899,7 @@ impl App {
             return;
         };
         let rows = match kind {
+            PickerKind::Mode => self.mode_picker(),
             PickerKind::Models => self.model_picker(),
             PickerKind::Effort => self.effort_picker(),
             PickerKind::Connect => self.connection_picker(),
@@ -2843,7 +2938,7 @@ impl App {
                 self.status.effort = *effort;
                 self.sidebar.model.backend = Some(provider_profile.clone());
                 self.sidebar.model.model = Some(model.clone());
-                self.sidebar.model.effort = Some(effort.as_str().to_owned());
+                self.sidebar.model.effort = Some(effort.label().to_owned());
                 self.sidebar.model.managed_by_agent = false;
                 self.connector = None;
                 // A session with stored history is pinned to the provider
@@ -2874,6 +2969,7 @@ fn changes_settings(command: Command) -> bool {
         Command::Connect
             | Command::Models
             | Command::Effort
+            | Command::Mode
             | Command::Plan
             | Command::Code
             | Command::New
@@ -2885,7 +2981,7 @@ fn changes_settings(command: Command) -> bool {
 fn is_native_setting(command: Command) -> bool {
     matches!(
         command,
-        Command::Connect | Command::Models | Command::Effort
+        Command::Connect | Command::Models | Command::Effort | Command::Mode
     )
 }
 
@@ -2947,6 +3043,17 @@ pub fn describe_draft_error(error: &DraftError) -> (String, String) {
         DraftError::OtherWorkspace { name, workspace } => (
             "That session belongs to another workspace".into(),
             format!("`{name}` was created in {}. Sessions do not move between workspaces.", workspace.display()),
+        ),
+        DraftError::NoUsableProfile { skipped } => (
+            "No provider could start the session".into(),
+            format!(
+                "Every profile in the fallback order was skipped:\n{}\n/connect lists the profiles; keys and endpoints are checked again on the next prompt.",
+                skipped
+                    .iter()
+                    .map(|entry| format!("  {entry}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
         ),
     }
 }

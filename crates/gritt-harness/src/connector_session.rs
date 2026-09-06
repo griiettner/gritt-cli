@@ -248,6 +248,7 @@ impl ConnectorSession {
         };
         let answer = match self.approval {
             ApprovalMode::ApproveAll => ApprovalDecision::Approved,
+            ApprovalMode::FullAccess => ApprovalDecision::Denied,
             ApprovalMode::DenyAll => ApprovalDecision::Denied,
             ApprovalMode::Ask => {
                 let cancel = self.cancel.clone();

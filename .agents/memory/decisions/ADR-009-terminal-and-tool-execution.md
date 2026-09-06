@@ -28,10 +28,35 @@ continuation. The full-screen mode adds streamed transcript, tool activity,
 multiline input, status, approvals, diff review, cancellation, command
 palette, and task views.
 
-Native tools are workspace-bounded file read and write plus shell execution.
+Native tools are workspace-bounded file read and write plus shell execution by default.
 The policy engine returns `allow`, `ask`, or `deny` based on tool and resource,
 with workspace-aware wildcard rules, before every native execution. Child
 processes are tracked and cancellation terminates them.
+
+## Execution modes (2026-09-06)
+
+The user requested four native modes, shared by print, REPL, and the TUI.
+
+- Planning exposes only `file_read` inside the workspace. The execution gate
+  rejects writes, shell calls, and MCP calls even if a provider emits them.
+- Supervised follows configured policy and asks through the interface for
+  `ask` outcomes. A non-interactive interface denies unanswered prompts.
+- Auto Approve accepts `ask` outcomes while preserving `deny` and workspace
+  file boundaries.
+- Full Access is an explicit override in the policy engine. It permits
+  otherwise denied native and discovered MCP calls and file access outside
+  the workspace, subject to OS permissions. MCP server trust, tool identity
+  checks, secret redaction, and cancellation still apply.
+
+`ExecutionMode` is a core value. The native driver owns its application;
+interfaces select it only between turns. Modes derive the persisted planning
+or coding phase. Elevated authority is not restored from history. A launch
+flag or a new mode selection is required, and resumed provider history is
+told the effective mode before the next turn. External connectors retain
+their own permission controls and refuse the native mode picker.
+
+The alternative of storing elevated authority on the session was rejected
+because resuming a transcript should not silently enable Full Access.
 
 ## Rationale
 

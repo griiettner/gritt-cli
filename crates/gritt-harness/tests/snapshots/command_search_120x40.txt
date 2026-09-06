@@ -2,13 +2,13 @@
 
 ## text
 
- api-cleanup  coding  /work/gritt  fixture
+ api-cleanup  supervised  /work/gritt  fixture
  you   Tidy the public API of the store module.                                          │ Gritt 0.1.0
                                                                                          │
  think Reading the module, then the callers.                                             │ Session
                       ╭ Commands ────────────────────────────────────────────────────────────────╮i-cleanup
  gritt I read `store/m│› se▏                                                                     │ork/gritt
-       the crate uses.│The same registry as / and the shortcuts                                  │oding
+       the crate uses.│The same registry as / and the shortcuts                                  │pervised
        世界 renders at│  /connect                                                                │reaming
                       │    Choose an AI provider or an installed agent                           │
  tool  -> file_read st│  /models                                                                 │
@@ -19,18 +19,18 @@
                       │    Switch to the planning phase                                          │
                       │  /code                                                                   │480
                       │    Switch to the coding phase                                            │10
-                      │  /sessions                                                      [Ctrl-S] │00 in, last request
-                      │    Search and resume sessions for this workspace                         │ of context
-                      │  /new                                                                    │
-                      │    Start a fresh draft without deleting the current session              │
-                      │  /details                                                                │0.0412
-                      │    Expand or collapse tool output                                        │is session, listed p
-                      │  /sidebar                                                                │
-                      │    Toggle the session information sidebar                                │ files
-                      │  /mcp                                                                    │s/gritt-harness/src/
-                      │    Inspect configured MCP servers and their tools                        │ied
-                      │                                                                          │E.md
-                      │                                                                          │ied (pre-existing)
+                      │  /mode                                                       [Shift+Tab] │00 in, last request
+                      │    Choose Planning, Supervised, Auto Approve, or Full Access             │ of context
+                      │  /sessions                                                      [Ctrl-S] │
+                      │    Search and resume sessions for this workspace                         │
+                      │  /new                                                                    │0.0412
+                      │    Start a fresh draft without deleting the current session              │is session, listed p
+                      │  /details                                                                │
+                      │    Expand or collapse tool output                                        │ files
+                      │  /sidebar                                                                │s/gritt-harness/src/
+                      │    Toggle the session information sidebar                                │ied
+                      │  /mcp                                                                    │E.md
+                      │    Inspect configured MCP servers and their tools                        │ied (pre-existing)
                       │                                                                          │
                       │                                                                          │tions
                       │                                                                          │ed by Gritt

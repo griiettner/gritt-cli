@@ -2,7 +2,7 @@
 
 ## text
 
- api-cleanup  coding  fixture
+ api-cleanup  supervised  fixture
  you   Tidy the public API of the store module.
  ╭ Help ──────────────────────────────────────────────────────────────────────╮
  │Commands                                                                    │
@@ -11,6 +11,8 @@
  │ /effort     Choose the reasoning effort for native turns                   │
  │ /plan       Switch to the planning phase                                   │
  │ /code       Switch to the coding phase                                     │
+ │ /mode       Choose Planning, Supervised, Auto Approve, or Full Access      │
+ │[Shift+Tab]                                                                 │
  │ /sessions   Search and resume sessions for this workspace  [Ctrl-S]        │
  │ /new        Start a fresh draft without deleting the current session       │
  │ /details    Expand or collapse tool output                                 │
@@ -20,8 +22,6 @@
  │ /quit       Leave Gritt and restore the terminal  [Ctrl-Q]                 │
  │                                                                            │
  │Keys                                                                        │
- │ Enter                     send the prompt                                  │
- │ Ctrl-J / Shift-Enter      insert a newline                                 │
  ╰ j/k scrolls · Esc closes ──────────────────────────────────────────────────╯
  │Ask Gritt to do something…                                                  │
  ╰────────────────────────────────────────────────────────────────────────────╯

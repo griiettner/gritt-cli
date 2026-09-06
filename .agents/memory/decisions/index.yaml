@@ -73,6 +73,7 @@ memories:
       - adding a config value
       - loading or storing a provider key
       - changing model-list refresh behavior
+      - changing how a new session picks its profile, model, or effort
   - id: ADR-009
     title: Terminal interface and tool execution
     file: ADR-009-terminal-and-tool-execution.md

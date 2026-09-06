@@ -2,14 +2,14 @@
 
 ## text
 
- api-cleanup  coding  /work/gritt  fixture
+ api-cleanup  supervised  /work/gritt  fixture
  you   Tidy the public API of the store module.                                          │ Gritt 0.1.0
                                                                                          │
  think Reading the module, then the callers.                                             │ Session
                               ╭ Effort ──────────────────────────────────────────────────╮ name api-cleanup
  gritt I read `store/mod.rs` a│› ▏                                                       │ dir  /work/gritt
-       the crate uses. I will │Effort applies to native turns and can change between them│ phase coding
-       世界 renders at its rea│  Model default                                    [auto] │ now  streaming
+       the crate uses. I will │Effort applies to native turns and can change between them│ mode Supervised
+       世界 renders at its rea│  Provider default                              [default] │ now  streaming
                               │    no explicit effort is sent                            │
  tool  -> file_read store/mod.│  low                                               [low] │ Model
                               │● medium                                         [medium] │ via  openai

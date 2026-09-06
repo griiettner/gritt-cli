@@ -11,7 +11,7 @@ use gritt_core::provider::{ModelListStatus, Protocol};
 use gritt_core::secret::Secret;
 use gritt_core::ErrorKind;
 use gritt_provider::adapter::{CapabilitySource, KeyProvider, StaticKey};
-use gritt_provider::models::{load_models, ModelCache, ModelCatalog};
+use gritt_provider::models::{load_models, probe_models, ModelCache, ModelCatalog};
 use gritt_provider::{FixtureResponse, FixtureTransport};
 
 fn keys() -> Arc<dyn KeyProvider> {
@@ -286,4 +286,57 @@ async fn a_failed_first_fetch_is_not_retried_until_the_interval_passes() {
     // Forcing bypasses the throttle.
     let _ = load_models(&cache, &transport, &*keys, &profile, &policy, soon, true).await;
     assert_eq!(transport.request_count(), 2);
+}
+
+#[tokio::test]
+async fn a_probe_fetches_live_and_reports_the_raw_failure_without_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ModelCache::new(dir.path());
+    let keys = keys();
+    let profile = profile(Protocol::ChatCompletions);
+    let now = Utc::now();
+    let transport = FixtureTransport::new(
+        [
+            FixtureResponse::json(200, fixture("chat-completions", "models.json")),
+            FixtureResponse::json(
+                401,
+                format!(r#"{{"error":{{"message":"invalid key {TEST_KEY}"}}}}"#),
+            ),
+        ],
+        32,
+    );
+    let fresh = probe_models(&cache, &transport, &*keys, &profile, now)
+        .await
+        .unwrap();
+    assert!(matches!(fresh.status, ModelListStatus::Fresh { fetched_at } if fetched_at == now));
+    assert!(!fresh.models.is_empty());
+
+    // A second probe a minute later fetches again: the interval does not
+    // apply to a probe. The failure comes back as the provider's own
+    // error, key-redacted, and the cached list survives it.
+    let error = probe_models(
+        &cache,
+        &transport,
+        &*keys,
+        &profile,
+        now + Duration::minutes(1),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Provider);
+    assert_eq!(error.diagnostic.as_ref().unwrap()["status"], 401);
+    assert!(!error.message.contains(TEST_KEY));
+    assert!(!format!("{:?}", error.diagnostic).contains(TEST_KEY));
+    assert_eq!(transport.request_count(), 2);
+    let cached = cache.read(&profile.name).unwrap().unwrap();
+    assert_eq!(cached.fetched_at, Some(now));
+    assert_eq!(cached.last_attempt_at, Some(now + Duration::minutes(1)));
+    assert_eq!(cached.models, fresh.models);
+
+    // With nothing queued the failure is a transport error with no status.
+    let error = probe_models(&cache, &transport, &*keys, &profile, now)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Provider);
+    assert!(error.diagnostic.is_none());
 }

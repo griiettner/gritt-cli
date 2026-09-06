@@ -47,6 +47,7 @@ pub fn profile(protocol: Protocol) -> ProviderProfile {
         base_url: base_url.into(),
         key: SecretRef::for_profile(name, var),
         aliases: Default::default(),
+        fallback_model: None,
     }
 }
 
@@ -202,6 +203,7 @@ pub fn chat_profiles() -> Vec<ProviderProfile> {
         base_url: base_url.into(),
         key: SecretRef::for_profile(name, var),
         aliases: Default::default(),
+        fallback_model: None,
     })
     .collect()
 }

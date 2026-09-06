@@ -9,11 +9,11 @@
 
 
 
-                                        ▟█████▙  ▗█▙  ▗█▙  █▄▄▄▄  █▄▄▄▄  ▗█▙  ▗█▙
-                                       ▟█▛▘      ▐█▌  ▐█▌  █▌  █  █▌  █    ██▛▛
-                                       ██▌  ▟██  ▐█████▛▌  █▛▀▀   █▛▀▀      ██
-                                       ▜█▙   █▌  ▐█▌  ▐█▌  █▌     █▌        ██
-                                        ▜█████▛  ▐█▌  ▐█▌  █▌     █▌        ██
+                                            ▟█████▙          ▄▄    ██     ██
+                                           ▟█▛▘      ▐█▟█▙       █████  █████
+                                           ██▌  ▟██  ▐█▛     ██    ██     ██
+                                           ▜█▙   █▌  ▐█▌     ██    ██     ██
+                                            ▜█████▛  ▐█▌     ██    ▀██▙   ▀██▙
 
                                               Use /connect to get started.
 
@@ -26,14 +26,14 @@
                │ /effort     Choose the reasoning effort for native turns                               │
                │ /plan       Switch to the planning phase                                               │
                │ /code       Switch to the coding phase                                                 │
+               │ /mode       Choose Planning, Supervised, Auto Approve, or Full Access                  │
                │ /sessions   Search and resume sessions for this workspace                              │
                │ /new        Start a fresh draft without deleting the current session                   │
                │ /details    Expand or collapse tool output                                             │
                │ /mcp        Inspect configured MCP servers and their tools                             │
                │ /help       Show commands, keys, and current limitations                               │
                ╰────────────────────────────────────────────────────────────────────────────────────────╯
-                           /work/gritt  ·  not connected  ·  effort auto  ·  plan  ·  fixture
-
+                     /work/gritt  ·  not connected  ·  effort provider default  ·  plan  ·  fixture
 
 
 

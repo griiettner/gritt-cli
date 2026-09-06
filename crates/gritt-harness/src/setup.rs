@@ -282,6 +282,7 @@ mod tests {
             base_url: base_url.into(),
             key: SecretRef::for_profile(name, var),
             aliases: Default::default(),
+            fallback_model: None,
         }
     }
 

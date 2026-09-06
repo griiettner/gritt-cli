@@ -13,6 +13,7 @@ pub enum Command {
     Connect,
     Models,
     Effort,
+    Mode,
     Plan,
     Code,
     Sessions,
@@ -85,6 +86,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         summary: "Switch to the coding phase",
         shortcut: None,
+    },
+    CommandSpec {
+        command: Command::Mode,
+        name: "mode",
+        aliases: &["permissions"],
+        summary: "Choose Planning, Supervised, Auto Approve, or Full Access",
+        shortcut: Some("Shift+Tab"),
     },
     CommandSpec {
         command: Command::Sessions,
@@ -227,6 +235,7 @@ mod tests {
     #[test]
     fn every_command_has_one_row_and_resolves_by_name_and_alias() {
         let all = [
+            Command::Mode,
             Command::Connect,
             Command::Models,
             Command::Effort,

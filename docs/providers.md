@@ -45,6 +45,72 @@ such as `anthropic-version` and OpenRouter attribution stay inside the
 adapter. Nothing above an adapter learns which provider served a request;
 provider-specific fields travel only as diagnostic metadata on events.
 
+## Startup failover
+
+A new native session tries the default profile first, then the profiles in
+`fallback_profiles`, in order, and starts on the first one that is usable:
+
+```toml
+default_profile = "openrouter"
+default_model = "openai/gpt-5-nano"
+fallback_profiles = ["anthropic", "openai"]
+
+[profiles.anthropic]
+# ...
+fallback_model = "claude-sonnet-5"
+```
+
+A profile that is not configured, or one listed twice (the default counts),
+fails at load. `GRITT_FALLBACK_PROFILES` is the environment form, a
+comma-separated list that a config file's own list replaces.
+
+With a chain of more than one profile, each candidate is checked before the
+session opens: its key must resolve, `GET /models` must answer (fetched
+live, whatever the refresh interval says), and the model must be in the
+list. A missing key, a 401 or 403, a connection failure, another provider
+error, or an absent model moves startup to the next profile. A fallback
+profile tries the requested model, then its `fallback_model`, then the
+configured default model, and takes the first one its list contains; without
+a `fallback_model` it needs a list to check against. Every skipped profile
+is reported with its failure class, in print and REPL mode on stderr and in
+the full-screen mode as a notice and a transcript line, followed by the
+profile and model the session runs on. Key values never appear in those
+lines. When nothing is usable the error names every profile and its class.
+
+A profile you chose yourself, with `--profile`, a qualified model name, or
+the `/connect` picker, is pinned: startup does not move away from it, and
+it is loaded the way it always was. On the command line a qualified model
+name or global alias names its own profile and wins over `--profile`, as
+alias resolution always has, unless the hinted profile's list carries that
+id; in the full-screen mode a model from another profile is refused under
+the picked profile so the selection can be cleared. The same rules hold
+when no `fallback_profiles` are configured, so a configuration without the
+field keeps its behaviour, a missing key included: it is reported on the
+first request as before.
+
+Failover is a startup decision. A running session never changes provider
+mid-turn, and a resumed session keeps the profile and model its transcript
+was produced under whatever the default or fallback order is now.
+
+## Remembered choices
+
+The profile, model, and effort of the last new native session that
+completed a turn are remembered per workspace in the local database, and
+fill whatever a later new session leaves unspecified. For each field the
+order is: the flag or picker choice, the remembered value, then the
+configured default. So `default_profile` and `default_model` are where a
+workspace starts before any session has completed, and what it returns to
+when the remembered profile is removed from the configuration; after that
+the last session's choices carry forward until a flag or picker names
+something else. A remembered effort the selected model cannot take returns
+to the provider default with a note. The remembered model applies only
+under the profile it was chosen on.
+
+`--effort auto|low|medium|high` sets the effort for a new session on the
+command line. Resumed sessions keep their own stored effort. Databases from
+before this table load unchanged and remember nothing until a session
+completes.
+
 ## Model lists and capabilities
 
 Each profile's model list is fetched from the provider (`GET /models`, or
@@ -53,6 +119,9 @@ directory (`gritt/models/`). Refresh happens at most once per day. When a
 refresh fails Gritt uses the last cached list and marks it stale; a failed
 refresh is not retried until the interval passes. With no cache and a failed
 fetch the model list is reported missing and capabilities are unreported.
+The one exception is a startup chain of more than one profile, which
+fetches the list live as its endpoint probe (see [Startup
+failover](#startup-failover)) and refreshes the cache with the answer.
 
 Capabilities recorded from the list: context length, tools, vision,
 structured output, reasoning, and pricing. These describe what Gritt parsed
@@ -68,7 +137,9 @@ profile's cache state.
 
 ## Reasoning effort
 
-Effort is provider-neutral in Gritt: `auto`, `low`, `medium`, or `high`. It
+Effort is provider-neutral in Gritt: `auto`, `low`, `medium`, or `high`. The
+`auto` value is shown in the interface as `provider default`; it does not
+adapt effort to task complexity. It
 is chosen with `/effort` in the full-screen mode, stored with a native
 session, and sent through the provider adapter. `auto` means Gritt sends no
 effort field at all, on every protocol, so it is always accepted.

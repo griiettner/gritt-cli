@@ -2,7 +2,7 @@
 //! through a session: stream events, persist them, gate every tool call
 //! through the policy engine, ask the interface when the policy says so,
 //! execute, submit results, and continue until the turn completes, fails,
-//! or is cancelled. Planning turns carry no tools; coding turns carry the
+//! or is cancelled. Planning turns carry file_read; coding turns carry the
 //! native tools.
 
 use std::collections::BTreeMap;
@@ -19,19 +19,22 @@ use gritt_core::event::{
 use gritt_core::policy::PolicyOutcome;
 use gritt_core::provider::{Message, PromptRequest, ReasoningEffort, RequestOptions, Role};
 use gritt_core::secret::Secret;
-use gritt_core::session::{BoxFuture, Phase, Session, SessionId, SessionKind, SessionStore};
+use gritt_core::session::{
+    BoxFuture, ExecutionMode, LastUsedNative, Phase, Session, SessionId, SessionKind, SessionStore,
+};
 use gritt_core::tool::{ToolCall, ToolResult};
 use gritt_core::{Error, ErrorKind, Result};
 use gritt_provider::adapter::{redact_text, redact_value, CapabilitySource, KeyProvider};
-use gritt_provider::alias;
 use gritt_provider::effort::{effort_support, EffortSupport};
 use gritt_provider::models::{load_models, ModelCache, ModelCatalog};
 use gritt_provider::transport::HttpTransport;
 use gritt_provider::{adapter_for, AdapterContext, CancellationToken};
 
+use crate::draft::{DraftError, DraftWarning};
 use crate::driver::EffortOutcome;
 use crate::mcp::{is_dispatch_name, McpRuntime, McpToolSet};
 use crate::policy::{Decision, PolicyEngine};
+use crate::startup::{StartupOutcome, StartupRequest};
 use crate::store::Store;
 use crate::telemetry::Telemetry;
 use crate::tools::{NativeTools, ProcessRegistry, Workspace};
@@ -43,6 +46,8 @@ pub enum ApprovalMode {
     Ask,
     /// Approve without asking. For scripts that accept the risk.
     ApproveAll,
+    /// Explicit unrestricted native tool authority for this run.
+    FullAccess,
     /// Deny without asking. The default when no terminal can answer.
     DenyAll,
 }
@@ -133,6 +138,14 @@ pub struct NativeAgent {
     /// content-log row the harness produces.
     secrets: Vec<Secret>,
     labels: BTreeMap<String, String>,
+    /// Whether this session was created in this run. Only such a session
+    /// records its profile, model, and effort as the workspace's last-used
+    /// choices; a resumed one leaves the record alone.
+    new_session: bool,
+    /// Whether the last-used record is behind the session's choices: set
+    /// at creation and again when the effort changes, cleared once a
+    /// completed turn has written the record.
+    remember_pending: bool,
 }
 
 /// Redacts every registered secret out of an event's text, arguments,
@@ -187,11 +200,11 @@ pub fn persisted_projection(mut event: Event) -> Event {
 pub fn phase_transition_note(phase: Phase) -> &'static str {
     match phase {
         Phase::Planning => {
-            "[Phase changed to planning. No tools are available now; discuss the task and propose a plan.]"
+            "[Phase changed to planning. Use file_read to inspect workspace files and propose a plan. Writes, shell, and MCP calls are disabled.]"
         }
         Phase::Coding => {
             "[Phase changed to coding. The tools file_read, file_write, and shell are now available. \
-             Paths are relative to the workspace root and the user approves writes and commands.]"
+             Paths are relative to the workspace root. Follow the current execution mode.]"
         }
     }
 }
@@ -248,6 +261,7 @@ impl NativeAgent {
         {
             *current = effort;
         }
+        self.remember_pending = self.new_session;
         let event = self.harness_event(
             EventKind::StatusChanged {
                 status: SessionStatus::Idle,
@@ -264,6 +278,36 @@ impl NativeAgent {
 
     pub fn set_approval_mode(&mut self, mode: ApprovalMode) {
         self.approval = mode;
+        self.tools
+            .set_full_access(mode == ApprovalMode::FullAccess && self.phase() == Phase::Coding);
+        self.sent_phase = None;
+    }
+
+    pub fn mode(&self) -> ExecutionMode {
+        if self.phase() == Phase::Planning {
+            return ExecutionMode::Planning;
+        }
+        match self.approval {
+            ApprovalMode::Ask | ApprovalMode::DenyAll => ExecutionMode::Supervised,
+            ApprovalMode::ApproveAll => ExecutionMode::AutoApprove,
+            ApprovalMode::FullAccess => ExecutionMode::FullAccess,
+        }
+    }
+
+    pub async fn set_mode(&mut self, mode: ExecutionMode) -> Result<()> {
+        self.set_phase(mode.phase()).await?;
+        self.set_approval_mode(match mode {
+            ExecutionMode::Planning | ExecutionMode::Supervised => ApprovalMode::Ask,
+            ExecutionMode::AutoApprove => ApprovalMode::ApproveAll,
+            ExecutionMode::FullAccess => ApprovalMode::FullAccess,
+        });
+        let event = self.harness_event(
+            EventKind::StatusChanged {
+                status: SessionStatus::Idle,
+            },
+            Some(serde_json::json!({ "mode": mode })),
+        );
+        self.store.append_events(vec![event]).await
     }
 
     pub fn handle(&self) -> CancelHandle {
@@ -282,8 +326,10 @@ impl NativeAgent {
         if self.session.phase == phase {
             return Ok(());
         }
-        self.session.phase = phase;
         self.store.set_phase(&self.session.id, phase).await?;
+        self.session.phase = phase;
+        self.tools
+            .set_full_access(phase == Phase::Coding && self.approval == ApprovalMode::FullAccess);
         let status = match phase {
             Phase::Planning => SessionStatus::Idle,
             Phase::Coding => SessionStatus::Idle,
@@ -352,14 +398,15 @@ impl NativeAgent {
         match self.session.phase {
             Phase::Planning => format!(
                 "You are Gritt, a coding agent working in {}. This is the planning phase: \
-                 discuss the task, ask questions, and propose a plan. No tools are available.",
+                 inspect workspace files with file_read, discuss the task, ask questions, and propose a plan. \
+                 Writes, shell commands, and MCP tools are disabled.",
                 self.tools.workspace().root().display()
             ),
             Phase::Coding => format!(
                 "You are Gritt, a coding agent working in {}. This is the coding phase. \
                  Use file_read, file_write, and shell to do the work. Paths are relative to the \
-                 workspace root. The user approves writes and commands.",
-                self.tools.workspace().root().display()
+                 workspace root. Mode: {}. {}",
+                self.tools.workspace().root().display(), self.mode().label(), self.mode().description()
             ),
         }
     }
@@ -381,8 +428,10 @@ impl NativeAgent {
             // model what changed rather than leaving it believing tools
             // are absent (or present).
             content = format!(
-                "{}\n\n{}",
+                "{} Mode: {}. {}\n\n{}",
                 phase_transition_note(self.session.phase),
+                self.mode().label(),
+                self.mode().description(),
                 prompt
             );
         }
@@ -394,9 +443,10 @@ impl NativeAgent {
             model,
             messages,
             tools: match self.session.phase {
-                // Planning keeps the existing no-tools behavior, MCP
-                // included, until a separate phase-policy decision.
-                Phase::Planning => Vec::new(),
+                Phase::Planning => NativeTools::definitions()
+                    .into_iter()
+                    .filter(|tool| tool.name == gritt_core::tool::native::FILE_READ)
+                    .collect(),
                 Phase::Coding => {
                     let mut tools = NativeTools::definitions();
                     tools.extend(self.mcp_tools.definitions().iter().cloned());
@@ -581,7 +631,38 @@ impl NativeAgent {
         );
         self.emit(ui, event).await?;
         self.record_turn(started_at, &outcome).await?;
+        if self.remember_pending && outcome.status == TurnStatus::Completed {
+            self.remember_choices().await;
+        }
         Ok(outcome)
+    }
+
+    /// Records the session's native choices as the workspace's last-used
+    /// preferences. A profile name, a model id, and an effort level: no
+    /// credential is involved. Best effort: the turn has already
+    /// completed and been shown, so a failed write is retried on the next
+    /// completed turn rather than reported as a failed turn.
+    async fn remember_choices(&mut self) {
+        let SessionKind::Native {
+            provider_profile,
+            model,
+            effort,
+        } = &self.session.kind
+        else {
+            return;
+        };
+        let written = self
+            .store
+            .set_last_used(
+                self.tools.workspace().root(),
+                &LastUsedNative {
+                    provider_profile: provider_profile.clone(),
+                    model: model.clone(),
+                    effort: *effort,
+                },
+            )
+            .await;
+        self.remember_pending = written.is_err();
     }
 
     async fn fail(
@@ -722,6 +803,11 @@ impl NativeAgent {
 
     /// Policy, approval, execution, and the events for one call.
     async fn handle_call(&mut self, ui: &mut dyn Ui, call: &ToolCall) -> Result<ToolResult> {
+        if self.phase() == Phase::Planning && call.name != gritt_core::tool::native::FILE_READ {
+            return self
+                .refuse_call(ui, call, "planning mode only allows file_read".into())
+                .await;
+        }
         let resource = match self.resource_for(call) {
             Ok(resource) => resource,
             Err(error) => {
@@ -730,7 +816,9 @@ impl NativeAgent {
                 return self.refuse_call(ui, call, error.message).await;
             }
         };
-        let decision = self.policy.evaluate(&call.name, &resource);
+        let decision = self
+            .policy
+            .evaluate_mode(&call.name, &resource, self.mode());
         let approved = match decision.outcome {
             PolicyOutcome::Allow => true,
             PolicyOutcome::Deny => {
@@ -787,7 +875,9 @@ impl NativeAgent {
                 );
                 self.emit(ui, event).await?;
                 let answer = match self.approval {
-                    ApprovalMode::ApproveAll => ApprovalDecision::Approved,
+                    ApprovalMode::ApproveAll | ApprovalMode::FullAccess => {
+                        ApprovalDecision::Approved
+                    }
                     ApprovalMode::DenyAll => ApprovalDecision::Denied,
                     ApprovalMode::Ask => {
                         // The wait races cancellation so Ctrl-C or Esc
@@ -861,6 +951,15 @@ fn add_usage(total: &mut Usage, usage: &Usage) {
     add(&mut total.output_tokens, usage.output_tokens);
     add(&mut total.reasoning_tokens, usage.reasoning_tokens);
     add(&mut total.cached_input_tokens, usage.cached_input_tokens);
+}
+
+/// A native session opened by the builder with the startup notes a new
+/// session produced. `catalog` is the model-list state the new session's
+/// choices were resolved against, `None` for a resumed session.
+pub struct NativeOpen {
+    pub agent: NativeAgent,
+    pub warnings: Vec<DraftWarning>,
+    pub catalog: Option<crate::draft::CatalogState>,
 }
 
 /// Which session a turn runs in.
@@ -937,27 +1036,14 @@ impl AgentBuilder {
         }
     }
 
-    /// Resolves `model` (alias, qualified, or bare) against the config and
-    /// catalog. Bare names use `profile_hint`, then the default profile.
-    pub fn resolve_model(
-        &self,
-        model: Option<&str>,
-        profile_hint: Option<&str>,
-    ) -> Result<(String, String)> {
-        let name = model
-            .map(str::to_owned)
-            .or_else(|| self.config.default_model.clone())
-            .ok_or_else(|| Error::config("no model given and no default_model configured"))?;
-        let resolved = alias::resolve(&self.config, &self.catalog, &name, profile_hint)?;
-        Ok((resolved.profile, resolved.model))
-    }
-
     /// The provider profile a session will actually run on: the resumed
     /// session's own profile when the selector names an existing native
-    /// session, else the profile the model name resolves to (qualified
-    /// name, alias, hint, or default). Callers warm the catalog for this
-    /// profile before opening, so capability and deprecation data belong
-    /// to the right provider. No side effects: the phase is left alone.
+    /// session, else the profile a new session starts on before any
+    /// failover (an explicit profile, the one a qualified model name or
+    /// global alias spells out, the configured default, or the last
+    /// successful session's). Callers warm the catalog for this profile
+    /// before opening, so capability and deprecation data belong to the
+    /// right provider. No side effects: the phase is left alone.
     pub async fn session_profile(
         &self,
         selector: &SessionSelector,
@@ -972,8 +1058,13 @@ impl AgentBuilder {
                 return Ok(provider_profile);
             }
         }
-        let (profile, _) = self.resolve_model(model, profile_hint)?;
-        Ok(profile)
+        let request = StartupRequest::from_flags(profile_hint, model, None);
+        let last_used = self.last_used().await?;
+        match self.primary_profile(&request, last_used.as_ref()) {
+            Some((profile, _)) if self.config.profiles.contains_key(&profile) => Ok(profile),
+            Some((profile, _)) => Err(DraftError::UnknownProfile { profile }.into_error()),
+            None => Err(DraftError::MissingProfile.into_error()),
+        }
     }
 
     /// Finds the session a selector names, checking that it belongs to
@@ -1027,7 +1118,9 @@ impl AgentBuilder {
     }
 
     /// Opens or creates the session and builds its agent. A new session
-    /// starts at `Auto` effort; the draft path sets an explicit one.
+    /// goes through the startup resolver with the flags as given, so it
+    /// gets the same failover and remembered choices as every mode; the
+    /// resolver's notes are dropped here, see [`AgentBuilder::open_with`].
     pub async fn open(
         &self,
         selector: SessionSelector,
@@ -1035,19 +1128,68 @@ impl AgentBuilder {
         model: Option<&str>,
         phase: Option<Phase>,
     ) -> Result<NativeAgent> {
-        match self.find_session(&selector, phase).await? {
-            Some(session) => self.agent_for(session).await,
-            None => {
-                let (profile_name, model_id) = self.resolve_model(model, profile)?;
-                self.create_native(
-                    &selector,
-                    profile_name,
-                    model_id,
-                    ReasoningEffort::Auto,
-                    phase,
-                )
-                .await
+        let opened = self
+            .open_with(
+                selector,
+                StartupRequest::from_flags(profile, model, None),
+                phase,
+            )
+            .await?;
+        Ok(opened.agent)
+    }
+
+    /// Opens or creates the session and builds its agent, with the
+    /// startup notes for a new session: skipped profiles, remembered
+    /// choices, model warnings, and the state of the model list it was
+    /// resolved against. A resumed session keeps its stored profile,
+    /// model, and effort and produces no notes.
+    pub async fn open_with(
+        &self,
+        selector: SessionSelector,
+        request: StartupRequest,
+        phase: Option<Phase>,
+    ) -> Result<NativeOpen> {
+        if let Some(session) = self.find_session(&selector, phase).await? {
+            return Ok(NativeOpen {
+                agent: self.agent_for(session).await?,
+                warnings: Vec::new(),
+                catalog: None,
+            });
+        }
+        self.start_native(&selector, request, phase).await
+    }
+
+    /// Creates a new session from a startup request, after the caller has
+    /// established that the selector names nothing yet. A rejected
+    /// request is the typed draft error as an [`Error`].
+    pub async fn start_native(
+        &self,
+        selector: &SessionSelector,
+        request: StartupRequest,
+        phase: Option<Phase>,
+    ) -> Result<NativeOpen> {
+        match self.resolve_startup(&request).await? {
+            StartupOutcome::Ready(selection) => {
+                let agent = self
+                    .create_native(
+                        selector,
+                        selection.profile,
+                        selection.model,
+                        selection.effort,
+                        phase,
+                    )
+                    .await?;
+                Ok(NativeOpen {
+                    agent,
+                    warnings: selection.warnings,
+                    catalog: Some(selection.catalog),
+                })
             }
+            StartupOutcome::Rejected { mut errors, .. } => Err(errors
+                .drain(..)
+                .next()
+                .unwrap_or(DraftError::MissingProfile)
+                .into_error()),
         }
     }
 
@@ -1080,7 +1222,10 @@ impl AgentBuilder {
             parent_id: None,
         };
         self.store.create(session.clone()).await?;
-        self.agent_for(session).await
+        let mut agent = self.agent_for(session).await?;
+        agent.new_session = true;
+        agent.remember_pending = true;
+        Ok(agent)
     }
 
     /// Builds the agent for a stored session. The phase the model was last
@@ -1135,13 +1280,14 @@ impl AgentBuilder {
             .values()
             .map(|profile| profile.key.env_var_name.clone())
             .collect();
-        let tools = NativeTools::new(self.workspace.clone(), ProcessRegistry::new())
+        let mut tools = NativeTools::new(self.workspace.clone(), ProcessRegistry::new())
             .with_blocked_env(blocked_env);
-        let sent_phase = if started {
-            self.store.told_phase(&session.id).await?
-        } else {
-            None
-        };
+        tools.set_full_access(
+            self.approval == ApprovalMode::FullAccess && session.phase == Phase::Coding,
+        );
+        // Authority belongs to this run, so resumed provider history must
+        // hear the current mode even if the persisted phase is unchanged.
+        let sent_phase = None;
         let labels = BTreeMap::from([
             ("profile".to_string(), provider_profile.clone()),
             ("model".to_string(), model.clone()),
@@ -1166,6 +1312,8 @@ impl AgentBuilder {
             sent_phase,
             secrets,
             labels,
+            new_session: false,
+            remember_pending: false,
         })
     }
 

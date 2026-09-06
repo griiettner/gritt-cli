@@ -180,6 +180,20 @@ impl PolicyEngine {
         &self.config
     }
 
+    pub fn evaluate_mode(
+        &self,
+        tool: &str,
+        resource: &Resource,
+        mode: gritt_core::session::ExecutionMode,
+    ) -> Decision {
+        let mut decision = self.evaluate(tool, resource);
+        if mode == gritt_core::session::ExecutionMode::FullAccess {
+            decision.outcome = PolicyOutcome::Allow;
+            decision.reason = "full access selected for this run".into();
+        }
+        decision
+    }
+
     fn inside_workspace<'a>(&self, path: &'a Path) -> Option<&'a Path> {
         path.strip_prefix(&self.workspace).ok()
     }

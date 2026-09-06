@@ -2,7 +2,7 @@
 
 ## text
 
- api-cleanup  coding  fixture
+ api-cleanup  supervised  fixture
  you   T╭ approve? ────────────────────────────────────────────────────╮
         │--- a/crates/gritt-harness/src/store/mod.rs                   │
  think R│+++ b/crates/gritt-harness/src/store/mod.rs                   │

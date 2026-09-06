@@ -2,13 +2,13 @@
 
 ## text
 
- api-cleanup  coding  fixture             ╭────────────────────────────────────╮
+ api-cleanup  supervised  fixture         ╭────────────────────────────────────╮
  you   Tidy the public API of the store mo│ Gritt 0.1.0                        │
                                           │                                    │
  think Reading the module, then the caller│ Session                            │
                                           │ name api-cleanup                   │
  gritt I read `store/mod.rs` and found thr│ dir  /work/gritt                   │
-       outside the crate uses. I will make│ phase coding                       │
+       outside the crate uses. I will make│ mode Supervised                    │
        surface unchanged. 世界 renders at │ now  streaming                     │
                                           │                                    │
  tool  -> file_read store/mod.rs          │ Model                              │

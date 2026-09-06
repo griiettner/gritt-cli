@@ -2,13 +2,13 @@
 
 ## text
 
- api-cleanup  coding  /work/gritt  fixture
+ api-cleanup  supervised  /work/gritt  fixture
  you   Tidy the public API of the store module.                                          │ Gritt 0.1.0
                                                                                          │
  think Reading the module, then the callers.                                             │ Session
                                                                                          │ name unavailable
  gritt I read `store/mod.rs` and found three exported helpers that no caller outside     │ dir  unavailable
-       the crate uses. I will make them private and keep the trait surface unchanged.    │ phase unavailable
+       the crate uses. I will make them private and keep the trait surface unchanged.    │ mode unavailable
        世界 renders at its real width.                                                   │ now  unavailable
                                                                                          │
  tool  -> file_read store/mod.rs                                                         │ Model

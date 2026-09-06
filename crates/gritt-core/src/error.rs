@@ -31,6 +31,10 @@ pub enum ErrorKind {
     MissingModelList,
     /// The provider returned an error response.
     Provider,
+    /// No configured profile could start a new native session: every
+    /// candidate was skipped for a missing key, an authentication or
+    /// connection failure, or an unavailable model.
+    NoUsableProfile,
     /// Configuration is invalid.
     Config,
     /// A config layer contained a literal secret value.
@@ -62,7 +66,8 @@ impl Error {
         Self::new(
             ErrorKind::MissingKey,
             format!(
-                "no key for profile `{profile}`: nothing in the keychain and `{env_var_name}` is not set"
+                "no key for profile `{profile}`: nothing in the keychain and `{env_var_name}` is not set; set `{env_var_name}` for this process ({}) or run `gritt key-set {profile}` to save it in the OS keychain",
+                env_var_setup_hint(env_var_name)
             ),
         )
     }
@@ -109,6 +114,16 @@ impl Error {
     }
 }
 
+#[cfg(windows)]
+fn env_var_setup_hint(name: &str) -> String {
+    format!("PowerShell: $env:{name} = '<key>'; Command Prompt: set {name}=<key>")
+}
+
+#[cfg(not(windows))]
+fn env_var_setup_hint(name: &str) -> String {
+    format!("macOS/Linux shell: export {name}='<key>'")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +134,8 @@ mod tests {
         assert_eq!(error.kind, ErrorKind::MissingKey);
         assert!(error.message.contains("openrouter"));
         assert!(error.message.contains("OPENROUTER_API_KEY"));
+        assert!(error.message.contains("gritt key-set openrouter"));
+        assert!(error.message.contains("<key>"));
         assert!(error.diagnostic.is_none());
     }
 

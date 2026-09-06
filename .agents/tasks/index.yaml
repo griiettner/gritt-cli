@@ -1,19 +1,24 @@
 - namespace: griiettner
   range: TKT-0001-0025
   file: .agents/tasks/griiettner/TKT-0001-0025/index.yaml
-  count: 21
-  updated: 2026-09-05
+  count: 23
+  updated: 2026-09-06
   statuses:
-    - done: 20
+    - done: 21
     - in_progress: 1
+    - ready: 1
   areas:
     - .agents/cli
     - .agents/memory
     - .agents/plans
     - .agents/skills
     - .agents/tasks
+    - cli
+    - core
     - crates/gritt
     - crates/gritt-core
     - crates/gritt-harness
     - crates/gritt-provider
     - docs
+    - harness
+    - provider

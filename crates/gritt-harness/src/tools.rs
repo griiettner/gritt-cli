@@ -44,6 +44,10 @@ impl Workspace {
     /// `..` climbing above the root, absolute paths elsewhere, and symlink
     /// escapes by canonicalizing the longest existing prefix.
     pub fn resolve(&self, input: &str) -> Result<PathBuf> {
+        self.resolve_with_access(input, false)
+    }
+
+    fn resolve_with_access(&self, input: &str, full_access: bool) -> Result<PathBuf> {
         let candidate = Path::new(input);
         let joined = if candidate.is_absolute() {
             candidate.to_path_buf()
@@ -62,7 +66,7 @@ impl Workspace {
                 other => normalized.push(other.as_os_str()),
             }
         }
-        if !normalized.starts_with(&self.root) {
+        if !full_access && !normalized.starts_with(&self.root) {
             return Err(outside(input));
         }
         // Canonicalize the deepest existing ancestor to catch symlinks.
@@ -80,7 +84,7 @@ impl Workspace {
         let mut real = existing
             .canonicalize()
             .map_err(|error| Error::config(format!("cannot resolve `{input}`: {error}")))?;
-        if !real.starts_with(&self.root) {
+        if !full_access && !real.starts_with(&self.root) {
             return Err(outside(input));
         }
         for name in tail.into_iter().rev() {
@@ -300,6 +304,7 @@ pub struct NativeTools {
     workspace: Workspace,
     registry: Arc<ProcessRegistry>,
     blocked_env: Vec<String>,
+    full_access: bool,
 }
 
 impl NativeTools {
@@ -308,6 +313,7 @@ impl NativeTools {
             workspace,
             registry,
             blocked_env: Vec::new(),
+            full_access: false,
         }
     }
 
@@ -323,6 +329,14 @@ impl NativeTools {
         &self.workspace
     }
 
+    pub fn set_full_access(&mut self, enabled: bool) {
+        self.full_access = enabled;
+    }
+
+    fn resolve(&self, path: &str) -> Result<PathBuf> {
+        self.workspace.resolve_with_access(path, self.full_access)
+    }
+
     pub fn registry(&self) -> &Arc<ProcessRegistry> {
         &self.registry
     }
@@ -331,7 +345,7 @@ impl NativeTools {
         vec![
             ToolDefinition {
                 name: native::FILE_READ.into(),
-                description: "Read a UTF-8 text file inside the workspace.".into(),
+                description: "Read a UTF-8 text file. The current execution mode controls file access.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -342,7 +356,7 @@ impl NativeTools {
             },
             ToolDefinition {
                 name: native::FILE_WRITE.into(),
-                description: "Write a UTF-8 text file inside the workspace, replacing its content. The user reviews a diff first.".into(),
+                description: "Write a UTF-8 text file, replacing its content. The current execution mode controls file access and approval.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -354,7 +368,7 @@ impl NativeTools {
             },
             ToolDefinition {
                 name: native::SHELL.into(),
-                description: "Run a shell command in the workspace root and return its output. Requires approval.".into(),
+                description: "Run a shell command in the workspace root and return its output. The current execution mode controls approval.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -379,7 +393,7 @@ impl NativeTools {
         match call.name.as_str() {
             native::FILE_READ | native::FILE_WRITE => {
                 let path = Self::argument(call, "path")?;
-                Ok(Resource::Path(self.workspace.resolve(path)?))
+                Ok(Resource::Path(self.resolve(path)?))
             }
             native::SHELL => Ok(Resource::Command(
                 Self::argument(call, "command")?.to_owned(),
@@ -428,7 +442,7 @@ impl NativeTools {
     async fn execute_inner(&self, call: &ToolCall, cancel: &CancellationToken) -> Result<String> {
         match call.name.as_str() {
             native::FILE_READ => {
-                let path = self.workspace.resolve(Self::argument(call, "path")?)?;
+                let path = self.resolve(Self::argument(call, "path")?)?;
                 let mut text = tokio::fs::read_to_string(&path).await.map_err(|error| {
                     Error::config(format!("cannot read `{}`: {error}", path.display()))
                 })?;
@@ -436,7 +450,7 @@ impl NativeTools {
                 Ok(text)
             }
             native::FILE_WRITE => {
-                let path = self.workspace.resolve(Self::argument(call, "path")?)?;
+                let path = self.resolve(Self::argument(call, "path")?)?;
                 let content = Self::argument(call, "content")?;
                 if let Some(parent) = path.parent() {
                     tokio::fs::create_dir_all(parent).await.map_err(|error| {

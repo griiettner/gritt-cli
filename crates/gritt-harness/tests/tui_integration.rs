@@ -62,6 +62,7 @@ fn profile(name: &str, protocol: Protocol, base_url: &str) -> ProviderProfile {
         base_url: base_url.into(),
         key: SecretRef::for_profile(name, format!("{}_API_KEY", name.to_uppercase())),
         aliases: Default::default(),
+        fallback_model: None,
     }
 }
 

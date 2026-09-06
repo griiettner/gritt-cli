@@ -472,3 +472,46 @@ tickets:
       - codebase-design
       - tdd
       - write-plan
+  - id: TKT-0022
+    namespace: griiettner
+    title: Add provider failover and remember session preferences
+    status: done
+    owner: griiettner
+    priority: normal
+    created: 2026-09-06
+    updated: 2026-09-06
+    artifacts:
+      concept: .agents/tasks/griiettner/TKT-0001-0025/TKT-0022/concept.md
+      task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0022/task.md
+      report: .agents/tasks/griiettner/TKT-0001-0025/TKT-0022/report.md
+    dependencies:
+      - TKT-0019
+    areas:
+      - provider
+      - harness
+      - cli
+    skills:
+      - dev-provider
+      - dev-harness
+      - dev-cli
+  - id: TKT-0023
+    namespace: griiettner
+    title: Expose reusable control plane API for T3Code
+    status: ready
+    owner: griiettner
+    priority: normal
+    created: 2026-09-06
+    updated: 2026-09-06
+    artifacts:
+      concept: .agents/tasks/griiettner/TKT-0001-0025/TKT-0023/concept.md
+      plan: .agents/tasks/griiettner/TKT-0001-0025/TKT-0023/plan.md
+      task: .agents/tasks/griiettner/TKT-0001-0025/TKT-0023/task.md
+    dependencies: []
+    areas:
+      - core
+      - harness
+      - cli
+    skills:
+      - codebase-design
+      - dev-harness
+      - dev-cli

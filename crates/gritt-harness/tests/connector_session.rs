@@ -103,6 +103,7 @@ async fn fixture(
             base_url: "https://openrouter.ai/api/v1".into(),
             key: SecretRef::for_profile("openrouter", "OPENROUTER_API_KEY"),
             aliases: Default::default(),
+            fallback_model: None,
         },
     );
     config.default_profile = Some("openrouter".into());
@@ -460,7 +461,22 @@ async fn the_native_path_runs_behind_the_connector_contract() {
     let info = native.info().await.unwrap();
     assert_eq!(info.id, ConnectorId::Native);
     assert!(info.capabilities.approvals);
-    let session_id = SessionId("native-contract".into());
+    let session_id = fx
+        .plane
+        .builder
+        .open(
+            gritt_harness::agent::SessionSelector::New {
+                name: Some("native-contract".into()),
+            },
+            None,
+            None,
+            Some(Phase::Coding),
+        )
+        .await
+        .unwrap()
+        .session()
+        .id
+        .clone();
     let mut stream = native
         .start(TaskRequest {
             session_id: session_id.clone(),
