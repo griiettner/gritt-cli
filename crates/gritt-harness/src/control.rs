@@ -186,6 +186,23 @@ impl ControlPlane {
         }
     }
 
+    /// Status and catalog lines print and REPL show for a discovery
+    /// result. The TUI picker renders the same value.
+    pub fn connector_model_lines(discovery: &ConnectorModelDiscovery) -> Vec<String> {
+        let mut lines = vec![discovery.describe()];
+        if let Some(catalog) = discovery.catalog() {
+            for model in &catalog.models {
+                match &model.display_label {
+                    Some(label) if label != &model.id => {
+                        lines.push(format!("  {}  {label}", model.id));
+                    }
+                    _ => lines.push(format!("  {}", model.id)),
+                }
+            }
+        }
+        lines
+    }
+
     /// Warms the profile's list and returns it for the model picker.
     pub async fn catalog(&self, profile: &str) -> Result<ProfileCatalog> {
         let state = self.warm_catalog(profile).await?;
@@ -469,6 +486,7 @@ impl ControlPlane {
             connector,
             StartupRequest::from_flags(profile, model, None),
             phase,
+            false,
         )
         .await
         .map(|opened| opened.driver)
@@ -476,12 +494,15 @@ impl ControlPlane {
 
     /// [`ControlPlane::open`] with the full startup request and the notes
     /// a new native session produced, for a mode that reports them.
+    /// `refresh_models` is forwarded to [`ControlPlane::connector_models`]
+    /// for a new connector session.
     pub async fn open_with(
         &self,
         selector: SessionSelector,
         connector: Option<ConnectorId>,
         request: StartupRequest,
         phase: Option<Phase>,
+        refresh_models: bool,
     ) -> Result<Opened> {
         let existing = self.builder.find_session(&selector, phase).await?;
         let existing_id = existing.as_ref().map(|session| session.id.clone());
@@ -576,7 +597,7 @@ impl ControlPlane {
                 let created_now = existing_id.is_none();
                 let session_id = session.id.clone();
                 let connector_models = if created_now {
-                    Some(connector.discover_models(false).await)
+                    Some(self.connector_models(*id, refresh_models).await)
                 } else {
                     None
                 };

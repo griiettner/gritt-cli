@@ -139,7 +139,7 @@ pub fn parse_cursor_models(
             display_label: (!label.is_empty()).then_some(label),
         });
     }
-    if out.is_empty() && text.chars().any(|c| !c.is_whitespace()) {
+    if out.is_empty() {
         return Err(ModelParseError::Malformed);
     }
     Ok(out)

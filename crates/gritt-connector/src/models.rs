@@ -100,6 +100,16 @@ pub fn cache_is_fresh(
         .is_some_and(|fetched_at| now.signed_duration_since(fetched_at) < interval(policy))
 }
 
+/// A refresh ran after the last successful fetch and did not replace it.
+/// The list is still on disk, but it must not be reported as current.
+pub fn failed_since_fetch(cached: &CachedConnectorModels) -> bool {
+    match (cached.fetched_at, cached.last_attempt_at) {
+        (Some(fetched), Some(attempt)) => attempt > fetched,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
 pub fn attempted_recently(
     cached: &CachedConnectorModels,
     policy: &ModelListPolicy,

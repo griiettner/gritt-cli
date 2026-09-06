@@ -1886,13 +1886,166 @@ fn an_installed_agent_opens_its_model_picker_instead_of_starting() {
         app.on_key(key(KeyCode::Enter)),
         Action::SelectConnector(gritt_core::connector::ConnectorId::Codex)
     );
-    assert_eq!(app.draft.model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(app.connector_model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(
+        app.draft.model, None,
+        "a connector identifier must not overwrite the native draft model"
+    );
     // Escape from the picker starts nothing.
     let mut app = fixture::home(Theme::new(ThemeMode::NoColor));
     app.dispatch(Command::Connect, None);
     type_text(&mut app, "codex");
     app.on_key(key(KeyCode::Enter));
     assert_eq!(app.on_key(key(KeyCode::Esc)), Action::None);
+}
+
+#[test]
+fn a_new_draft_after_a_connector_choice_keeps_the_native_model() {
+    let mut app = fixture::home(Theme::new(ThemeMode::NoColor));
+    app.draft = app
+        .draft
+        .clone()
+        .with_profile("openai")
+        .with_model("openai/gpt-5-nano");
+    app.dispatch(Command::Connect, None);
+    type_text(&mut app, "codex");
+    app.on_key(key(KeyCode::Enter));
+    app.apply_connector_catalog(
+        app.selection,
+        gritt_core::connector::ConnectorId::Codex,
+        gritt_core::connector::ConnectorModelDiscovery::Current {
+            catalog: gritt_core::connector::ConnectorModelCatalog {
+                connector: gritt_core::connector::ConnectorId::Codex,
+                models: vec![gritt_core::connector::ConnectorModel {
+                    id: "gpt-5.4".into(),
+                    display_label: Some("GPT-5.4".into()),
+                }],
+                source: "codex debug models".into(),
+                fetched_at: Utc::now(),
+                freshness: gritt_core::connector::ConnectorModelFreshness::Current,
+            },
+        },
+    );
+    type_text(&mut app, "gpt-5.4");
+    assert_eq!(
+        app.on_key(key(KeyCode::Enter)),
+        Action::SelectConnector(gritt_core::connector::ConnectorId::Codex)
+    );
+    assert_eq!(app.connector_model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(app.draft.model.as_deref(), Some("openai/gpt-5-nano"));
+    app.dispatch(Command::New, None);
+    assert_eq!(app.connector_choice, None);
+    assert_eq!(app.connector, None);
+    assert_eq!(app.connector_model, None);
+    assert_eq!(
+        app.draft.model.as_deref(),
+        Some("openai/gpt-5-nano"),
+        "a native session after /new opened with the connector identifier"
+    );
+}
+
+#[test]
+fn a_connector_catalog_result_updates_the_visible_picker() {
+    let mut app = fixture::home(Theme::new(ThemeMode::NoColor));
+    app.dispatch(Command::Connect, None);
+    type_text(&mut app, "codex");
+    app.on_key(key(KeyCode::Enter));
+    match app.top_overlay() {
+        Some(Overlay::Picker {
+            kind: PickerKind::Models,
+            picker,
+        }) => {
+            assert!(
+                picker.status.is_loading(),
+                "the open overlay should start in loading: {:?}",
+                picker.status
+            );
+        }
+        other => panic!("expected the models overlay, got {other:?}"),
+    }
+    app.apply_connector_catalog(
+        app.selection,
+        gritt_core::connector::ConnectorId::Codex,
+        gritt_core::connector::ConnectorModelDiscovery::Current {
+            catalog: gritt_core::connector::ConnectorModelCatalog {
+                connector: gritt_core::connector::ConnectorId::Codex,
+                models: vec![gritt_core::connector::ConnectorModel {
+                    id: "gpt-5.4".into(),
+                    display_label: Some("GPT-5.4".into()),
+                }],
+                source: "codex debug models".into(),
+                fetched_at: Utc::now(),
+                freshness: gritt_core::connector::ConnectorModelFreshness::Current,
+            },
+        },
+    );
+    match app.top_overlay() {
+        Some(Overlay::Picker {
+            kind: PickerKind::Models,
+            picker,
+        }) => {
+            assert!(
+                !picker.status.is_loading(),
+                "the visible picker stayed on loading after a current catalog arrived: {:?}",
+                picker.status
+            );
+            assert!(matches!(
+                picker.status,
+                crate::tui::picker::ListStatus::Ready
+            ));
+            assert!(
+                picker.hint.contains("codex debug models"),
+                "overlay hint was not updated: {}",
+                picker.hint
+            );
+            assert!(picker.rows().iter().any(|row| row.id == "gpt-5.4"));
+        }
+        other => panic!("expected the models overlay to remain, got {other:?}"),
+    }
+
+    app.connector_catalog.loading = true;
+    app.connector_catalog.discovery = None;
+    app.selection = app.selection.wrapping_add(1);
+    let selection = app.selection;
+    app.apply_connector_catalog(
+        selection,
+        gritt_core::connector::ConnectorId::Codex,
+        gritt_core::connector::ConnectorModelDiscovery::CachedStale {
+            catalog: gritt_core::connector::ConnectorModelCatalog {
+                connector: gritt_core::connector::ConnectorId::Codex,
+                models: vec![gritt_core::connector::ConnectorModel {
+                    id: "gpt-5.4".into(),
+                    display_label: None,
+                }],
+                source: "codex debug models".into(),
+                fetched_at: Utc::now(),
+                freshness: gritt_core::connector::ConnectorModelFreshness::Stale,
+            },
+            reason: "codex debug models exited unsuccessfully".into(),
+        },
+    );
+    match app.top_overlay() {
+        Some(Overlay::Picker {
+            kind: PickerKind::Models,
+            picker,
+        }) => {
+            assert!(
+                !picker.status.is_loading(),
+                "stale result left the overlay on loading: {:?}",
+                picker.status
+            );
+            assert!(matches!(
+                picker.status,
+                crate::tui::picker::ListStatus::Failed { cached: true, .. }
+            ));
+            assert!(
+                picker.hint.contains("stale"),
+                "overlay hint was not updated for stale: {}",
+                picker.hint
+            );
+        }
+        other => panic!("expected the models overlay to remain, got {other:?}"),
+    }
 }
 
 #[test]

@@ -31,8 +31,8 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::health::{find_executable, probe, version_at_least, version_token, ProbeOutput};
 use crate::models::{
-    attempted_recently, cache_is_fresh, catalog_from_cache, CachedConnectorModels,
-    ConnectorModelCache,
+    attempted_recently, cache_is_fresh, catalog_from_cache, failed_since_fetch,
+    CachedConnectorModels, ConnectorModelCache,
 };
 use crate::process::{self, Launch, Line, Supervised};
 use crate::protocols::ModelParseError;
@@ -377,7 +377,10 @@ impl<P: Protocol> ExternalConnector<P> {
             .and_then(|cache| cache.read(id).ok().flatten());
         if !refresh {
             if let Some(cached) = &cached {
-                if cache_is_fresh(cached, &self.model_policy, now) {
+                // A failed refresh stamps last_attempt_at later than
+                // fetched_at. That list is stale until a refresh succeeds,
+                // even if fetched_at is still inside the freshness window.
+                if !failed_since_fetch(cached) && cache_is_fresh(cached, &self.model_policy, now) {
                     if let Some(mut catalog) =
                         catalog_from_cache(id, cached, ConnectorModelFreshness::Current)
                     {

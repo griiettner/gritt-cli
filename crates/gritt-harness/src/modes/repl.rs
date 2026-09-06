@@ -7,8 +7,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use gritt_core::connector::ConnectorId;
 use gritt_core::event::ApprovalDecision;
-use gritt_core::session::{Phase, SessionStore};
+use gritt_core::session::{Phase, SessionKind, SessionStore};
 use gritt_core::Result;
 
 use crate::agent::{CancelHandle, SessionSelector, TurnStatus, Ui};
@@ -107,6 +108,7 @@ pub enum ReplCommand {
     Sessions,
     Resume(String),
     History,
+    Models { refresh: bool },
     Help,
     Quit,
     Empty,
@@ -131,13 +133,16 @@ pub fn parse_command(line: &str) -> ReplCommand {
         "/sessions" => ReplCommand::Sessions,
         "/resume" if !argument.is_empty() => ReplCommand::Resume(argument.to_owned()),
         "/history" => ReplCommand::History,
+        "/models" => ReplCommand::Models {
+            refresh: argument == "refresh",
+        },
         "/help" => ReplCommand::Help,
         "/quit" | "/exit" => ReplCommand::Quit,
         other => ReplCommand::Unknown(other.to_owned()),
     }
 }
 
-pub const HELP: &str = "commands: /mode [planning|supervised|auto-approve|full-access]  /plan  /code  /sessions  /resume NAME  /history  /help  /quit\n\
+pub const HELP: &str = "commands: /mode [planning|supervised|auto-approve|full-access]  /plan  /code  /sessions  /resume NAME  /models [refresh]  /history  /help  /quit\n\
 Ctrl-C cancels a running turn; a second Ctrl-C at the prompt quits.";
 
 /// Runs the loop until `/quit` or end of input. Returns the driver so the
@@ -207,6 +212,19 @@ pub async fn run_repl<O: Write + Send, E: Write + Send>(
                     let _ = writeln!(out, "{:>3}  {entry}", index + 1);
                 }
             }
+            ReplCommand::Models { refresh } => match &agent.session().kind {
+                SessionKind::Connector { id, .. } if *id != ConnectorId::Native => {
+                    let discovery = plane.connector_models(*id, refresh).await;
+                    let (out, _) = ui.parts_mut();
+                    for line in ControlPlane::connector_model_lines(&discovery) {
+                        let _ = writeln!(out, "{line}");
+                    }
+                }
+                _ => {
+                    let (_, err) = ui.parts_mut();
+                    let _ = writeln!(err, "native sessions use the provider model catalog");
+                }
+            },
             ReplCommand::Plan => {
                 if agent.mode().is_some() {
                     agent
@@ -347,6 +365,14 @@ mod tests {
             ReplCommand::Unknown("/resume".into())
         );
         assert_eq!(parse_command("/exit"), ReplCommand::Quit);
+        assert_eq!(
+            parse_command("/models"),
+            ReplCommand::Models { refresh: false }
+        );
+        assert_eq!(
+            parse_command("/models refresh"),
+            ReplCommand::Models { refresh: true }
+        );
         assert_eq!(parse_command("/nope"), ReplCommand::Unknown("/nope".into()));
     }
 }

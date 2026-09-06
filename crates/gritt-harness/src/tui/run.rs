@@ -1563,7 +1563,7 @@ async fn on_action(
             let tx = runtime.tx.clone();
             let generation = app.sidebar.generation;
             let operation = runtime.next_operation();
-            let model = app.draft.model.clone();
+            let model = app.connector_model.clone();
             runtime.pending_open = Some(PendingOpen {
                 operation,
                 prompt: None,

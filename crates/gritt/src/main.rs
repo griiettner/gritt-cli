@@ -172,6 +172,11 @@ struct SessionArgs {
     /// Skip the model list refresh.
     #[arg(long)]
     no_models: bool,
+    /// Refresh the connector model catalog instead of using a still-fresh
+    /// cache. Print and REPL list the catalog through the same service
+    /// the TUI uses.
+    #[arg(long, conflicts_with = "no_models")]
+    refresh_models: bool,
     /// Run through an installed agent instead of the native path:
     /// codex, claude, cursor, or opencode.
     #[arg(long, value_name = "NAME")]
@@ -482,11 +487,19 @@ fn startup_notes(opened: &Opened) -> Vec<String> {
         }
     }
     if let Some(discovery) = &opened.connector_models {
-        match discovery {
-            gritt_core::connector::ConnectorModelDiscovery::Current { .. } => {
-                lines.push(format!("note: {}", discovery.describe()));
+        let prefix = match discovery {
+            gritt_core::connector::ConnectorModelDiscovery::Current { .. } => "note",
+            _ => "warning",
+        };
+        for (index, line) in ControlPlane::connector_model_lines(discovery)
+            .into_iter()
+            .enumerate()
+        {
+            if index == 0 {
+                lines.push(format!("{prefix}: {line}"));
+            } else {
+                lines.push(line);
             }
-            _ => lines.push(format!("warning: {}", discovery.describe())),
         }
     }
     lines.extend(
@@ -627,6 +640,7 @@ async fn print_turn(
             connector,
             startup_request(args),
             phase_flag(args),
+            args.refresh_models,
         )
         .await?;
     for line in startup_notes(&opened) {
@@ -714,6 +728,7 @@ async fn repl_loop(
             connector,
             startup_request(args),
             phase_flag(args),
+            args.refresh_models,
         )
         .await?;
     for line in startup_notes(&opened) {
@@ -1039,6 +1054,7 @@ async fn connectors_command(workspace: &Path, database: Option<&Path>) -> Result
         deny_all: true,
         ask: false,
         no_models: true,
+        refresh_models: false,
         connector: None,
     };
     let builder = builder(workspace, database, &args).await?;
@@ -1103,6 +1119,7 @@ async fn doctor_command(workspace: &Path, database: Option<&Path>) -> Result<Exi
         deny_all: true,
         ask: false,
         no_models: true,
+        refresh_models: false,
         connector: None,
     };
     // A broken config or connector setup is itself a finding, not a reason
@@ -1269,6 +1286,7 @@ mod tests {
             deny_all,
             ask,
             no_models: true,
+            refresh_models: false,
             connector: connector.map(str::to_owned),
         }
     }
@@ -1325,6 +1343,35 @@ mod tests {
             panic!("repl command")
         };
         assert!(startup_request(&session).pinned);
+    }
+
+    #[test]
+    fn print_and_repl_accept_an_explicit_connector_catalog_refresh() {
+        let cli = Cli::try_parse_from([
+            "gritt",
+            "run",
+            "--connector",
+            "codex",
+            "--refresh-models",
+            "--model",
+            "gpt-5.4",
+            "hello",
+        ])
+        .unwrap();
+        let Some(Command::Run { session, .. }) = cli.command else {
+            panic!("run command")
+        };
+        assert!(session.refresh_models);
+        assert_eq!(session.model.as_deref(), Some("gpt-5.4"));
+        let cli = Cli::try_parse_from(["gritt", "repl", "--refresh-models"]).unwrap();
+        let Some(Command::Repl { session, .. }) = cli.command else {
+            panic!("repl command")
+        };
+        assert!(session.refresh_models);
+        assert!(
+            Cli::try_parse_from(["gritt", "run", "--refresh-models", "--no-models", "hello"])
+                .is_err()
+        );
     }
 
     #[test]

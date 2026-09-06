@@ -134,6 +134,25 @@ fn parsers_read_committed_catalog_fixtures() {
 }
 
 #[test]
+fn parsers_reject_empty_or_whitespace_output() {
+    assert_eq!(parse_cursor_models(""), Err(ModelParseError::Malformed));
+    assert_eq!(
+        parse_cursor_models("  \n\t\n  "),
+        Err(ModelParseError::Malformed)
+    );
+    assert_eq!(parse_opencode_models(""), Err(ModelParseError::Malformed));
+    assert_eq!(
+        parse_opencode_models(" \n "),
+        Err(ModelParseError::Malformed)
+    );
+    assert_eq!(parse_codex_models(""), Err(ModelParseError::Malformed));
+    assert_eq!(
+        parse_codex_models("\n  \n"),
+        Err(ModelParseError::Malformed)
+    );
+}
+
+#[test]
 fn parsers_reject_malformed_catalogs() {
     assert_eq!(
         parse_codex_models(&std::fs::read_to_string(fixture("codex", "malformed.json")).unwrap()),
@@ -336,6 +355,83 @@ async fn refresh_failure_falls_back_to_a_stale_cache() {
     assert_eq!(catalog.models[0].id, "gpt-5.4");
     assert!(!reason.contains("sk-"));
     assert_ne!(catalog.freshness, ConnectorModelFreshness::Current);
+}
+
+#[tokio::test]
+async fn a_failed_refresh_stays_stale_on_the_next_ordinary_lookup() {
+    let fake = Fake::new(&[(
+        "FAKE_AGENT_MODELS_FILE",
+        fixture("codex", "current.json").display().to_string(),
+    )]);
+    let cache_dir = fake.dir.path().join("cache");
+    let cache = ConnectorModelCache::new(&cache_dir);
+    cache
+        .write(
+            ConnectorId::Codex,
+            &gritt_connector::models::CachedConnectorModels {
+                fetched_at: Some(Utc::now() - ChronoDuration::minutes(1)),
+                last_attempt_at: Some(Utc::now() - ChronoDuration::minutes(1)),
+                source: "codex debug models".into(),
+                models: parse_codex_models(
+                    &std::fs::read_to_string(fixture("codex", "current.json")).unwrap(),
+                )
+                .unwrap(),
+            },
+        )
+        .unwrap();
+    let failing = Fake::new(&[("FAKE_AGENT_MODELS_EXIT", "1".into())]);
+    let connector = failing.connector_with_cache(Codex, "codex", Some(cache_dir.clone()));
+    let refreshed = connector.discover_models(true).await;
+    let ConnectorModelDiscovery::CachedStale { catalog, .. } = refreshed else {
+        panic!("expected stale fallback after a failed refresh, got {refreshed:?}");
+    };
+    assert_eq!(catalog.freshness, ConnectorModelFreshness::Stale);
+
+    let lookup = connector.discover_models(false).await;
+    let ConnectorModelDiscovery::CachedStale { catalog, .. } = lookup else {
+        panic!("ordinary lookup after a failed refresh must stay stale, got {lookup:?}");
+    };
+    assert_eq!(catalog.freshness, ConnectorModelFreshness::Stale);
+    assert_eq!(catalog.models[0].id, "gpt-5.4");
+}
+
+#[tokio::test]
+async fn empty_listing_output_does_not_replace_a_good_cache() {
+    let empty = tempfile::NamedTempFile::new().unwrap();
+    let fake = Fake::new(&[("FAKE_AGENT_MODELS_FILE", empty.path().display().to_string())]);
+    let cache_dir = fake.dir.path().join("cache");
+    let cache = ConnectorModelCache::new(&cache_dir);
+    cache
+        .write(
+            ConnectorId::Cursor,
+            &gritt_connector::models::CachedConnectorModels {
+                fetched_at: Some(Utc::now() - ChronoDuration::hours(48)),
+                last_attempt_at: Some(Utc::now() - ChronoDuration::hours(48)),
+                source: "cursor-agent --list-models".into(),
+                models: parse_cursor_models(
+                    &std::fs::read_to_string(fixture("cursor", "list.txt")).unwrap(),
+                )
+                .unwrap(),
+            },
+        )
+        .unwrap();
+    let connector = fake.connector_with_cache(Cursor, "cursor", Some(cache_dir.clone()));
+    let outcome = connector.discover_models(true).await;
+    assert!(
+        matches!(
+            outcome,
+            ConnectorModelDiscovery::CachedStale { .. }
+                | ConnectorModelDiscovery::MalformedOutput { .. }
+        ),
+        "empty output was treated as a current catalog: {outcome:?}"
+    );
+    if let ConnectorModelDiscovery::CachedStale { catalog, .. } = &outcome {
+        assert_eq!(catalog.freshness, ConnectorModelFreshness::Stale);
+        assert_eq!(catalog.models[0].id, "gpt-5.5-medium");
+    }
+    let stored = cache.read(ConnectorId::Cursor).unwrap().unwrap();
+    assert_eq!(stored.models[0].id, "gpt-5.5-medium");
+    assert!(!stored.models.is_empty());
 }
 
 #[tokio::test]

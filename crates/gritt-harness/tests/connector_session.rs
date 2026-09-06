@@ -27,6 +27,7 @@ use gritt_harness::agent::{AgentBuilder, ApprovalMode, SessionSelector, TurnStat
 use gritt_harness::connector_session::ConnectorSession;
 use gritt_harness::control::ControlPlane;
 use gritt_harness::modes::print::{PrintUi, PrintUiOptions, SharedBuffer};
+use gritt_harness::modes::repl::{run_repl, CancelSlot, LineInput};
 use gritt_harness::native_connector::NativeConnector;
 use gritt_harness::policy::Decision;
 use gritt_harness::startup::StartupRequest;
@@ -821,6 +822,7 @@ async fn explicit_connector_model_is_stored_and_default_is_omitted() {
             Some(ConnectorId::Codex),
             StartupRequest::from_flags(None, Some("gpt-5.4"), None),
             None,
+            false,
         )
         .await
         .unwrap();
@@ -842,6 +844,7 @@ async fn explicit_connector_model_is_stored_and_default_is_omitted() {
             Some(ConnectorId::Codex),
             StartupRequest::from_flags(None, None, None),
             None,
+            false,
         )
         .await
         .unwrap();
@@ -883,6 +886,7 @@ async fn resumed_connector_sessions_keep_the_stored_model() {
             Some(ConnectorId::Codex),
             StartupRequest::from_flags(None, Some("gpt-5.4"), None),
             None,
+            false,
         )
         .await
         .unwrap();
@@ -893,6 +897,7 @@ async fn resumed_connector_sessions_keep_the_stored_model() {
             Some(ConnectorId::Codex),
             StartupRequest::from_flags(None, Some("gpt-5.4-mini"), None),
             None,
+            false,
         )
         .await
         .unwrap();
@@ -941,4 +946,136 @@ async fn connector_refresh_failure_marks_the_cached_list_stale() {
     };
     assert_eq!(catalog.freshness, ConnectorModelFreshness::Stale);
     assert_eq!(catalog.models[0].id, "gpt-5.4");
+}
+
+#[tokio::test]
+async fn print_and_repl_list_catalog_entries_from_the_shared_service() {
+    let scratch = tempfile::tempdir().unwrap();
+    let wrapper = fake_agent(
+        scratch.path(),
+        &[(
+            "FAKE_AGENT_MODELS_FILE",
+            models_fixture("current.json").display().to_string(),
+        )],
+    );
+    let cache = scratch.path().join("cache");
+    let fx = fixture(
+        Vec::new(),
+        ApprovalMode::DenyAll,
+        vec![codex_connector_with_models(&wrapper, &cache)],
+    )
+    .await;
+    let discovery = fx.plane.connector_models(ConnectorId::Codex, false).await;
+    let lines = ControlPlane::connector_model_lines(&discovery);
+    let text = lines.join("\n");
+    assert!(
+        text.contains("gpt-5.4"),
+        "catalog listing omitted model ids: {text}"
+    );
+    assert!(
+        text.contains("codex debug models"),
+        "catalog listing omitted the source: {text}"
+    );
+    let opened = fx
+        .plane
+        .open_with(
+            SessionSelector::Named("listed".into()),
+            Some(ConnectorId::Codex),
+            StartupRequest::from_flags(None, Some("gpt-5.4"), None),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let opened_lines = ControlPlane::connector_model_lines(
+        opened
+            .connector_models
+            .as_ref()
+            .expect("new connector session runs discovery"),
+    );
+    assert!(opened_lines.iter().any(|line| line.contains("gpt-5.4")));
+
+    let refreshed = fx
+        .plane
+        .open_with(
+            SessionSelector::Named("refreshed".into()),
+            Some(ConnectorId::Codex),
+            StartupRequest::from_flags(None, None, None),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    let refreshed_lines = ControlPlane::connector_model_lines(
+        refreshed
+            .connector_models
+            .as_ref()
+            .expect("refresh uses the same discovery service"),
+    );
+    assert!(refreshed_lines.iter().any(|line| line.contains("gpt-5.4")));
+}
+
+#[tokio::test]
+async fn repl_models_lists_the_connector_catalog() {
+    let scratch = tempfile::tempdir().unwrap();
+    let wrapper = fake_agent(
+        scratch.path(),
+        &[
+            (
+                "FAKE_AGENT_FIXTURE",
+                connector_fixture("text").display().to_string(),
+            ),
+            (
+                "FAKE_AGENT_MODELS_FILE",
+                models_fixture("current.json").display().to_string(),
+            ),
+        ],
+    );
+    let cache = scratch.path().join("cache");
+    let fx = fixture(
+        Vec::new(),
+        ApprovalMode::DenyAll,
+        vec![codex_connector_with_models(&wrapper, &cache)],
+    )
+    .await;
+    let opened = fx
+        .plane
+        .open_with(
+            SessionSelector::Named("repl-models".into()),
+            Some(ConnectorId::Codex),
+            StartupRequest::from_flags(None, Some("gpt-5.4"), None),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let script = "/models\n/models refresh\n/quit\n";
+    let input = LineInput::from_reader(std::io::Cursor::new(script.as_bytes().to_vec()));
+    let out = SharedBuffer::default();
+    let err = SharedBuffer::default();
+    let slot: CancelSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    run_repl(
+        &fx.plane,
+        opened.driver,
+        &input,
+        out.clone(),
+        err.clone(),
+        PrintUiOptions::deny_all(false),
+        slot,
+    )
+    .await
+    .unwrap();
+    let body = out.contents();
+    assert!(
+        body.contains("gpt-5.4"),
+        "REPL /models did not list the catalog: {body}"
+    );
+    assert!(
+        body.contains("codex debug models"),
+        "REPL /models omitted the source: {body}"
+    );
+    assert!(
+        body.matches("gpt-5.4").count() >= 2,
+        "refresh did not list again: {body}"
+    );
 }

@@ -643,6 +643,9 @@ pub struct App {
     /// Connector chosen from `/connect` before a session exists. The model
     /// picker loads this agent's catalog instead of a provider list.
     pub connector_choice: Option<ConnectorId>,
+    /// Model chosen for that drafted connector. Kept off `draft.model` so
+    /// a native session after `/new` cannot open with a connector id.
+    pub connector_model: Option<String>,
     pub connector_catalog: ConnectorCatalogView,
     /// The server `/mcp` opened an action list for.
     pub mcp_target: Option<String>,
@@ -732,6 +735,7 @@ impl App {
             session_id: None,
             connector: None,
             connector_choice: None,
+            connector_model: None,
             connector_catalog: ConnectorCatalogView::default(),
             mcp_target: None,
             mcp_approval: None,
@@ -1283,7 +1287,7 @@ impl App {
         let mut rows = vec![PickerRow::new("__default__", "Agent default")
             .detail("the CLI chooses its own model")
             .badge(id.as_str().to_owned())
-            .current(self.draft.model.is_none())];
+            .current(self.connector_model.is_none())];
         for model in &self.connector_catalog.models {
             let label = model
                 .display_label
@@ -1293,7 +1297,7 @@ impl App {
                 PickerRow::new(model.id.clone(), label)
                     .detail(model.id.clone())
                     .badge(id.as_str().to_owned())
-                    .current(self.draft.model.as_deref() == Some(model.id.as_str())),
+                    .current(self.connector_model.as_deref() == Some(model.id.as_str())),
             );
         }
         let status = if self.connector_catalog.loading {
@@ -2085,14 +2089,7 @@ impl App {
         };
         if ctrl && matches!(key.code, KeyCode::Char('r')) && kind == PickerKind::Models {
             if let Some(id) = self.connector_choice {
-                self.connector_catalog.loading = true;
-                self.connector_catalog.discovery = None;
-                self.selection = self.selection.wrapping_add(1);
-                return Action::LoadConnectorCatalog {
-                    connector: id,
-                    selection: self.selection,
-                    refresh: true,
-                };
+                return self.request_connector_catalog(id, true);
             }
         }
         let Some(Overlay::Picker { picker, .. }) = self.overlays.last_mut() else {
@@ -2154,6 +2151,7 @@ impl App {
                 }
                 if let Some(profile) = id.strip_prefix("profile:") {
                     self.connector_choice = None;
+                    self.connector_model = None;
                     self.select_profile(profile);
                     self.overlays.pop();
                     self.open_picker(PickerKind::Models);
@@ -2161,7 +2159,7 @@ impl App {
                 } else if let Some(agent) = id.strip_prefix("agent:") {
                     if let Some(connector) = connector_id(agent) {
                         self.connector_choice = Some(connector);
-                        self.draft.model = None;
+                        self.connector_model = None;
                         self.overlays.pop();
                         let action = self.request_connector_catalog(connector, false);
                         self.open_picker(PickerKind::Models);
@@ -2182,9 +2180,9 @@ impl App {
                 self.overlays.pop();
                 if let Some(connector) = self.connector_choice {
                     if id == "__default__" {
-                        self.draft.model = None;
+                        self.connector_model = None;
                     } else {
-                        self.draft.model = Some(id);
+                        self.connector_model = Some(id);
                     }
                     return Action::SelectConnector(connector);
                 }
@@ -2292,6 +2290,7 @@ impl App {
         if refresh {
             self.connector_catalog.discovery = None;
         }
+        self.refresh_open_picker();
         Action::LoadConnectorCatalog {
             connector: id,
             selection: self.selection,
@@ -2734,6 +2733,7 @@ impl App {
         self.session_id = None;
         self.connector = None;
         self.connector_choice = None;
+        self.connector_model = None;
         self.connector_catalog = ConnectorCatalogView::default();
         self.running = false;
         self.pending = None;
@@ -3050,9 +3050,8 @@ impl App {
             PickerKind::Changes => self.changes_picker(),
             PickerKind::Commands | PickerKind::Sessions => return,
         };
-        let rows = rows.rows().to_vec();
         if let Some(Overlay::Picker { picker, .. }) = self.overlays.last_mut() {
-            picker.replace_rows(rows);
+            picker.replace_contents(rows);
         }
     }
 

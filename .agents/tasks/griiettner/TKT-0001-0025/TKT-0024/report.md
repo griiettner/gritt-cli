@@ -105,8 +105,11 @@ agent now closes the connect picker first.
 - Non-zero listing exit, `CommandFailure`, or `CachedStale` when a list
   exists.
 - Unreadable JSON or text, `MalformedOutput`, or `CachedStale`.
-- Empty listing stdout after skipping headers is malformed, not an empty
-  current catalog.
+- Empty, whitespace-only, or header-only listing stdout is
+  `MalformedOutput`, or `CachedStale` when a previous list exists. The
+  first completion left empty and whitespace-only Cursor and OpenCode
+  output as `Ok([])`, which could replace a good cache with an empty
+  current catalog. That is fixed in the 2026-09-06 review update.
 - The fake-agent process writes `--model` and the identifier as separate
   argv entries. Prompt text is not interpolated into a shell string.
 - Launch diagnostics still replace option values with `[value]`.
@@ -121,22 +124,29 @@ agent now closes the connect picker first.
 - Control-plane tests in `crates/gritt-harness/tests/connector_session.rs`
   passed for explicit selection, default selection, resume, and stale fallback
 - TUI reducer tests passed for picker loading, stale, unsupported, and default
-- `GRITT_LIVE_CONNECTOR_TESTS=1 cargo test -p gritt-connector --test live
+- The first completion recorded
+  `GRITT_LIVE_CONNECTOR_TESTS=1 cargo test -p gritt-connector --test live
   live_codex_model_listing live_claude_model_listing
-  live_opencode_model_listing` passed. Codex and OpenCode returned current
-  catalogs. Claude returned `Unsupported`. Cursor is not installed.
-  Full live task smokes that send prompt text were not run.
+  live_opencode_model_listing`.
+  `cargo test` rejects multiple positional filters with
+  `error: unexpected argument`. That command did not run. Live listing
+  was re-run in the 2026-09-06 review update, one filter at a time.
+  There is no test named `live_claude_model_listing`. The matching test
+  is `live_claude_model_listing_is_unsupported`.
 - `cargo build --release --locked` passed
 - `./.agents/gritt-agent ticket validate` passed, 0 warnings
 
 ## Completion Gate
 
-- Acceptance: met. Evidence is the tests named under Validation, plus live
-  listing on Codex and OpenCode.
+- Acceptance: met after the 2026-09-06 review update. The first
+  completion left native selection, stale fallback, empty listing, print
+  and REPL catalog listing, and TUI overlay status incomplete.
 - Scope: met. Native provider discovery was not changed. Resumed connector
   sessions are not migrated. TKT-0025 version checks were not added.
-- Validation: the commands above. Live task smokes that send prompts were
-  not run. Listing-only live tests were.
+- Validation: workspace fmt, clippy, test, release build, and ticket
+  validate passed in the 2026-09-06 update. The first completion's live
+  command did not run. Listing tests were re-run one filter at a time.
+  Live task smokes that send prompts were not run.
 - Security and safety: listing commands are fixed argv vectors. Model ids
   are separate arguments. Diagnostics name the CLI and source, not stdout.
   Cache files store ids and labels only.
@@ -157,3 +167,5 @@ agent now closes the connect picker first.
   `--model` flag. This ticket ignores it.
 
 ## Updates
+
+- [2026-09-06 review fixes](updates/2026-09-06-review-fixes.md)

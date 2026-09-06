@@ -138,7 +138,7 @@ pub fn parse_opencode_models(
             }
         }
     }
-    if out.is_empty() && text.chars().any(|c| !c.is_whitespace()) {
+    if out.is_empty() {
         return Err(ModelParseError::Malformed);
     }
     Ok(out)

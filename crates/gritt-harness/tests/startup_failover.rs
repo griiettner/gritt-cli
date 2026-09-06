@@ -660,6 +660,7 @@ async fn a_completed_turn_remembers_the_choices_and_flags_and_config_win_over_th
             None,
             StartupRequest::default(),
             None,
+            false,
         )
         .await
     {
@@ -684,6 +685,7 @@ async fn a_completed_turn_remembers_the_choices_and_flags_and_config_win_over_th
                 Some(ReasoningEffort::High),
             ),
             None,
+            false,
         )
         .await
         .unwrap();
@@ -867,6 +869,7 @@ async fn a_completed_turn_remembers_the_choices_and_flags_and_config_win_over_th
             None,
             StartupRequest::from_flags(Some("openrouter"), Some("openai/gpt-5-mini"), None),
             None,
+            false,
         )
         .await
         .unwrap();
@@ -901,6 +904,7 @@ async fn a_resumed_session_keeps_its_profile_and_model_when_the_configuration_ch
             None,
             StartupRequest::default(),
             None,
+            false,
         )
         .await
         .unwrap();
@@ -937,6 +941,7 @@ async fn a_resumed_session_keeps_its_profile_and_model_when_the_configuration_ch
             None,
             StartupRequest::from_flags(None, None, Some(ReasoningEffort::High)),
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1082,6 +1087,7 @@ async fn the_draft_path_and_the_flag_path_share_the_resolver_and_its_notes() {
             None,
             StartupRequest::default(),
             None,
+            false,
         )
         .await
         .unwrap();
