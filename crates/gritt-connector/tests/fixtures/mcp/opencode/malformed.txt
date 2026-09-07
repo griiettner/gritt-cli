@@ -1,0 +1,2 @@
+Usage: opencode <command>
+unknown command mcp

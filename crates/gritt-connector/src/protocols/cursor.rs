@@ -82,6 +82,13 @@ impl Protocol for Cursor {
         args
     }
 
+    /// The published reference documents `mcp list` as an interactive
+    /// menu, not a machine-readable listing, so nothing is scraped.
+    fn mcp_list_unsupported_reason(&self) -> String {
+        "cursor-agent mcp list opens an interactive menu; no machine-readable listing is documented"
+            .to_owned()
+    }
+
     fn model_list_args(&self, _refresh: bool) -> Option<Vec<String>> {
         Some(vec!["--list-models".into()])
     }

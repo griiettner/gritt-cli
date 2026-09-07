@@ -4,9 +4,8 @@
   count: 25
   updated: 2026-09-06
   statuses:
-    - done: 23
+    - done: 24
     - in_progress: 1
-    - ready: 1
   areas:
     - .agents/cli
     - .agents/memory
@@ -22,3 +21,17 @@
     - docs
     - harness
     - provider
+- namespace: griiettner
+  range: TKT-0026-0050
+  file: .agents/tasks/griiettner/TKT-0026-0050/index.yaml
+  count: 2
+  updated: 2026-09-06
+  statuses:
+    - done: 1
+    - ready: 1
+  areas:
+    - crates/gritt
+    - crates/gritt-connector
+    - crates/gritt-core
+    - crates/gritt-harness
+    - crates/gritt-provider

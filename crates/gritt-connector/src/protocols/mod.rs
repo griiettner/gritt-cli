@@ -18,6 +18,26 @@ pub enum ModelParseError {
     Malformed,
 }
 
+/// Why a connector MCP listing could not be turned into an inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpParseError {
+    /// The CLI has no documented machine-readable listing.
+    Unsupported,
+    /// The output was not the documented inventory shape.
+    Malformed,
+}
+
+/// The transport word for an MCP server whose listing only shows its
+/// launch command or URL: `http` for a URL, `stdio` for a command. A CLI
+/// that names the transport itself (Codex) keeps its own word.
+pub(crate) fn transport_from_target(target: &str) -> &'static str {
+    if target.contains("://") {
+        "http"
+    } else {
+        "stdio"
+    }
+}
+
 /// The documented `--model` flag pair, or nothing when the user left the
 /// CLI default in place. The identifier is passed as a separate argument,
 /// never interpolated into a shell string.

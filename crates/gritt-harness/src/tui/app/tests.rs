@@ -30,6 +30,71 @@ fn plain() -> App {
 }
 
 #[test]
+fn adopting_a_native_session_discards_a_connector_draft() {
+    let mut app = plain();
+    app.connector_choice = Some(ConnectorId::Codex);
+    app.connector_model = Some("connector-only".into());
+    let mut session = connector_session(ConnectorId::Codex);
+    session.kind = gritt_core::session::SessionKind::Native {
+        provider_profile: "local".into(),
+        model: "native-model".into(),
+        effort: ReasoningEffort::default(),
+    };
+    app.set_session(&session);
+    assert!(!matches!(
+        app.dispatch(Command::Models, None),
+        Action::LoadConnectorCatalog { .. }
+    ));
+    assert!(app.connector_model.is_none());
+    assert!(app
+        .model_picker()
+        .rows()
+        .iter()
+        .all(|row| row.id != "__default__"));
+}
+
+#[test]
+fn changing_connectors_removes_foreign_models_before_loading() {
+    let mut app = fixture::home(Theme::new(ThemeMode::NoColor));
+    for agent in &mut app.agents {
+        agent.installed = true;
+        agent.authenticated = Some(true);
+        agent.name = agent.id.as_str().into();
+    }
+    app.connector_choice = Some(ConnectorId::Codex);
+    app.apply_connector_catalog(
+        app.selection,
+        ConnectorId::Codex,
+        ConnectorModelDiscovery::Current {
+            catalog: gritt_core::connector::ConnectorModelCatalog {
+                connector: ConnectorId::Codex,
+                models: vec![ConnectorModel {
+                    id: "codex-only".into(),
+                    display_label: None,
+                }],
+                source: "fixture".into(),
+                fetched_at: Utc::now(),
+                freshness: gritt_core::connector::ConnectorModelFreshness::Current,
+            },
+        },
+    );
+    app.dispatch(Command::Connect, None);
+    type_text(&mut app, "claude");
+    assert!(matches!(
+        app.on_key(key(KeyCode::Enter)),
+        Action::LoadConnectorCatalog {
+            connector: ConnectorId::ClaudeCode,
+            ..
+        }
+    ));
+    assert!(app
+        .model_picker()
+        .rows()
+        .iter()
+        .all(|row| row.id != "codex-only"));
+}
+
+#[test]
 fn modes_are_selectable_by_command_and_keyboard_but_not_during_work() {
     use gritt_core::session::ExecutionMode;
     let mut app = plain();
@@ -2099,7 +2164,7 @@ fn an_unsupported_connector_catalog_still_offers_the_agent_default() {
 }
 
 /// The MCP inventory is Gritt's on a connector session, and the agent's
-/// own MCP state is named as unreported rather than being stood in for.
+/// own servers arrive separately and are drawn under their own label.
 #[test]
 fn a_connector_session_does_not_relabel_gritts_mcp_inventory() {
     let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
@@ -2127,7 +2192,48 @@ fn a_connector_session_does_not_relabel_gritts_mcp_inventory() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("MCP owned by Gritt"), "{text}");
-    assert!(text.contains("codex's own MCP: not reported"), "{text}");
+    assert!(text.contains("codex's own MCP: checking"), "{text}");
+    assert!(!text.contains("not reported"), "{text}");
+
+    // A result for another connector is dropped; the live one lands in
+    // its own field and never touches Gritt's list.
+    let other = gritt_core::connector::ConnectorMcpDiscovery::Unsupported {
+        connector: gritt_core::connector::ConnectorId::Cursor,
+        reason: "interactive menu".into(),
+    };
+    assert!(!app.apply_connector_mcp(gritt_core::connector::ConnectorId::Cursor, other));
+    let inventory = gritt_core::connector::ConnectorMcpInventory {
+        connector: gritt_core::connector::ConnectorId::Codex,
+        servers: vec![gritt_core::connector::ConnectorMcpServer {
+            name: "playwright".into(),
+            transport: Some("stdio".into()),
+            target: Some("npx".into()),
+            status: gritt_core::connector::ConnectorMcpStatus::Enabled,
+            detail: None,
+        }],
+        source: "codex mcp list --json".into(),
+        fetched_at: chrono::Utc::now(),
+    };
+    assert!(app.apply_connector_mcp(
+        gritt_core::connector::ConnectorId::Codex,
+        gritt_core::connector::ConnectorMcpDiscovery::Current { inventory },
+    ));
+    assert_eq!(app.sidebar.integrations.mcp.as_ref().map(Vec::len), Some(1));
+    let text = app
+        .sidebar
+        .lines(&app.theme, 30)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("gritt-server ready"), "{text}");
+    assert!(text.contains("codex's own MCP (1)"), "{text}");
+    assert!(text.contains("playwright enabled"), "{text}");
 }
 
 // -- connector CLI versions and updates (TKT-0025) --------------------------

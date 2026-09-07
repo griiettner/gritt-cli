@@ -11,8 +11,8 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use gritt_core::connector::{
-    AuthState, ConnectorId, ConnectorModelDiscovery, ConnectorUpdateOutcome, ConnectorVersionCheck,
-    VersionCheckMode,
+    AuthState, ConnectorId, ConnectorMcpDiscovery, ConnectorModelDiscovery, ConnectorUpdateOutcome,
+    ConnectorVersionCheck, VersionCheckMode,
 };
 use gritt_core::event::{ApprovalDecision, ApprovalRequest, Event};
 use gritt_core::mcp::McpServerSnapshot;
@@ -81,6 +81,13 @@ enum UiMsg {
         operation: u64,
         connector: ConnectorId,
         result: ConnectorUpdateOutcome,
+    },
+    /// The live connector session's own MCP inventory, read once after
+    /// the session is adopted. Never on the path to opening it.
+    ConnectorMcp {
+        generation: u64,
+        connector: ConnectorId,
+        result: ConnectorMcpDiscovery,
     },
     Sessions {
         operation: u64,
@@ -573,7 +580,8 @@ async fn agent_summaries(plane: &ControlPlane) -> Vec<AgentSummary> {
 
 /// Takes a driver as the live session: history, identity, effort, and the
 /// catalog figures behind usage and cost.
-async fn adopt(app: &mut App, plane: &ControlPlane, agent: &dyn Driver) -> Result<()> {
+async fn adopt(app: &mut App, runtime: &Runtime, agent: &dyn Driver) -> Result<()> {
+    let plane = &runtime.plane;
     app.entries.clear();
     // The sidebar moves to a new generation here, so a scan or a catalog
     // load still in flight for the previous session cannot land on this one.
@@ -599,6 +607,37 @@ async fn adopt(app: &mut App, plane: &ControlPlane, agent: &dyn Driver) -> Resul
         Some(mcp) => mcp.snapshots().await,
         None => Vec::new(),
     });
+    // Both initial drivers and later session transitions get the same
+    // advisory check, independently of interactive work.
+    if let Some(connector) = app.connector {
+        let plane = Arc::clone(&runtime.plane);
+        let tx = runtime.tx.clone();
+        let generation = app.sidebar.generation;
+        runtime.spawn_detached(async move {
+            let result = plane
+                .connector_version(connector, VersionCheckMode::Cached)
+                .await;
+            let _ = tx.send(UiMsg::ConnectorVersion {
+                operation: 0,
+                generation,
+                connector,
+                result,
+            });
+        });
+        // The agent's own MCP listing is a separate process and does not
+        // wait for the version check. Bounded by the health timeout;
+        // every outcome is typed.
+        let plane = Arc::clone(&runtime.plane);
+        let tx = runtime.tx.clone();
+        runtime.spawn_detached(async move {
+            let result = plane.connector_mcp_inventory(connector).await;
+            let _ = tx.send(UiMsg::ConnectorMcp {
+                generation,
+                connector,
+                result,
+            });
+        });
+    }
     Ok(())
 }
 
@@ -667,7 +706,7 @@ async fn event_loop(
     };
     let mut idle_agent: Option<Box<dyn Driver>> = None;
     if let Some(agent) = agent {
-        adopt(&mut app, &runtime.plane, agent.as_ref()).await?;
+        adopt(&mut app, &runtime, agent.as_ref()).await?;
         idle_agent = Some(agent);
     }
     // The baseline is taken before anything else can change the workspace,
@@ -1229,6 +1268,16 @@ async fn on_message(
             }
             app.apply_connector_update(connector, result);
         }
+        UiMsg::ConnectorMcp {
+            generation,
+            connector,
+            result,
+        } => {
+            if generation != app.sidebar.generation {
+                return Ok(Action::None);
+            }
+            app.apply_connector_mcp(connector, result);
+        }
         UiMsg::Sessions {
             operation,
             sessions,
@@ -1280,27 +1329,7 @@ async fn on_message(
                     // The driver being replaced goes away only now that
                     // its replacement exists.
                     drop(pending.previous);
-                    adopt(app, &runtime.plane, driver.as_ref()).await?;
-                    // The CLI's version is advisory and reads local
-                    // evidence plus the cache first, so it runs detached:
-                    // it never supersedes the user's request and never
-                    // delays the session it describes.
-                    if let Some(connector) = app.connector {
-                        let plane = Arc::clone(&runtime.plane);
-                        let tx = runtime.tx.clone();
-                        let generation = app.sidebar.generation;
-                        runtime.spawn_detached(async move {
-                            let result = plane
-                                .connector_version(connector, VersionCheckMode::Cached)
-                                .await;
-                            let _ = tx.send(UiMsg::ConnectorVersion {
-                                operation: 0,
-                                generation,
-                                connector,
-                                result,
-                            });
-                        });
-                    }
+                    adopt(app, runtime, driver.as_ref()).await?;
                     app.show_draft_warnings(&warnings);
                     *idle_agent = Some(driver);
                     scan_changes(runtime, app.sidebar.generation);
@@ -2664,6 +2693,62 @@ mod tests {
             .await
             .unwrap()
         }
+    }
+
+    #[tokio::test]
+    async fn adopting_an_initial_connector_requests_its_version() {
+        let mut h = harness().await;
+        let now = chrono::Utc::now();
+        let session = Session {
+            id: SessionId("initial-connector".into()),
+            name: "initial".into(),
+            kind: SessionKind::Connector {
+                id: ConnectorId::Codex,
+                model: None,
+            },
+            phase: Phase::Coding,
+            workspace: h._dir.path().to_owned(),
+            created_at: now,
+            updated_at: now,
+            parent_id: None,
+        };
+        h.runtime
+            .plane
+            .builder
+            .store
+            .create(session.clone())
+            .await
+            .unwrap();
+        let driver = StubDriver {
+            session,
+            turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        adopt(&mut h.app, &h.runtime, &driver).await.unwrap();
+        // The version check and the agent's own MCP listing are read
+        // independently, so they land in either order.
+        let mut saw_version = false;
+        let mut saw_mcp = false;
+        for _ in 0..2 {
+            let msg = tokio::time::timeout(Duration::from_secs(5), h.rx.recv())
+                .await
+                .expect("initial adoption must request version status and MCP inventory")
+                .unwrap();
+            match &msg {
+                UiMsg::ConnectorVersion {
+                    connector: ConnectorId::Codex,
+                    ..
+                } => saw_version = true,
+                UiMsg::ConnectorMcp {
+                    connector: ConnectorId::Codex,
+                    ..
+                } => saw_mcp = true,
+                _ => panic!("unexpected message after adoption"),
+            }
+            h.message(msg).await;
+        }
+        assert!(saw_version && saw_mcp);
+        assert!(h.app.sidebar.model.version.is_some());
+        assert!(h.app.sidebar.integrations.connector_mcp_inventory.is_some());
     }
 
     #[tokio::test]

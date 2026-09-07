@@ -202,10 +202,9 @@ pub fn update_action(
         InstallSource::Homebrew { name, cask: false } => {
             ("brew".into(), vec!["upgrade".into(), name.clone()])
         }
-        InstallSource::Npm { package } => (
-            "npm".into(),
-            vec!["install".into(), "-g".into(), format!("{package}@latest")],
-        ),
+        // An npm package can be local, global, or owned by another Node
+        // manager. Only the lifecycle check can verify npm's global root.
+        InstallSource::Npm { .. } => return None,
         InstallSource::Pipx { package } => ("pipx".into(), vec!["upgrade".into(), package.clone()]),
         InstallSource::Cargo { crate_name } => {
             ("cargo".into(), vec!["install".into(), crate_name.clone()])
@@ -230,6 +229,52 @@ pub fn update_action(
     })
 }
 
+/// Offers an npm update only when this manager's global root contains the
+/// selected package. Pin the manager and prefix so another npm on PATH or
+/// a different current directory cannot redirect the approved update.
+pub fn npm_update_action(
+    source: &InstallSource,
+    executable: &Path,
+    manager: &Path,
+    global_root: &Path,
+) -> Option<UpdateAction> {
+    let InstallSource::Npm { package } = source else {
+        return None;
+    };
+    let root = std::fs::canonicalize(global_root).ok()?;
+    let package_dir = std::fs::canonicalize(root.join(package)).ok()?;
+    // `npm link` can expose a project-local package from the global root.
+    // Replacing that link would not update an explicitly configured local executable.
+    if package_dir != root.join(package) {
+        return None;
+    }
+    let executable = std::fs::canonicalize(executable).ok()?;
+    if !executable.starts_with(&package_dir) || root.file_name()? != "node_modules" {
+        return None;
+    }
+    let parent = root.parent()?;
+    #[cfg(unix)]
+    let prefix = {
+        if parent.file_name()? != "lib" {
+            return None;
+        }
+        parent.parent()?
+    };
+    #[cfg(windows)]
+    let prefix = parent;
+    Some(UpdateAction {
+        program: manager.display().to_string(),
+        args: vec![
+            "install".into(),
+            "-g".into(),
+            "--prefix".into(),
+            prefix.display().to_string(),
+            format!("{package}@latest"),
+        ],
+        source: source.clone(),
+    })
+}
+
 /// What the user can do when no update is offered.
 pub fn next_step(source: &InstallSource, executable: &Path) -> Option<String> {
     let path = executable.display();
@@ -243,6 +288,9 @@ pub fn next_step(source: &InstallSource, executable: &Path) -> Option<String> {
              check again",
             candidates.join(" or ")
         )),
+        InstallSource::Npm { .. } => Some(
+            "the selected npm has not verified ownership of this global installation; refresh the check or update it with its original installer".into()
+        ),
         InstallSource::Pipx { .. } | InstallSource::Vendor { .. } => Some(
             "this installer does not publish a newest version Gritt can read; the update \
              command reports whether anything changed"
@@ -516,10 +564,7 @@ mod tests {
                 InstallSource::Npm {
                     package: "@anthropic-ai/claude-code".into(),
                 },
-                Some((
-                    "npm",
-                    vec!["install", "-g", "@anthropic-ai/claude-code@latest"],
-                )),
+                None,
             ),
             (
                 InstallSource::Pipx {

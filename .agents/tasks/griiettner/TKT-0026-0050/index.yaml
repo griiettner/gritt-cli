@@ -1,0 +1,54 @@
+tickets:
+  - id: TKT-0026
+    namespace: griiettner
+    title: Report each connector's own MCP inventory at session start
+    status: done
+    owner: griiettner
+    priority: normal
+    created: 2026-09-06
+    updated: 2026-09-06
+    artifacts:
+      concept: .agents/tasks/griiettner/TKT-0026-0050/TKT-0026/concept.md
+      plan: .agents/tasks/griiettner/TKT-0026-0050/TKT-0026/plan.md
+      task: .agents/tasks/griiettner/TKT-0026-0050/TKT-0026/task.md
+      report: .agents/tasks/griiettner/TKT-0026-0050/TKT-0026/report.md
+    dependencies:
+      - TKT-0012
+      - TKT-0024
+    areas:
+      - crates/gritt-core
+      - crates/gritt-connector
+      - crates/gritt-harness
+      - crates/gritt
+    skills:
+      - dev-provider
+      - dev-harness
+      - dev-cli
+      - codebase-design
+      - tdd
+      - write
+  - id: TKT-0027
+    namespace: griiettner
+    title: Allow provider and model changes within an active conversation
+    status: ready
+    owner: griiettner
+    priority: normal
+    created: 2026-09-06
+    updated: 2026-09-06
+    artifacts:
+      concept: .agents/tasks/griiettner/TKT-0026-0050/TKT-0027/concept.md
+      plan: .agents/tasks/griiettner/TKT-0026-0050/TKT-0027/plan.md
+      task: .agents/tasks/griiettner/TKT-0026-0050/TKT-0027/task.md
+    dependencies:
+      - TKT-0015
+    areas:
+      - crates/gritt-core
+      - crates/gritt-provider
+      - crates/gritt-harness
+      - crates/gritt
+    skills:
+      - codebase-design
+      - tdd
+      - dev-harness
+      - dev-provider
+      - write

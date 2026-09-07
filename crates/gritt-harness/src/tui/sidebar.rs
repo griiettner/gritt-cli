@@ -9,6 +9,7 @@
 //! apart and only reports occupancy when both the current context size and
 //! the model limit are known.
 
+use gritt_core::connector::{ConnectorMcpDiscovery, ConnectorMcpStatus};
 use gritt_core::mcp::{McpServerSnapshot, McpServerState};
 use ratatui::text::{Line, Span};
 
@@ -130,10 +131,14 @@ pub struct IntegrationsSection {
     /// Who owns the servers in `mcp`. Always Gritt for this list: it comes
     /// from Gritt's runtime and Gritt's `.mcp.json`.
     pub mcp_owner: Option<String>,
-    /// The connector whose *own* MCP clients Gritt cannot see. Set while a
-    /// connector session is active, so the unknown is stated instead of
-    /// Gritt's list standing in for it (ADR-010).
+    /// The connector whose *own* MCP servers are listed separately. Set
+    /// while a connector session is active, so Gritt's list never stands
+    /// in for the agent's (ADR-010).
     pub connector_mcp: Option<String>,
+    /// That connector's own inventory once its documented listing ran:
+    /// the servers, or the typed reason there are none to show. `None`
+    /// while the listing is still running.
+    pub connector_mcp_inventory: Option<ConnectorMcpDiscovery>,
 }
 
 /// Everything the sidebar shows for one session.
@@ -366,12 +371,6 @@ impl SidebarModel {
                     theme.muted(),
                 )));
             }
-            if let Some(connector) = &self.integrations.connector_mcp {
-                lines.push(Line::from(Span::styled(
-                    truncate(&format!("{connector}'s own MCP: not reported"), width),
-                    theme.dim(),
-                )));
-            }
             if servers.is_empty() {
                 lines.push(Line::from(Span::styled(
                     "no MCP servers configured".to_owned(),
@@ -404,8 +403,83 @@ impl SidebarModel {
                     theme.muted(),
                 )));
             }
+            // The agent's own servers come after Gritt's, under their own
+            // label, so the two inventories are never read as one.
+            if let Some(connector) = &self.integrations.connector_mcp {
+                lines.push(Line::default());
+                self.connector_mcp_lines(theme, width, connector, &mut lines);
+            }
         }
         lines
+    }
+
+    fn connector_mcp_lines(
+        &self,
+        theme: &Theme,
+        width: usize,
+        connector: &str,
+        lines: &mut Vec<Line<'static>>,
+    ) {
+        let label = |word: &str| format!("{connector}'s own MCP: {word}");
+        match &self.integrations.connector_mcp_inventory {
+            None => lines.push(Line::from(Span::styled(
+                truncate(&label("checking"), width),
+                theme.dim(),
+            ))),
+            Some(ConnectorMcpDiscovery::Current { inventory }) => {
+                if inventory.servers.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        truncate(&label("none configured"), width),
+                        theme.muted(),
+                    )));
+                    return;
+                }
+                lines.push(Line::from(Span::styled(
+                    truncate(
+                        &format!("{connector}'s own MCP ({})", inventory.servers.len()),
+                        width,
+                    ),
+                    theme.muted(),
+                )));
+                for server in &inventory.servers {
+                    let word = server.status.label();
+                    let style = match server.status {
+                        ConnectorMcpStatus::Connected => theme.success(),
+                        ConnectorMcpStatus::Failed => theme.error(),
+                        ConnectorMcpStatus::NeedsAuth | ConnectorMcpStatus::PendingApproval => {
+                            theme.warning()
+                        }
+                        _ => theme.muted(),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            truncate(&server.name, width.saturating_sub(word.len() + 1)),
+                            theme.text(),
+                        ),
+                        Span::styled(format!(" {word}"), style),
+                    ]));
+                    if let Some(detail) = server.detail.as_deref().or(server.target.as_deref()) {
+                        lines.push(Line::from(Span::styled(
+                            truncate(&format!("  {detail}"), width),
+                            theme.muted(),
+                        )));
+                    }
+                }
+            }
+            Some(other) => {
+                let Some((word, reason)) = other.failure() else {
+                    return;
+                };
+                lines.push(Line::from(Span::styled(
+                    truncate(&label(word), width),
+                    theme.dim(),
+                )));
+                lines.push(Line::from(Span::styled(
+                    truncate(&format!("  {reason}"), width),
+                    theme.dim(),
+                )));
+            }
+        }
     }
 }
 
@@ -552,6 +626,7 @@ mod tests {
                 ]),
                 mcp_owner: None,
                 connector_mcp: None,
+                connector_mcp_inventory: None,
             },
             ..SidebarModel::default()
         };
@@ -563,12 +638,82 @@ mod tests {
     }
 
     #[test]
+    fn a_connectors_own_servers_are_listed_apart_from_gritts() {
+        use gritt_core::connector::{ConnectorId, ConnectorMcpInventory, ConnectorMcpServer};
+        let inventory = ConnectorMcpInventory {
+            connector: ConnectorId::Codex,
+            servers: vec![
+                ConnectorMcpServer {
+                    name: "playwright".into(),
+                    transport: Some("stdio".into()),
+                    target: Some("npx".into()),
+                    status: ConnectorMcpStatus::Enabled,
+                    detail: None,
+                },
+                ConnectorMcpServer {
+                    name: "design".into(),
+                    transport: Some("streamable_http".into()),
+                    target: Some("https://design.example.invalid/mcp".into()),
+                    status: ConnectorMcpStatus::NeedsAuth,
+                    detail: Some("not logged in".into()),
+                },
+            ],
+            source: "codex mcp list --json".into(),
+            fetched_at: chrono::Utc::now(),
+        };
+        let mut model = SidebarModel {
+            integrations: IntegrationsSection {
+                mcp: Some(Vec::new()),
+                mcp_owner: Some("Gritt".into()),
+                connector_mcp: Some("codex".into()),
+                connector_mcp_inventory: None,
+            },
+            ..SidebarModel::default()
+        };
+        let text = text_of(&model.lines(&Theme::new(ThemeMode::NoColor), 30));
+        assert!(text.contains("codex's own MCP: checking"), "{text}");
+        assert!(!text.contains("not reported"), "{text}");
+
+        model.integrations.connector_mcp_inventory =
+            Some(ConnectorMcpDiscovery::Current { inventory });
+        let text = text_of(&model.lines(&Theme::new(ThemeMode::NoColor), 30));
+        assert!(text.contains("MCP owned by Gritt"), "{text}");
+        assert!(text.contains("no MCP servers configured"), "{text}");
+        assert!(text.contains("codex's own MCP (2)"), "{text}");
+        assert!(text.contains("playwright enabled"), "{text}");
+        assert!(text.contains("design needs auth"), "{text}");
+        assert!(text.contains("not logged in"), "{text}");
+        let gritt_at = text.find("MCP owned by Gritt").unwrap();
+        let codex_at = text.find("codex's own MCP").unwrap();
+        assert!(
+            gritt_at < codex_at,
+            "the two inventories must stay apart: {text}"
+        );
+
+        model.integrations.connector_mcp_inventory = Some(ConnectorMcpDiscovery::Unsupported {
+            connector: ConnectorId::Cursor,
+            reason: "opens an interactive menu".into(),
+        });
+        let text = text_of(&model.lines(&Theme::new(ThemeMode::NoColor), 30));
+        assert!(text.contains("codex's own MCP: not listable"), "{text}");
+        assert!(text.contains("interactive menu"), "{text}");
+
+        model.integrations.connector_mcp_inventory = Some(ConnectorMcpDiscovery::TimedOut {
+            connector: ConnectorId::Codex,
+            reason: "codex did not answer within 15s".into(),
+        });
+        let text = text_of(&model.lines(&Theme::new(ThemeMode::NoColor), 30));
+        assert!(text.contains("codex's own MCP: timed out"), "{text}");
+    }
+
+    #[test]
     fn a_checked_but_empty_inventory_may_say_none() {
         let model = SidebarModel {
             integrations: IntegrationsSection {
                 mcp: Some(Vec::new()),
                 mcp_owner: None,
                 connector_mcp: None,
+                connector_mcp_inventory: None,
             },
             ..SidebarModel::default()
         };

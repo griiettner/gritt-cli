@@ -281,7 +281,21 @@ pub async fn run_repl<O: Write + Send, E: Write + Send>(
                                 matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
                             });
                             let outcome = if approved {
-                                plane.connector_update(id, action).await
+                                let cancel = crate::CancellationToken::new();
+                                *cancel_slot.lock().expect("cancel slot") =
+                                    Some(CancelHandle::new(
+                                        cancel.clone(),
+                                        crate::tools::ProcessRegistry::new(),
+                                    ));
+                                let result = plane
+                                    .connector_update_until(
+                                        id,
+                                        action,
+                                        Box::pin(cancel.cancelled()),
+                                    )
+                                    .await;
+                                *cancel_slot.lock().expect("cancel slot") = None;
+                                result
                             } else {
                                 ConnectorUpdateOutcome::Declined { connector: id }
                             };

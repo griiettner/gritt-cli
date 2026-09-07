@@ -102,6 +102,43 @@ marks it stale rather than presenting it as current. A missing CLI,
 unsupported listing command, failed command, or unreadable output is a
 typed diagnostic and does not affect native sessions or other connectors.
 
+## The agent's own MCP servers
+
+An external agent keeps its own MCP servers, approvals, and logins
+(ADR-010). Gritt does not manage them, but it does show them: opening a
+connector session runs that agent's documented listing command once, in
+the session workspace so project-scoped servers count, and reports every
+server with a normalized status, through one control-plane operation
+print, REPL, and the full-screen UI share.
+
+| Connector | List | Status source |
+| --- | --- | --- |
+| Codex | `codex mcp list --json` | configuration only: `enabled`, `disabled`, or `needs auth` when Codex reports `not_logged_in` |
+| Claude Code | `claude mcp list` | Claude's own live health check: `connected`, `failed`, `pending approval`, `needs auth`, `disabled` |
+| Cursor | none machine-readable (shown as unsupported) | `cursor-agent mcp list` opens an interactive menu, which Gritt does not scrape |
+| OpenCode | `opencode mcp list` | OpenCode's own check: `connected`, `failed`, `disabled`, `needs auth` |
+
+The inventory is display only. Nothing here adds, removes, enables,
+approves, or connects to a server; use the agent's own CLI for that.
+Gritt's own MCP list (`.mcp.json`, `/mcp`, `gritt mcp`) is unaffected and
+is always shown apart from the agent's, under `MCP owned by Gritt` in the
+sidebar and as its own startup note in print and REPL mode, so one
+agent's server is never mistaken for another's.
+
+Only a server's name, transport, launch command or URL, status, and the
+agent's own hint are kept, as display text. A credential-looking option
+value in the command (`--api-key ...`), a URL's userinfo and query string,
+and any value Gritt knows to be a secret are redacted before storage, and
+environment values, headers, and argument vectors are never read from the
+listing at all.
+
+The read is bounded by the connector's health check timeout and is not
+cached: a missing CLI, an unsupported listing, a failed command, a
+timeout, or unreadable output is its own typed diagnostic, leaves the
+session usable, and never affects native sessions or another connector.
+The full-screen UI reads the inventory in the background after the
+session opens and shows `checking` until it lands.
+
 ## Versions and updates
 
 Gritt can tell when an installed agent CLI is behind the newest version its
@@ -121,7 +158,7 @@ no evidence is reported as unknown with the same result.
 | --- | --- | --- |
 | Homebrew formula | `brew info --json=v2 <name>` | `brew upgrade <name>` |
 | Homebrew cask | `brew info --json=v2 <name>` | `brew upgrade --cask <name>` |
-| npm | `npm view <package> version` | `npm install -g <package>@latest` |
+| npm | `npm view <package> version` | `<npm path> install -g --prefix <verified prefix> <package>@latest` |
 | Cargo | `cargo search <crate> --limit 1` | `cargo install <crate>` |
 | pipx | not published | `pipx upgrade <package>` |
 | Claude Code native installer | not published | `claude update` |
@@ -131,6 +168,11 @@ no evidence is reported as unknown with the same result.
 Every command is an executable plus a fixed argument vector. It is shown to
 you exactly as it runs and never joined into a shell string. Nothing from a
 prompt, a credential, or the agent's output enters it.
+
+For npm, Gritt also checks `npm root --global` and verifies that the selected
+executable belongs to that installation. Local packages and installations
+owned by another npm executable offer no update. The approved command fixes
+both the npm executable and its installation prefix.
 
 - `gritt connectors --check` reports each installed agent's version, owner,
   newest published version, and the command Gritt would run. `--refresh`
@@ -154,11 +196,16 @@ offer. Network, authentication, malformed, and unsupported-source failures
 are reported by class; the text a package manager printed stays in the
 process.
 
+Version caches belong to an executable, installation source, and querying
+manager. Changing those discards the old answer. Older cache entries without
+that identity are refreshed before use.
+
 An update runs through the same supervised process path as an agent task:
 it is cancellable, stops after a bounded silence, and its process tree is
-killed either way. Its last output lines are kept, redacted and capped, for
-the failure report. A declined, failed, or cancelled update leaves the
-connector as it was.
+killed on cancellation or timeout. Failure reports contain the command and
+exit status; package-manager stdout and stderr are discarded because they can
+contain credentials Gritt does not know. Ctrl-C cancels an update in the CLI
+or REPL and waits for cleanup. The REPL then accepts another command.
 
 ## PTY fallback
 

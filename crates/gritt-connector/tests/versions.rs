@@ -10,18 +10,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{Duration as ChronoDuration, Utc};
 use gritt_connector::install::{detect_install_source, update_action, InstallEnv, VendorInstall};
 use gritt_connector::process::is_alive;
 use gritt_connector::protocols::claude::ClaudeCode;
 use gritt_connector::protocols::codex::Codex;
 use gritt_connector::protocols::opencode::OpenCode;
-use gritt_connector::versions::{CachedConnectorVersion, ConnectorVersionCache};
+use gritt_connector::versions::ConnectorVersionCache;
 use gritt_connector::{ExternalConnector, Protocol, Timeouts};
 use gritt_core::config::{ConnectorSettings, ModelListPolicy};
 use gritt_core::connector::{
-    Connector, ConnectorId, ConnectorUpdateOutcome, ConnectorVersionCheck, InstallSource,
-    VersionCheckFailure, VersionCheckMode, VersionComparison, VersionFreshness,
+    Connector, ConnectorUpdateOutcome, ConnectorVersionCheck, InstallSource, VersionCheckFailure,
+    VersionCheckMode, VersionComparison, VersionFreshness,
 };
 use gritt_core::secret::Secret;
 
@@ -50,8 +49,21 @@ fn fake_agent(path: &Path, vars: &[(&str, String)]) {
 
 /// A fake package manager that records its arguments and prints `stdout`.
 fn fake_manager(path: &Path, args_file: &Path, stdout: &str, exit: i32, stderr: &str) {
+    let root_probe = if path.file_name().unwrap() == "npm" {
+        format!(
+            "if [ \"$1\" = root ]; then echo '{}'; exit 0; fi\n",
+            path.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("lib/node_modules")
+                .display()
+        )
+    } else {
+        String::new()
+    };
     let body = format!(
-        ": > '{args}'\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{args}'; done\n\
+        "{root_probe}: > '{args}'\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{args}'; done\n\
          if [ -n '{stderr}' ]; then echo '{stderr}' >&2; fi\n\
          cat <<'FAKE_EOF'\n{stdout}\nFAKE_EOF\nexit {exit}\n",
         args = args_file.display(),
@@ -121,6 +133,135 @@ fn env(home: &Path) -> InstallEnv {
     }
 }
 
+#[tokio::test]
+async fn probe_timeout_stops_descendants() {
+    let root = tempfile::tempdir().unwrap();
+    let exe = root.path().join("probe");
+    let pid_file = root.path().join("descendant.pid");
+    write_script(
+        &exe,
+        &format!("sleep 30 &\necho $! > '{}'\nwait\n", pid_file.display()),
+    );
+    assert!(
+        gritt_connector::health::probe(&exe, &[], Duration::from_secs(2))
+            .await
+            .is_err()
+    );
+    let pid: u32 = std::fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let alive = is_alive(pid).await;
+    if alive {
+        gritt_connector::process::kill_tree(pid).await;
+    }
+    assert!(!alive, "a timed-out probe left its descendant running");
+}
+
+#[tokio::test]
+async fn failed_updates_do_not_retain_package_manager_content() {
+    let fx = vendor_fixture(&[]);
+    write_script(&fx.exe, "if [ \"$1\" = --version ]; then echo 1.0.0; exit 0; fi\necho 'registry failure https://fixture-user:fixture-password@registry.invalid/' >&2\nexit 1\n");
+    let connector = vendor_connector(&fx);
+    let action = connector
+        .check_version(VersionCheckMode::Refresh)
+        .await
+        .status()
+        .unwrap()
+        .update
+        .clone()
+        .unwrap();
+    let outcome = connector.update(action).await;
+    let ConnectorUpdateOutcome::Failed { reason, output, .. } = outcome else {
+        panic!("expected failure")
+    };
+    assert!(reason.contains("status 1"));
+    assert!(
+        output.is_empty(),
+        "package-manager content must stay out of diagnostics"
+    );
+}
+
+#[tokio::test]
+async fn a_local_npm_install_never_offers_a_global_update() {
+    let fx = npm_fixture("1.0.0", "2.0.0", 0, "");
+    let package = fx._root.path().join("project/node_modules/@openai/codex");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("package.json"), "{}").unwrap();
+    let exe = package.join("bin/codex");
+    fake_agent(&exe, &[]);
+    let check = connector(
+        Codex,
+        "codex",
+        &exe,
+        &fx.home,
+        BTreeMap::from([("npm".into(), fx.npm.clone())]),
+        None,
+    )
+    .check_version(VersionCheckMode::Refresh)
+    .await;
+    assert!(
+        check.status().unwrap().update.is_none(),
+        "a local package must not be updated globally"
+    );
+    assert!(check.status().unwrap().next_step.is_some());
+}
+
+#[test]
+fn a_globally_linked_local_package_is_not_replaced_by_an_update() {
+    let root = tempfile::tempdir().unwrap();
+    let global_root = root.path().join("lib/node_modules");
+    let local = root.path().join("project/node_modules/fixture-cli");
+    let exe = local.join("bin/cli");
+    write_script(&exe, "exit 0\n");
+    std::fs::create_dir_all(&global_root).unwrap();
+    symlink(&local, global_root.join("fixture-cli")).unwrap();
+    let action = gritt_connector::install::npm_update_action(
+        &InstallSource::Npm {
+            package: "fixture-cli".into(),
+        },
+        &exe,
+        &root.path().join("bin/npm"),
+        &global_root,
+    );
+    assert!(
+        action.is_none(),
+        "a global link does not make the local package a global installation"
+    );
+}
+
+#[tokio::test]
+async fn changing_installation_source_does_not_reuse_a_fresh_version() {
+    let fx = npm_fixture("1.0.0", "2.0.0", 0, "");
+    npm_connector(&fx)
+        .check_version(VersionCheckMode::Refresh)
+        .await;
+    let exe = fx._root.path().join("Cellar/codex/1.0.0/bin/codex");
+    fake_agent(&exe, &[]);
+    let brew = fx._root.path().join("managers/brew");
+    let args = fx._root.path().join("brew-args");
+    fake_manager(
+        &brew,
+        &args,
+        r#"{"formulae":[{"name":"codex","versions":{"stable":"3.0.0"}}]}"#,
+        0,
+        "",
+    );
+    let check = connector(
+        Codex,
+        "codex",
+        &exe,
+        &fx.home,
+        BTreeMap::from([("brew".into(), brew)]),
+        Some(&fx.cache),
+    )
+    .check_version(VersionCheckMode::Cached)
+    .await;
+    assert_eq!(check.status().unwrap().latest.as_deref(), Some("3.0.0"));
+    assert!(args.exists(), "a new install source must be checked");
+}
+
 // -- owner detection -------------------------------------------------------
 
 #[test]
@@ -181,10 +322,30 @@ fn npm_needs_the_package_manifest_and_reads_a_scoped_name() {
             package: "@anthropic-ai/claude-code".into()
         }
     );
-    let action = update_action(&source, &link, None).unwrap();
+    assert!(
+        update_action(&source, &link, None).is_none(),
+        "a manifest alone does not prove global ownership"
+    );
+    let manager = root.path().join("bin/npm");
+    let action = gritt_connector::install::npm_update_action(
+        &source,
+        &link,
+        &manager,
+        &root.path().join("lib/node_modules"),
+    )
+    .unwrap();
     assert_eq!(
         action.args,
-        vec!["install", "-g", "@anthropic-ai/claude-code@latest"]
+        vec![
+            "install".to_owned(),
+            "-g".into(),
+            "--prefix".into(),
+            std::fs::canonicalize(root.path())
+                .unwrap()
+                .display()
+                .to_string(),
+            "@anthropic-ai/claude-code@latest".into()
+        ]
     );
 }
 
@@ -362,8 +523,20 @@ async fn an_outdated_npm_install_reports_both_versions_the_owner_and_the_exact_a
         .update
         .as_ref()
         .expect("an outdated install offers its command");
-    assert_eq!(action.program, "npm");
-    assert_eq!(action.args, vec!["install", "-g", "@openai/codex@latest"]);
+    assert_eq!(action.program, fx.npm.display().to_string());
+    assert_eq!(
+        action.args,
+        vec![
+            "install".to_owned(),
+            "-g".into(),
+            "--prefix".into(),
+            std::fs::canonicalize(fx._root.path())
+                .unwrap()
+                .display()
+                .to_string(),
+            "@openai/codex@latest".into()
+        ]
+    );
     assert!(check.update_available());
     assert_eq!(
         recorded_args(&fx.args),
@@ -407,20 +580,16 @@ async fn a_fresh_cache_answers_without_querying_and_a_refresh_queries_again() {
 
 #[tokio::test]
 async fn a_failed_query_falls_back_to_the_stale_cache_and_stays_stale() {
-    let fx = npm_fixture("1.0.0", "", 1, "npm ERR! code ENOTFOUND registry.npmjs.org");
-    let cache = ConnectorVersionCache::new(&fx.cache);
-    cache
-        .write(
-            ConnectorId::Codex,
-            &CachedConnectorVersion {
-                checked_at: Some(Utc::now() - ChronoDuration::minutes(1)),
-                last_attempt_at: Some(Utc::now() - ChronoDuration::minutes(1)),
-                latest: Some("1.5.0".into()),
-                latest_source: Some("npm view @openai/codex version".into()),
-            },
-        )
-        .unwrap();
+    let fx = npm_fixture("1.0.0", "1.5.0", 0, "");
     let connector = npm_connector(&fx);
+    connector.check_version(VersionCheckMode::Refresh).await;
+    fake_manager(
+        &fx.npm,
+        &fx.args,
+        "",
+        1,
+        "npm ERR! code ENOTFOUND registry.npmjs.org",
+    );
     let refreshed = connector.check_version(VersionCheckMode::Refresh).await;
     let ConnectorVersionCheck::CachedStale { status, reason } = &refreshed else {
         panic!("expected stale fallback, got {refreshed:?}");
@@ -757,9 +926,8 @@ async fn a_failed_update_reports_the_outcome_and_redacts_secrets() {
     };
     assert!(reason.contains("status 1"), "{reason}");
     let joined = output.join("\n");
-    assert!(joined.contains("update failed"), "{joined}");
+    assert!(joined.is_empty(), "{joined}");
     assert!(!joined.contains("sk-fake-secret"), "{joined}");
-    assert!(joined.contains("[redacted]"), "{joined}");
     // The connector is still usable: its version still probes.
     let info = connector.info().await.unwrap();
     assert_eq!(info.version.as_deref(), Some("1.0.0"));

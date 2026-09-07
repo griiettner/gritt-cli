@@ -854,6 +854,78 @@ fn interrupting_mcp_startup_leaves_no_server_running() {
     }
 }
 
+/// Print mode reports the agent's own MCP servers as a startup note on
+/// stderr, through the same operation the REPL and TUI use, and keeps
+/// the credential the fixture's launch line carries out of it.
+#[test]
+#[cfg(unix)]
+fn print_mode_notes_the_agents_own_mcp_inventory() {
+    use std::os::unix::fs::PermissionsExt;
+    let provider = serve(Vec::new(), false);
+    let space = Space::new(provider.port);
+    let exe = space.path().join("fake-opencode");
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../gritt-connector/tests/fake-agent/agent.sh");
+    let turn = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../gritt-connector/tests/fixtures/opencode/text.jsonl");
+    let listing = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../gritt-connector/tests/fixtures/mcp/opencode/list.txt");
+    std::fs::write(
+        &exe,
+        format!(
+            "#!/bin/sh\nFAKE_AGENT_FIXTURE='{}'\nexport FAKE_AGENT_FIXTURE\n\
+             FAKE_AGENT_MCP_FILE='{}'\nexport FAKE_AGENT_MCP_FILE\nexec '{}' \"$@\"\n",
+            turn.display(),
+            listing.display(),
+            script.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config = space.path().join("config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&executables_section("opencode", &exe));
+    std::fs::write(&config, text).unwrap();
+
+    let output = space.run(&[
+        "run",
+        "--no-models",
+        "--connector",
+        "opencode",
+        "--session",
+        "mcp-note",
+        "hi",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let err = stderr(&output);
+    assert!(
+        err.contains("note: opencode reports 3 MCP servers of its own (opencode mcp list)"),
+        "{err}"
+    );
+    assert!(err.contains("  demo-local  failed"), "{err}");
+    assert!(err.contains("  demo-remote  disabled"), "{err}");
+    assert!(err.contains("  memory  connected"), "{err}");
+    assert!(err.contains("--token [redacted]"), "{err}");
+    assert!(!err.contains("sk-fixture"), "{err}");
+
+    // A resumed session keeps its stored inventory silence: no second read.
+    let again = space.run(&[
+        "run",
+        "--no-models",
+        "--connector",
+        "opencode",
+        "--session",
+        "mcp-note",
+        "again",
+    ]);
+    assert!(again.status.success(), "stderr: {}", stderr(&again));
+    assert!(
+        !stderr(&again).contains("MCP servers of its own"),
+        "{}",
+        stderr(&again)
+    );
+}
+
 /// `gritt connectors --check` reports an installed agent's version and
 /// owner, and `--update NAME --yes` runs the owner's documented command
 /// as an argument vector. The agent is a fake installed the way the
@@ -925,4 +997,102 @@ fn connectors_check_and_update_run_the_documented_vendor_command() {
     let native = space.run(&["connectors", "--update", "native"]);
     assert!(!native.status.success());
     assert!(stderr(&native).contains("not an external connector"));
+}
+
+#[test]
+#[cfg(unix)]
+fn interrupting_an_update_stops_the_updater_in_cli_and_repl() {
+    use std::os::unix::fs::PermissionsExt;
+    for repl in [false, true] {
+        let space = Space::new(1);
+        let exe = space.path().join(".opencode/bin/opencode");
+        let pid_file = space.path().join("update.pid");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, format!(
+            "#!/bin/sh\ncase \"$1\" in\n--version) echo 1.0.0;;\nmodels) echo fixture/model;;\nupgrade) echo $$ > '{}'; sleep 30;;\nesac\n", pid_file.display()
+        )).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = space.path().join("config.toml");
+        let config =
+            std::fs::read_to_string(&path).unwrap() + &executables_section("opencode", &exe);
+        std::fs::write(path, config).unwrap();
+        let args: &[&str] = if repl {
+            &["repl", "--connector", "opencode", "--no-models"]
+        } else {
+            &["connectors", "--update", "opencode", "--yes"]
+        };
+        let mut child = space
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        if repl {
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"/update\ny\n")
+                .unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !pid_file.exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !pid_file.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("updater never started");
+        }
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_owned();
+        Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap();
+        let alive = || {
+            Command::new("kill")
+                .args(["-0", &pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while alive() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        let survived = alive();
+        if survived {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .status();
+        }
+        let repl_survived = !repl || child.try_wait().unwrap().is_none();
+        if repl && repl_survived {
+            child.stdin.as_mut().unwrap().write_all(b"/quit\n").unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            thread::sleep(Duration::from_millis(25));
+        };
+        assert!(!survived, "Ctrl-C left the updater alive (REPL={repl})");
+        assert!(
+            repl_survived,
+            "Ctrl-C quit the REPL instead of cancelling the update"
+        );
+        assert_eq!(status.unwrap().code(), Some(if repl { 0 } else { 130 }));
+    }
 }

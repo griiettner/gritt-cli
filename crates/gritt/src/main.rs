@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use clap::{Args, Parser, Subcommand};
 use gritt_connector::{default_connectors_configured, environment_secrets, parse_connector_id};
 use gritt_core::connector::{
-    AuthState, ConnectorId, ConnectorUpdateOutcome, ConnectorVersionCheck, VersionCheckMode,
+    AuthState, ConnectorId, ConnectorMcpDiscovery, ConnectorUpdateOutcome, ConnectorVersionCheck,
+    VersionCheckMode,
 };
 use gritt_core::event::{ApprovalDecision, EventKind};
 use gritt_core::mcp::{McpRuntimeSettings, McpServerState, TrustDecision};
@@ -492,6 +493,15 @@ fn startup_request(args: &SessionArgs) -> StartupRequest {
 /// moved.
 fn startup_notes(opened: &Opened) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
+    // The first line of a block carries the `note:` or `warning:` prefix;
+    // the rest are already indented by the formatter.
+    fn push_noted(lines: &mut Vec<String>, prefix: &str, body: Vec<String>) {
+        let mut body = body.into_iter();
+        if let Some(first) = body.next() {
+            lines.push(format!("{prefix}: {first}"));
+        }
+        lines.extend(body);
+    }
     if let (
         Some(catalog),
         SessionKind::Native {
@@ -514,16 +524,11 @@ fn startup_notes(opened: &Opened) -> Vec<String> {
             gritt_core::connector::ConnectorModelDiscovery::Current { .. } => "note",
             _ => "warning",
         };
-        for (index, line) in ControlPlane::connector_model_lines(discovery)
-            .into_iter()
-            .enumerate()
-        {
-            if index == 0 {
-                lines.push(format!("{prefix}: {line}"));
-            } else {
-                lines.push(line);
-            }
-        }
+        push_noted(
+            &mut lines,
+            prefix,
+            ControlPlane::connector_model_lines(discovery),
+        );
     }
     if let Some(check) = &opened.connector_version {
         let prefix = if check.update_available()
@@ -533,16 +538,24 @@ fn startup_notes(opened: &Opened) -> Vec<String> {
         } else {
             "note"
         };
-        for (index, line) in ControlPlane::connector_version_lines(check)
-            .into_iter()
-            .enumerate()
-        {
-            if index == 0 {
-                lines.push(format!("{prefix}: {line}"));
-            } else {
-                lines.push(line);
+        push_noted(
+            &mut lines,
+            prefix,
+            ControlPlane::connector_version_lines(check),
+        );
+    }
+    if let Some(discovery) = &opened.connector_mcp {
+        let prefix = match discovery {
+            ConnectorMcpDiscovery::Current { .. } | ConnectorMcpDiscovery::Unsupported { .. } => {
+                "note"
             }
-        }
+            _ => "warning",
+        };
+        push_noted(
+            &mut lines,
+            prefix,
+            ControlPlane::connector_mcp_lines(discovery),
+        );
     }
     lines.extend(
         opened
@@ -1194,7 +1207,15 @@ async fn connectors_command(
             read_yes_no(&mut stdin) == ApprovalDecision::Approved
         };
         let outcome = if approved {
-            plane.connector_update(id, action).await
+            plane
+                .connector_update_until(
+                    id,
+                    action,
+                    Box::pin(async {
+                        let _ = tokio::signal::ctrl_c().await;
+                    }),
+                )
+                .await
         } else {
             ConnectorUpdateOutcome::Declined { connector: id }
         };
@@ -1212,6 +1233,7 @@ async fn connectors_command(
                 return Ok(ExitCode::FAILURE);
             }
             ConnectorUpdateOutcome::TimedOut { .. } => return Ok(ExitCode::FAILURE),
+            ConnectorUpdateOutcome::Cancelled { .. } => return Ok(ExitCode::from(130)),
             _ => {}
         }
     }

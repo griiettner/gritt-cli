@@ -17,8 +17,9 @@ use gritt_core::config::ConnectorSettings;
 use gritt_core::config::ModelListPolicy;
 use gritt_core::connector::{
     AuthState, Connector, ConnectorCapabilities, ConnectorId, ConnectorInfo, ConnectorInspection,
-    ConnectorModel, ConnectorModelCatalog, ConnectorModelDiscovery, ConnectorModelFreshness,
-    TaskRequest, TaskState, Transport,
+    ConnectorMcpDiscovery, ConnectorMcpInventory, ConnectorMcpServer, ConnectorModel,
+    ConnectorModelCatalog, ConnectorModelDiscovery, ConnectorModelFreshness, TaskRequest,
+    TaskState, Transport,
 };
 use gritt_core::event::{
     ApprovalDecision, ApprovalId, Event, EventKind, EventSource, SessionStatus, StopReason,
@@ -29,18 +30,20 @@ use gritt_core::session::{BoxFuture, ContinuationState, SessionId};
 use gritt_core::{Error, ErrorKind, Result};
 use tokio::sync::{mpsc, Notify};
 
-use crate::health::{find_executable, probe, version_at_least, version_token, ProbeOutput};
+use crate::health::{
+    find_executable, probe, probe_in, version_at_least, version_token, ProbeOutput,
+};
 use crate::install::{
-    classify_failure, detect_install_source, latest_query, next_step, parse_latest, update_action,
-    InstallEnv, VendorInstall,
+    classify_failure, detect_install_source, latest_query, next_step, npm_update_action,
+    parse_latest, update_action, InstallEnv, VendorInstall,
 };
 use crate::models::{
     attempted_recently, cache_is_fresh, catalog_from_cache, failed_since_fetch,
     CachedConnectorModels, ConnectorModelCache,
 };
 use crate::process::{self, Launch, Line, Supervised};
-use crate::protocols::ModelParseError;
-use crate::redact::{cap, redact_text, redact_value};
+use crate::protocols::{McpParseError, ModelParseError};
+use crate::redact::{cap, redact_target, redact_text, redact_value};
 use crate::versions::{self, run_update, CachedConnectorVersion, ConnectorVersionCache};
 use gritt_core::connector::{
     ConnectorUpdateOutcome, ConnectorVersionCheck, ConnectorVersionStatus, InstallSource,
@@ -178,6 +181,32 @@ pub trait Protocol: Send + Sync + 'static {
         _stderr: &str,
     ) -> std::result::Result<Vec<ConnectorModel>, ModelParseError> {
         Err(ModelParseError::Unsupported)
+    }
+    /// Documented command that lists the agent's own MCP servers, or
+    /// `None` when the CLI has no machine-readable listing.
+    /// [`Protocol::mcp_list_unsupported_reason`] then says why.
+    fn mcp_list_args(&self) -> Option<Vec<String>> {
+        None
+    }
+    fn mcp_list_source(&self) -> &'static str {
+        self.executable()
+    }
+    fn mcp_list_unsupported_reason(&self) -> String {
+        format!(
+            "{} has no documented MCP listing command",
+            self.executable()
+        )
+    }
+    /// Turns the listing into entries. Every field of every entry is
+    /// redacted again by the connector before it is kept, so a parser
+    /// only has to drop what must never be stored (environment values,
+    /// headers, argument vectors).
+    fn parse_mcp_inventory(
+        &self,
+        _stdout: &str,
+        _stderr: &str,
+    ) -> std::result::Result<Vec<ConnectorMcpServer>, McpParseError> {
+        Err(McpParseError::Unsupported)
     }
 }
 
@@ -377,8 +406,31 @@ impl<P: Protocol> ExternalConnector<P> {
         let installed = self.installed_version(program).await;
         let vendor = self.protocol.vendor_install();
         let source = detect_install_source(program, &self.install_env, vendor.as_ref());
-        let update = update_action(&source, program, vendor.as_ref());
-        let next = next_step(&source, program);
+        let mut update = update_action(&source, program, vendor.as_ref());
+        let mut next = next_step(&source, program);
+        if matches!(source, InstallSource::Npm { .. }) && mode != VersionCheckMode::Offline {
+            if let Some(manager) = self.manager_program("npm") {
+                if let Ok(output) = probe(
+                    &manager,
+                    &["root".into(), "--global".into()],
+                    self.timeouts.health,
+                )
+                .await
+                {
+                    if output.success {
+                        update = npm_update_action(
+                            &source,
+                            program,
+                            &manager,
+                            std::path::Path::new(output.stdout.trim()),
+                        );
+                        if update.is_some() {
+                            next = None;
+                        }
+                    }
+                }
+            }
+        }
         let now = Utc::now();
         let status = |latest: Option<String>,
                       latest_source: Option<String>,
@@ -412,10 +464,18 @@ impl<P: Protocol> ExternalConnector<P> {
                 reason,
             };
         };
+        let installation = serde_json::to_string(&(
+            std::fs::canonicalize(program).unwrap_or_else(|_| program.clone()),
+            &source,
+            self.manager_program(&query.program),
+            &query.args,
+        ))
+        .expect("installation identity serializes");
         let cached = self
             .version_cache
             .as_ref()
-            .and_then(|cache| cache.read(id).ok().flatten());
+            .and_then(|cache| cache.read(id).ok().flatten())
+            .filter(|cache| cache.installation.as_deref() == Some(installation.as_str()));
         let policy = &self.version_policy;
         let stale_or_unavailable = |failure: VersionCheckFailure, reason: String| {
             if policy.stale_fallback {
@@ -482,7 +542,7 @@ impl<P: Protocol> ExternalConnector<P> {
             VersionCheckMode::Refresh => {}
         }
         let Some(manager) = self.manager_program(&query.program) else {
-            record_version_attempt(&self.version_cache, id, &cached, now);
+            record_version_attempt(&self.version_cache, id, &cached, now, &installation);
             return stale_or_unavailable(
                 VersionCheckFailure::CommandFailure,
                 format!(
@@ -498,6 +558,7 @@ impl<P: Protocol> ExternalConnector<P> {
                         let _ = cache.write(
                             id,
                             &CachedConnectorVersion {
+                                installation: Some(installation),
                                 checked_at: Some(now),
                                 last_attempt_at: Some(now),
                                 latest: Some(latest.clone()),
@@ -515,7 +576,7 @@ impl<P: Protocol> ExternalConnector<P> {
                     }
                 }
                 Err(failure) => {
-                    record_version_attempt(&self.version_cache, id, &cached, now);
+                    record_version_attempt(&self.version_cache, id, &cached, now, &installation);
                     stale_or_unavailable(
                         failure,
                         format!("{} returned no readable version", query.source),
@@ -523,14 +584,14 @@ impl<P: Protocol> ExternalConnector<P> {
                 }
             },
             Ok(output) => {
-                record_version_attempt(&self.version_cache, id, &cached, now);
+                record_version_attempt(&self.version_cache, id, &cached, now, &installation);
                 stale_or_unavailable(
                     classify_failure(&output.stderr, &output.stdout),
                     format!("{} exited unsuccessfully", query.source),
                 )
             }
             Err(error) => {
-                record_version_attempt(&self.version_cache, id, &cached, now);
+                record_version_attempt(&self.version_cache, id, &cached, now, &installation);
                 let failure = if error.message.contains("did not answer") {
                     VersionCheckFailure::Timeout
                 } else {
@@ -541,7 +602,11 @@ impl<P: Protocol> ExternalConnector<P> {
         }
     }
 
-    async fn update_inner(&self, action: UpdateAction) -> ConnectorUpdateOutcome {
+    async fn update_inner(
+        &self,
+        action: UpdateAction,
+        mut cancel: BoxFuture<'_, ()>,
+    ) -> ConnectorUpdateOutcome {
         let id = self.protocol.id();
         let Some(program) = &self.program else {
             return ConnectorUpdateOutcome::NoAction {
@@ -549,7 +614,11 @@ impl<P: Protocol> ExternalConnector<P> {
                 reason: format!("`{}` is not installed", self.protocol.executable()),
             };
         };
-        let before = self.installed_version(program).await;
+        let before = tokio::select! {
+            biased;
+            () = &mut cancel => return ConnectorUpdateOutcome::Cancelled { connector: id },
+            before = self.installed_version(program) => before,
+        };
         let Some(manager) = self.manager_program(&action.program) else {
             return ConnectorUpdateOutcome::Failed {
                 connector: id,
@@ -562,11 +631,12 @@ impl<P: Protocol> ExternalConnector<P> {
             &manager,
             &action.args,
             &cwd,
-            &self.secrets,
             self.timeouts.idle,
+            &mut cancel,
         )
         .await
         {
+            Ok(run) if run.cancelled => ConnectorUpdateOutcome::Cancelled { connector: id },
             Ok(run) if run.timed_out => ConnectorUpdateOutcome::TimedOut {
                 connector: id,
                 reason: format!(
@@ -576,7 +646,11 @@ impl<P: Protocol> ExternalConnector<P> {
                 ),
             },
             Ok(run) if run.success => {
-                let recheck = self.check_version_inner(VersionCheckMode::Refresh).await;
+                let recheck = tokio::select! {
+                    biased;
+                    () = &mut cancel => return ConnectorUpdateOutcome::Cancelled { connector: id },
+                    check = self.check_version_inner(VersionCheckMode::Refresh) => check,
+                };
                 let after = recheck.status().and_then(|status| status.installed.clone());
                 ConnectorUpdateOutcome::Updated {
                     connector: id,
@@ -591,7 +665,7 @@ impl<P: Protocol> ExternalConnector<P> {
                     Some(code) => format!("`{}` exited with status {code}", action.display()),
                     None => format!("`{}` was stopped by a signal", action.display()),
                 },
-                output: run.output,
+                output: Vec::new(),
             },
             Err(error) => ConnectorUpdateOutcome::Failed {
                 connector: id,
@@ -778,6 +852,95 @@ impl<P: Protocol> ExternalConnector<P> {
         }
     }
 
+    /// The agent's own MCP servers through its documented listing
+    /// command, run in the session workspace so project-scoped servers
+    /// are counted, bounded by the health timeout. Read fresh every time:
+    /// there is no cache and no stale fallback, so a failure is its own
+    /// typed outcome and never a previous list.
+    async fn discover_mcp_inventory_inner(
+        &self,
+        workspace: &std::path::Path,
+    ) -> ConnectorMcpDiscovery {
+        let id = self.protocol.id();
+        let Some(program) = &self.program else {
+            return ConnectorMcpDiscovery::Unavailable {
+                connector: id,
+                reason: format!(
+                    "`{}` was not found on PATH and no executable is configured",
+                    self.protocol.executable()
+                ),
+            };
+        };
+        let Some(args) = self.protocol.mcp_list_args() else {
+            return ConnectorMcpDiscovery::Unsupported {
+                connector: id,
+                reason: self.protocol.mcp_list_unsupported_reason(),
+            };
+        };
+        let source = self.protocol.mcp_list_source().to_owned();
+        match probe_in(program, &args, workspace, self.timeouts.health).await {
+            Ok(output) if output.success => {
+                match self
+                    .protocol
+                    .parse_mcp_inventory(&output.stdout, &output.stderr)
+                {
+                    Ok(servers) => ConnectorMcpDiscovery::Current {
+                        inventory: ConnectorMcpInventory {
+                            connector: id,
+                            servers: servers
+                                .into_iter()
+                                .map(|server| self.redact_mcp_server(server))
+                                .collect(),
+                            source,
+                            fetched_at: Utc::now(),
+                        },
+                    },
+                    Err(McpParseError::Unsupported) => ConnectorMcpDiscovery::Unsupported {
+                        connector: id,
+                        reason: self.protocol.mcp_list_unsupported_reason(),
+                    },
+                    Err(McpParseError::Malformed) => ConnectorMcpDiscovery::MalformedOutput {
+                        connector: id,
+                        reason: format!("{source} returned a listing that could not be parsed"),
+                    },
+                }
+            }
+            Ok(_output) => ConnectorMcpDiscovery::CommandFailure {
+                connector: id,
+                reason: format!("{source} exited unsuccessfully"),
+            },
+            Err(error) if error.message.contains("did not answer") => {
+                ConnectorMcpDiscovery::TimedOut {
+                    connector: id,
+                    reason: redact_text(&error.message, &self.secrets),
+                }
+            }
+            Err(error) => ConnectorMcpDiscovery::CommandFailure {
+                connector: id,
+                reason: redact_text(&error.message, &self.secrets),
+            },
+        }
+    }
+
+    /// Every stored field passes through redaction: the name and detail
+    /// against known secrets, the target additionally against
+    /// credential-shaped options and URL parts.
+    fn redact_mcp_server(&self, server: ConnectorMcpServer) -> ConnectorMcpServer {
+        ConnectorMcpServer {
+            name: cap(&redact_text(&server.name, &self.secrets), 256),
+            transport: server.transport,
+            target: server
+                .target
+                .as_deref()
+                .map(|target| redact_target(target, &self.secrets)),
+            status: server.status,
+            detail: server
+                .detail
+                .as_deref()
+                .map(|detail| cap(&redact_text(detail, &self.secrets), 512)),
+        }
+    }
+
     fn not_installed(&self) -> Error {
         Error::connector(format!(
             "{} is not installed: `{}` was not found on PATH and no executable is configured",
@@ -958,11 +1121,13 @@ fn record_version_attempt(
     id: ConnectorId,
     cached: &Option<CachedConnectorVersion>,
     now: chrono::DateTime<Utc>,
+    installation: &str,
 ) {
     let Some(cache) = cache else {
         return;
     };
     let mut next = cached.clone().unwrap_or_default();
+    next.installation = Some(installation.to_owned());
     next.last_attempt_at = Some(now);
     let _ = cache.write(id, &next);
 }
@@ -1421,8 +1586,20 @@ impl<P: Protocol> Connector for ExternalConnector<P> {
         Box::pin(async move { self.check_version_inner(mode).await })
     }
 
+    fn discover_mcp_inventory(&self, workspace: PathBuf) -> BoxFuture<'_, ConnectorMcpDiscovery> {
+        Box::pin(async move { self.discover_mcp_inventory_inner(&workspace).await })
+    }
+
     fn update(&self, action: UpdateAction) -> BoxFuture<'_, ConnectorUpdateOutcome> {
-        Box::pin(async move { self.update_inner(action).await })
+        self.update_until(action, Box::pin(std::future::pending()))
+    }
+
+    fn update_until<'a>(
+        &'a self,
+        action: UpdateAction,
+        cancel: BoxFuture<'a, ()>,
+    ) -> BoxFuture<'a, ConnectorUpdateOutcome> {
+        Box::pin(async move { self.update_inner(action, cancel).await })
     }
 
     fn start(&self, request: TaskRequest) -> BoxFuture<'_, Result<EventStream<'_>>> {

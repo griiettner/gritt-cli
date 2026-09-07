@@ -19,7 +19,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use gritt_core::connector::{
-    AuthState, Connector, ConnectorId, ConnectorInfo, ConnectorModelDiscovery, Transport,
+    AuthState, Connector, ConnectorId, ConnectorInfo, ConnectorMcpDiscovery,
+    ConnectorModelDiscovery, Transport,
 };
 use gritt_core::connector::{
     ConnectorUpdateOutcome, ConnectorVersionCheck, UpdateAction, VersionCheckMode,
@@ -75,6 +76,10 @@ pub struct Opened {
     /// version and owner from local evidence, newest version from the
     /// cache only, so opening never waits on a package manager.
     pub connector_version: Option<ConnectorVersionCheck>,
+    /// The connector's own MCP servers, read once when a new connector
+    /// session opens. Display only, and separate from Gritt's own MCP
+    /// list (ADR-010).
+    pub connector_mcp: Option<ConnectorMcpDiscovery>,
 }
 
 /// Cloning shares every handle, which is what
@@ -240,6 +245,17 @@ impl ControlPlane {
         id: ConnectorId,
         action: UpdateAction,
     ) -> ConnectorUpdateOutcome {
+        self.connector_update_until(id, action, Box::pin(std::future::pending()))
+            .await
+    }
+
+    /// Cancellation returns only after the connector has stopped its updater.
+    pub async fn connector_update_until(
+        &self,
+        id: ConnectorId,
+        action: UpdateAction,
+        cancel: gritt_core::session::BoxFuture<'_, ()>,
+    ) -> ConnectorUpdateOutcome {
         if id == ConnectorId::Native {
             return ConnectorUpdateOutcome::NoAction {
                 connector: id,
@@ -247,12 +263,55 @@ impl ControlPlane {
             };
         }
         match self.connector(id) {
-            Some(connector) => connector.update(action).await,
+            Some(connector) => connector.update_until(action, cancel).await,
             None => ConnectorUpdateOutcome::NoAction {
                 connector: id,
                 reason: format!("{} is not available in this control plane", id.as_str()),
             },
         }
+    }
+
+    /// Lists the MCP servers an installed connector has configured for
+    /// itself, through that connector's own documented command. Native
+    /// sessions have no external agent; Gritt's own MCP list covers them.
+    /// Advisory: never an error, never on the path to opening a session.
+    pub async fn connector_mcp_inventory(&self, id: ConnectorId) -> ConnectorMcpDiscovery {
+        if id == ConnectorId::Native {
+            return ConnectorMcpDiscovery::Unsupported {
+                connector: id,
+                reason: "native sessions run inside Gritt; Gritt's own MCP list applies".into(),
+            };
+        }
+        match self.connector(id) {
+            Some(connector) => {
+                connector
+                    .discover_mcp_inventory(self.builder.workspace_root().to_path_buf())
+                    .await
+            }
+            None => ConnectorMcpDiscovery::Unavailable {
+                connector: id,
+                reason: format!("{} is not available in this control plane", id.as_str()),
+            },
+        }
+    }
+
+    /// Status and server lines print and REPL show for a connector's own
+    /// MCP inventory; the TUI sidebar renders the same values. Every
+    /// field was redacted by the connector before it got here.
+    pub fn connector_mcp_lines(discovery: &ConnectorMcpDiscovery) -> Vec<String> {
+        let mut lines = vec![discovery.describe()];
+        if let Some(inventory) = discovery.inventory() {
+            for server in &inventory.servers {
+                lines.push(format!("  {}  {}", server.name, server.status.label()));
+                if let Some(detail) = &server.detail {
+                    lines.push(format!("    {detail}"));
+                }
+                if let Some(target) = &server.target {
+                    lines.push(format!("    {target}"));
+                }
+            }
+        }
+        lines
     }
 
     /// Status lines print and REPL show for a version check; the TUI
@@ -541,7 +600,10 @@ impl ControlPlane {
     /// Opens or creates a session and returns its driver. An existing
     /// session keeps its own backend; `connector` only applies to a new
     /// one, and `None` means the native path. The startup notes are
-    /// dropped; see [`ControlPlane::open_with`].
+    /// dropped, and the advisory connector reads (models, version, MCP
+    /// inventory) that only exist to fill them are skipped: a caller that
+    /// wants them asks for them itself, as the TUI does after adoption.
+    /// See [`ControlPlane::open_with`].
     pub async fn open(
         &self,
         selector: SessionSelector,
@@ -550,11 +612,12 @@ impl ControlPlane {
         model: Option<&str>,
         phase: Option<Phase>,
     ) -> Result<Box<dyn Driver>> {
-        self.open_with(
+        self.open_inner(
             selector,
             connector,
             StartupRequest::from_flags(profile, model, None),
             phase,
+            false,
             false,
         )
         .await
@@ -572,6 +635,23 @@ impl ControlPlane {
         request: StartupRequest,
         phase: Option<Phase>,
         refresh_models: bool,
+    ) -> Result<Opened> {
+        self.open_inner(selector, connector, request, phase, refresh_models, true)
+            .await
+    }
+
+    /// `advisory` runs the model, version, and MCP inventory reads for a
+    /// newly created connector session. Each is bounded by the health
+    /// timeout and typed, but together they can hold the open for
+    /// seconds, so a caller that will not show them does not pay for them.
+    async fn open_inner(
+        &self,
+        selector: SessionSelector,
+        connector: Option<ConnectorId>,
+        request: StartupRequest,
+        phase: Option<Phase>,
+        refresh_models: bool,
+        advisory: bool,
     ) -> Result<Opened> {
         let existing = self.builder.find_session(&selector, phase).await?;
         let existing_id = existing.as_ref().map(|session| session.id.clone());
@@ -602,6 +682,7 @@ impl ControlPlane {
                         catalog: opened.catalog,
                         connector_models: None,
                         connector_version: None,
+                        connector_mcp: None,
                     });
                 }
                 Some(id) => {
@@ -660,6 +741,7 @@ impl ControlPlane {
                 catalog: None,
                 connector_models: None,
                 connector_version: None,
+                connector_mcp: None,
             }),
             SessionKind::Connector { id, .. } => {
                 let connector = self.connector(*id).ok_or_else(|| {
@@ -667,13 +749,21 @@ impl ControlPlane {
                 })?;
                 let created_now = existing_id.is_none();
                 let session_id = session.id.clone();
-                let connector_models = if created_now {
+                let advise = created_now && advisory;
+                let connector_models = if advise {
                     Some(self.connector_models(*id, refresh_models).await)
                 } else {
                     None
                 };
-                let connector_version = if created_now {
+                let connector_version = if advise {
                     Some(self.connector_version(*id, VersionCheckMode::Offline).await)
+                } else {
+                    None
+                };
+                // Bounded by the connector's health timeout, and every
+                // outcome is typed, so this cannot stop the session.
+                let connector_mcp = if advise {
+                    Some(self.connector_mcp_inventory(*id).await)
                 } else {
                     None
                 };
@@ -693,6 +783,7 @@ impl ControlPlane {
                         catalog: None,
                         connector_models,
                         connector_version,
+                        connector_mcp,
                     }),
                     Err(error) => {
                         // A row for a session that never opened is noise in

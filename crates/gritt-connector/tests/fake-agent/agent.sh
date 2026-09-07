@@ -14,7 +14,17 @@
 #   FAKE_AGENT_UPDATE_EXIT  exit status of a self-update (default 0)
 #   FAKE_AGENT_UPDATE_TO    version a successful self-update writes to FAKE_AGENT_VERSION_FILE
 #   FAKE_AGENT_PID_FILE     file that receives this process id during a self-update
+#   FAKE_AGENT_MCP_FILE     file printed by `mcp list` (default: one enabled stdio server)
+#   FAKE_AGENT_MCP_EXIT     exit status of `mcp list` (default 0)
+#   FAKE_AGENT_MCP_SLEEP    seconds `mcp list` sleeps before printing
 case "$1" in
+  mcp)
+    if [ "$2" = "list" ]; then
+      if [ -n "$FAKE_AGENT_MCP_SLEEP" ]; then sleep "$FAKE_AGENT_MCP_SLEEP"; fi
+      if [ -n "$FAKE_AGENT_MCP_FILE" ]; then cat "$FAKE_AGENT_MCP_FILE"; else printf '%s\n' '[{"name":"fake-server","enabled":true,"disabled_reason":null,"transport":{"type":"stdio","command":"fake-mcp","args":["--api-key","sk-fake-mcp-secret"],"env":{"FAKE_TOKEN":"sk-fake-env-secret"},"env_vars":[],"cwd":null},"auth_status":"unsupported"}]'; fi
+      exit "${FAKE_AGENT_MCP_EXIT:-0}"
+    fi
+    ;;
   --version)
     if [ -n "$FAKE_AGENT_VERSION_FILE" ] && [ -f "$FAKE_AGENT_VERSION_FILE" ]; then
       echo "fake-agent $(head -n 1 "$FAKE_AGENT_VERSION_FILE")"

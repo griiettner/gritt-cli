@@ -10,8 +10,8 @@ use std::cell::{Cell, RefCell};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use gritt_core::connector::{
-    ConnectorId, ConnectorModel, ConnectorModelDiscovery, ConnectorUpdateOutcome,
-    ConnectorVersionCheck, UpdateAction, VersionCheckMode,
+    ConnectorId, ConnectorMcpDiscovery, ConnectorModel, ConnectorModelDiscovery,
+    ConnectorUpdateOutcome, ConnectorVersionCheck, UpdateAction, VersionCheckMode,
 };
 use gritt_core::event::{
     ApprovalDecision, ApprovalRequest, Event, EventKind, SessionStatus, Usage,
@@ -1212,6 +1212,21 @@ impl App {
         };
         self.version_notice = Some((check.describe(), tone));
         self.connector_version = Some(check);
+        true
+    }
+
+    /// Records the live connector session's own MCP inventory for the
+    /// sidebar. A result for a connector the user has already left is
+    /// dropped. Gritt's own list in `apply_mcp` is untouched.
+    pub fn apply_connector_mcp(
+        &mut self,
+        connector: ConnectorId,
+        discovery: ConnectorMcpDiscovery,
+    ) -> bool {
+        if self.connector != Some(connector) {
+            return false;
+        }
+        self.sidebar.integrations.connector_mcp_inventory = Some(discovery);
         true
     }
 
@@ -2465,6 +2480,9 @@ impl App {
 
     fn request_connector_catalog(&mut self, id: ConnectorId, refresh: bool) -> Action {
         self.selection = self.selection.wrapping_add(1);
+        if self.connector_catalog.connector != Some(id) {
+            self.connector_catalog = ConnectorCatalogView::default();
+        }
         self.connector_catalog.connector = Some(id);
         self.connector_catalog.loading = true;
         if refresh {
@@ -2982,9 +3000,9 @@ impl App {
         self.sidebar.integrations.mcp = Some(self.mcp.clone());
         // These servers are Gritt's, whatever kind of session is open:
         // they come from Gritt's runtime and Gritt's `.mcp.json`. An
-        // external agent owns its own MCP clients (ADR-010) and does not
-        // report their state, so that is named as unknown beside them
-        // rather than this list being relabelled as the agent's.
+        // external agent owns its own MCP servers (ADR-010); its inventory
+        // arrives separately through `apply_connector_mcp` and is drawn
+        // under its own label, never merged into this list.
         self.sidebar.integrations.mcp_owner = Some("Gritt".to_owned());
         self.sidebar.integrations.connector_mcp = self.connector.map(|id| id.as_str().to_owned());
         self.refresh_open_picker();
@@ -3239,6 +3257,10 @@ impl App {
     }
 
     pub fn set_session(&mut self, session: &Session) {
+        self.connector_choice = None;
+        self.connector_model = None;
+        self.connector_catalog = ConnectorCatalogView::default();
+        self.selection = self.selection.wrapping_add(1);
         self.session_id = Some(session.id.clone());
         self.status.session = session.name.clone();
         self.status.workspace = session.workspace.display().to_string();

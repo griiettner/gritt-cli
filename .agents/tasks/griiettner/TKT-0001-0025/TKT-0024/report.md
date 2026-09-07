@@ -168,4 +168,5 @@ agent now closes the connect picker first.
 
 ## Updates
 
+- [2026-09-06 lifecycle audit fixes](updates/2026-09-06-lifecycle-audit-fixes.md)
 - [2026-09-06 review fixes](updates/2026-09-06-review-fixes.md)

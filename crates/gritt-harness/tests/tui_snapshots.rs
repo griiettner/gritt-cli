@@ -161,6 +161,7 @@ fn build(name: &str, theme: Theme) -> App {
                 mcp: Some(Vec::new()),
                 mcp_owner: Some("Gritt".into()),
                 connector_mcp: None,
+                connector_mcp_inventory: None,
             };
             app.sidebar.usage = Default::default();
             app.sidebar.cost = Default::default();

@@ -1,0 +1,91 @@
+[
+  {
+    "name": "cognity",
+    "enabled": true,
+    "disabled_reason": null,
+    "transport": {
+      "type": "stdio",
+      "command": "/home/user/.cargo/bin/gritt-cognity",
+      "args": [
+        "mcp"
+      ],
+      "env": null,
+      "env_vars": [],
+      "cwd": null
+    },
+    "startup_timeout_sec": null,
+    "tool_timeout_sec": null,
+    "auth_status": "unsupported"
+  },
+  {
+    "name": "computer-use",
+    "enabled": false,
+    "disabled_reason": null,
+    "transport": {
+      "type": "stdio",
+      "command": "./Computer Use.app/Contents/MacOS/ComputerUseClient",
+      "args": [
+        "mcp"
+      ],
+      "env": null,
+      "env_vars": [],
+      "cwd": "."
+    },
+    "startup_timeout_sec": null,
+    "tool_timeout_sec": null,
+    "auth_status": "unsupported"
+  },
+  {
+    "name": "node_repl",
+    "enabled": true,
+    "disabled_reason": null,
+    "transport": {
+      "type": "stdio",
+      "command": "/opt/app/bin/node_repl",
+      "args": [],
+      "env": {
+        "FAKE_REPL_TOKEN": "sk-fixture-env-value-never-shown",
+        "FAKE_REPL_PATH": "/opt/app/lib"
+      },
+      "env_vars": [],
+      "cwd": null
+    },
+    "startup_timeout_sec": 120.0,
+    "tool_timeout_sec": null,
+    "auth_status": "unsupported"
+  },
+  {
+    "name": "playwright",
+    "enabled": true,
+    "disabled_reason": null,
+    "transport": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "@playwright/mcp@latest"
+      ],
+      "env": null,
+      "env_vars": [],
+      "cwd": null
+    },
+    "startup_timeout_sec": null,
+    "tool_timeout_sec": null,
+    "auth_status": "unsupported"
+  },
+  {
+    "name": "remote-design",
+    "enabled": true,
+    "disabled_reason": null,
+    "transport": {
+      "type": "streamable_http",
+      "url": "https://design.example.invalid/mcp?token=sk-fixture-query-secret",
+      "bearer_token_env_var": "DESIGN_TOKEN",
+      "http_headers": {
+        "Authorization": "Bearer sk-fixture-header-secret"
+      }
+    },
+    "startup_timeout_sec": null,
+    "tool_timeout_sec": null,
+    "auth_status": "not_logged_in"
+  }
+]

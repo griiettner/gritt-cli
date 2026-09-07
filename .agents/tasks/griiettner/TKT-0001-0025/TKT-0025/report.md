@@ -249,4 +249,5 @@ binary, or a vendor marker under the home directory. Two matches are
 
 ## Updates
 
+- [2026-09-06 lifecycle audit fixes](updates/2026-09-06-lifecycle-audit-fixes.md)
 - [2026-09-06 execution notes](updates/2026-09-06-execution.md)

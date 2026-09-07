@@ -7,15 +7,97 @@
 
 use std::collections::HashMap;
 
-use gritt_core::connector::{AuthState, ConnectorCapabilities, ConnectorId, TaskRequest};
+use gritt_core::connector::{
+    AuthState, ConnectorCapabilities, ConnectorId, ConnectorMcpServer, ConnectorMcpStatus,
+    TaskRequest,
+};
 use gritt_core::event::{EventKind, SessionStatus, StopReason};
 use gritt_core::ErrorKind;
 
-use super::{model_flag, number, render, text, tool_call, tool_result};
+use super::{
+    model_flag, number, render, text, tool_call, tool_result, transport_from_target, McpParseError,
+};
 use crate::health::ProbeOutput;
+use crate::models::strip_ansi;
 use crate::supervise::{usage, Normalized, Normalizer, Protocol};
 
 pub struct ClaudeCode;
+
+/// `claude mcp list` runs a live health check and then prints one
+/// `name: <command or url> - <glyph> <status>` line per server, after a
+/// `Checking MCP server health…` line. Statuses seen on 2.1.x: `Connected`,
+/// `Failed to connect`, `Pending approval (run \`claude\` to approve)`,
+/// `Needs authentication`, `Disabled`. The command part is the server's
+/// full launch line, arguments included, so it goes through target
+/// redaction before it is kept.
+pub fn parse_claude_mcp(
+    stdout: &str,
+) -> std::result::Result<Vec<ConnectorMcpServer>, McpParseError> {
+    let text = strip_ansi(stdout);
+    let mut out = Vec::new();
+    let mut saw_empty_marker = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("checking mcp") {
+            continue;
+        }
+        if lower.starts_with("no mcp servers") {
+            saw_empty_marker = true;
+            continue;
+        }
+        let Some((head, status_text)) = line.rsplit_once(" - ") else {
+            continue;
+        };
+        let Some((name, target)) = head.split_once(": ") else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let status_words = status_text
+            .trim_start_matches(|c: char| !c.is_alphanumeric())
+            .trim();
+        let (status, detail) = classify_claude_status(status_words);
+        out.push(ConnectorMcpServer {
+            name: name.to_owned(),
+            transport: Some(transport_from_target(target).to_owned()),
+            target: Some(target.trim().to_owned()),
+            status,
+            detail,
+        });
+    }
+    if out.is_empty() && !saw_empty_marker {
+        return Err(McpParseError::Malformed);
+    }
+    Ok(out)
+}
+
+fn classify_claude_status(words: &str) -> (ConnectorMcpStatus, Option<String>) {
+    let lower = words.to_ascii_lowercase();
+    let hint = words
+        .find('(')
+        .map(|start| words[start..].trim_matches(['(', ')']).trim().to_owned())
+        .filter(|hint| !hint.is_empty());
+    let status = if lower.starts_with("connected") {
+        ConnectorMcpStatus::Connected
+    } else if lower.starts_with("failed") {
+        ConnectorMcpStatus::Failed
+    } else if lower.starts_with("pending approval") {
+        ConnectorMcpStatus::PendingApproval
+    } else if lower.starts_with("needs auth") || lower.contains("not authenticated") {
+        ConnectorMcpStatus::NeedsAuth
+    } else if lower.starts_with("disabled") {
+        ConnectorMcpStatus::Disabled
+    } else {
+        return (ConnectorMcpStatus::Unknown, Some(words.to_owned()));
+    };
+    (status, hint)
+}
 
 impl Protocol for ClaudeCode {
     fn id(&self) -> ConnectorId {
@@ -65,6 +147,22 @@ impl Protocol for ClaudeCode {
                 }
             }
         }
+    }
+
+    fn mcp_list_args(&self) -> Option<Vec<String>> {
+        Some(vec!["mcp".into(), "list".into()])
+    }
+
+    fn mcp_list_source(&self) -> &'static str {
+        "claude mcp list"
+    }
+
+    fn parse_mcp_inventory(
+        &self,
+        stdout: &str,
+        _stderr: &str,
+    ) -> std::result::Result<Vec<ConnectorMcpServer>, McpParseError> {
+        parse_claude_mcp(stdout)
     }
 
     fn task_args(&self, request: &TaskRequest, external_id: Option<&str>) -> Vec<String> {

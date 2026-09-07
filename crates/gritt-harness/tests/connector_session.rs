@@ -15,8 +15,9 @@ use gritt_connector::protocols::codex::Codex;
 use gritt_connector::{ExternalConnector, Timeouts};
 use gritt_core::config::{Config, ConnectorSettings, ModelListPolicy};
 use gritt_core::connector::{
-    AuthState, Connector, ConnectorId, ConnectorModelDiscovery, ConnectorModelFreshness,
-    ConnectorUpdateOutcome, ConnectorVersionCheck, TaskRequest, TaskState, VersionCheckMode,
+    AuthState, Connector, ConnectorId, ConnectorMcpDiscovery, ConnectorMcpStatus,
+    ConnectorModelDiscovery, ConnectorModelFreshness, ConnectorUpdateOutcome,
+    ConnectorVersionCheck, TaskRequest, TaskState, VersionCheckMode,
 };
 use gritt_core::event::{ApprovalDecision, ApprovalRequest, Event, EventKind, EventSource};
 use gritt_core::provider::{Protocol, ProviderProfile};
@@ -1077,6 +1078,183 @@ async fn repl_models_lists_the_connector_catalog() {
     assert!(
         body.matches("gpt-5.4").count() >= 2,
         "refresh did not list again: {body}"
+    );
+}
+
+// -- the agent's own MCP inventory (TKT-0026) ------------------------------
+
+fn mcp_fixture(connector: &str, name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../gritt-connector/tests/fixtures/mcp")
+        .join(connector)
+        .join(name)
+}
+
+/// A new connector session carries its agent's own MCP inventory, read
+/// through the shared operation print and REPL render with
+/// `connector_mcp_lines`; a resumed session does not read again, and the
+/// native path reports the operation as unsupported.
+#[tokio::test]
+async fn opening_a_connector_session_reports_the_agents_own_mcp_servers() {
+    let scratch = tempfile::tempdir().unwrap();
+    let wrapper = fake_agent(
+        scratch.path(),
+        &[
+            (
+                "FAKE_AGENT_FIXTURE",
+                connector_fixture("text").display().to_string(),
+            ),
+            (
+                "FAKE_AGENT_MCP_FILE",
+                mcp_fixture("codex", "list.json").display().to_string(),
+            ),
+        ],
+    );
+    let fx = fixture(
+        Vec::new(),
+        ApprovalMode::DenyAll,
+        vec![codex_connector(&wrapper)],
+    )
+    .await;
+    let opened = fx
+        .plane
+        .open_with(
+            SessionSelector::Named("mcp-listed".into()),
+            Some(ConnectorId::Codex),
+            StartupRequest::from_flags(None, None, None),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let discovery = opened
+        .connector_mcp
+        .as_ref()
+        .expect("a new connector session reads the agent's own MCP inventory");
+    let inventory = discovery.inventory().expect("current inventory");
+    assert_eq!(inventory.connector, ConnectorId::Codex);
+    assert_eq!(inventory.servers.len(), 5);
+    assert_eq!(inventory.servers[0].name, "cognity");
+    assert_eq!(inventory.servers[1].status, ConnectorMcpStatus::Disabled);
+    assert_eq!(inventory.servers[4].status, ConnectorMcpStatus::NeedsAuth);
+    let lines = ControlPlane::connector_mcp_lines(discovery);
+    let text = lines.join("\n");
+    assert!(text.contains("codex reports 5 MCP servers"), "{text}");
+    assert!(text.contains("codex mcp list --json"), "{text}");
+    assert!(text.contains("  cognity  enabled"), "{text}");
+    assert!(text.contains("  computer-use  disabled"), "{text}");
+    assert!(text.contains("  remote-design  needs auth"), "{text}");
+    assert!(
+        text.contains("https://design.example.invalid/mcp"),
+        "the URL is shown without its query: {text}"
+    );
+    for never in [
+        "sk-fixture",
+        "FAKE_REPL_TOKEN",
+        "Authorization",
+        "DESIGN_TOKEN",
+        "@playwright/mcp@latest",
+    ] {
+        assert!(
+            !text.contains(never),
+            "{never} reached the display lines: {text}"
+        );
+    }
+    drop(opened);
+
+    let resumed = fx
+        .plane
+        .open_with(
+            SessionSelector::Named("mcp-listed".into()),
+            Some(ConnectorId::Codex),
+            StartupRequest::from_flags(None, None, None),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(
+        resumed.connector_mcp.is_none(),
+        "a resumed session does not read the inventory again"
+    );
+
+    let native = fx.plane.connector_mcp_inventory(ConnectorId::Native).await;
+    assert!(
+        matches!(
+            native,
+            ConnectorMcpDiscovery::Unsupported {
+                connector: ConnectorId::Native,
+                ..
+            }
+        ),
+        "{native:?}"
+    );
+    let absent = fx.plane.connector_mcp_inventory(ConnectorId::Cursor).await;
+    assert!(
+        matches!(
+            absent,
+            ConnectorMcpDiscovery::Unavailable {
+                connector: ConnectorId::Cursor,
+                ..
+            }
+        ),
+        "a connector this plane does not have is unavailable, not an error: {absent:?}"
+    );
+}
+
+/// A listing command that fails is a typed outcome on the opened session,
+/// and the session itself still opens and runs a turn.
+#[tokio::test]
+async fn a_failed_mcp_listing_leaves_the_connector_session_usable() {
+    let scratch = tempfile::tempdir().unwrap();
+    let wrapper = fake_agent(
+        scratch.path(),
+        &[
+            (
+                "FAKE_AGENT_FIXTURE",
+                connector_fixture("text").display().to_string(),
+            ),
+            ("FAKE_AGENT_MCP_EXIT", "1".into()),
+        ],
+    );
+    let fx = fixture(
+        Vec::new(),
+        ApprovalMode::DenyAll,
+        vec![codex_connector(&wrapper)],
+    )
+    .await;
+    let mut opened = fx
+        .plane
+        .open_with(
+            SessionSelector::Named("mcp-failed".into()),
+            Some(ConnectorId::Codex),
+            StartupRequest::from_flags(None, None, None),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let discovery = opened.connector_mcp.as_ref().expect("discovery ran");
+    assert!(
+        matches!(
+            discovery,
+            ConnectorMcpDiscovery::CommandFailure {
+                connector: ConnectorId::Codex,
+                ..
+            }
+        ),
+        "{discovery:?}"
+    );
+    assert!(discovery.inventory().is_none());
+    let lines = ControlPlane::connector_mcp_lines(discovery);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("MCP listing failed"), "{lines:?}");
+
+    let mut ui = RecordingUi::default();
+    let outcome = opened.driver.run_turn("hello", &mut ui).await.unwrap();
+    assert!(
+        matches!(outcome.status, TurnStatus::Completed),
+        "the session must still run: {outcome:?}"
     );
 }
 

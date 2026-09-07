@@ -1,0 +1,6 @@
+Checking MCP server health…
+
+claude.ai Google Drive: https://drivemcp.example.invalid/mcp/v1 - ✔ Connected
+gritt: .agents/gritt-agent mcp serve - ⏸ Pending approval (run `claude` to approve)
+broken-demo: /opt/mcp/server --api-key sk-fixture-arg-secret --port 8080 - ✗ Failed to connect
+notes: https://notes.example.invalid/mcp - ⚠ Needs authentication

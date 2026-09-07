@@ -226,3 +226,44 @@ async fn live_opencode_model_listing() {
     );
     assert_eq!(outcome.connector(), ConnectorId::OpenCode);
 }
+
+/// Each installed CLI's own MCP listing parses into a current inventory
+/// (possibly empty) and never keeps an environment value or a credential
+/// option value. Skipped, not failed, when a CLI is missing.
+#[tokio::test]
+async fn live_mcp_inventories_parse_and_stay_redacted() {
+    if !gated() {
+        eprintln!("GRITT_LIVE_CONNECTOR_TESTS is not set; skipping");
+        return;
+    }
+    let settings = ConnectorSettings::default();
+    let connectors: Vec<(&str, Box<dyn Connector>)> = vec![
+        ("codex", Box::new(ExternalConnector::new(Codex, &settings))),
+        (
+            "claude",
+            Box::new(ExternalConnector::new(ClaudeCode, &settings)),
+        ),
+        (
+            "opencode",
+            Box::new(ExternalConnector::new(OpenCode, &settings)),
+        ),
+    ];
+    for (name, connector) in connectors {
+        let outcome = connector
+            .discover_mcp_inventory(std::env::current_dir().unwrap())
+            .await;
+        eprintln!("{name}: {}", outcome.describe());
+        match &outcome {
+            gritt_core::connector::ConnectorMcpDiscovery::Unavailable { .. } => continue,
+            gritt_core::connector::ConnectorMcpDiscovery::Current { inventory } => {
+                let text = serde_json::to_string(inventory).unwrap();
+                assert!(!text.contains("--api-key "), "{text}");
+                assert!(!text.contains("Bearer "), "{text}");
+                for server in &inventory.servers {
+                    assert!(!server.name.is_empty());
+                }
+            }
+            other => panic!("{name} live listing failed: {other:?}"),
+        }
+    }
+}

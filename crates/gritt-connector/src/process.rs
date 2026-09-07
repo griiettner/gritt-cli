@@ -56,6 +56,62 @@ pub struct Supervised {
     pub transport: Transport,
 }
 
+/// Owns a supervised process until its exit has been reaped. Explicit stop
+/// waits for cleanup; dropping an interrupted task also schedules cleanup.
+pub(crate) struct ProcessGuard {
+    pub supervised: Option<Supervised>,
+    pub finished: bool,
+}
+
+impl ProcessGuard {
+    pub async fn stop(&mut self) {
+        if let Some(child) = self.supervised.as_mut() {
+            child.control.kill().await;
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let Some(mut child) = self.supervised.take() else {
+            return;
+        };
+        // A runtime may be shutting down, so an async cleanup task alone
+        // is insufficient. Signal the group before yielding ownership.
+        if let Some(pid) = child.control.pid() {
+            kill_tree_sync(pid);
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                child.control.kill().await;
+            });
+        }
+    }
+}
+
+fn kill_tree_sync(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 /// Launches `launch` through pipes or a PTY.
 pub async fn spawn(launch: &Launch) -> Result<Supervised> {
     match launch.transport {

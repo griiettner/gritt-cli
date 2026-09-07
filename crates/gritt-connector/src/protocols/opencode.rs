@@ -7,12 +7,16 @@
 use std::collections::HashSet;
 
 use gritt_core::connector::{
-    AuthState, ConnectorCapabilities, ConnectorId, ConnectorModel, TaskRequest,
+    AuthState, ConnectorCapabilities, ConnectorId, ConnectorMcpServer, ConnectorMcpStatus,
+    ConnectorModel, TaskRequest,
 };
 use gritt_core::event::{EventKind, SessionStatus, StopReason};
 use gritt_core::ErrorKind;
 
-use super::{model_flag, number, render, text, tool_call, tool_result, ModelParseError};
+use super::{
+    model_flag, number, render, text, tool_call, tool_result, transport_from_target, McpParseError,
+    ModelParseError,
+};
 use crate::health::ProbeOutput;
 use crate::models::strip_ansi;
 use crate::supervise::{usage, Normalized, Normalizer, Protocol};
@@ -85,6 +89,22 @@ impl Protocol for OpenCode {
         args
     }
 
+    fn mcp_list_args(&self) -> Option<Vec<String>> {
+        Some(vec!["mcp".into(), "list".into()])
+    }
+
+    fn mcp_list_source(&self) -> &'static str {
+        "opencode mcp list"
+    }
+
+    fn parse_mcp_inventory(
+        &self,
+        stdout: &str,
+        _stderr: &str,
+    ) -> std::result::Result<Vec<ConnectorMcpServer>, McpParseError> {
+        parse_opencode_mcp(stdout)
+    }
+
     fn model_list_args(&self, refresh: bool) -> Option<Vec<String>> {
         let mut args = vec!["models".to_owned()];
         if refresh {
@@ -148,6 +168,113 @@ pub fn parse_opencode_models(
     }
     if out.is_empty() {
         return Err(ModelParseError::Malformed);
+    }
+    Ok(out)
+}
+
+/// `opencode mcp list` (1.18.x) prints a boxed list: a `MCP Servers`
+/// header, then per server `<glyph> <name> <status>[ (OAuth)]` followed by
+/// indented continuation lines (error hints, then the command or URL
+/// last), and a `N server(s)` summary. Statuses from the CLI source:
+/// `connected`, `disabled`, `needs authentication`, `needs client
+/// registration`, `failed`, `not initialized`. An empty list prints
+/// `No MCP servers configured`. Box-drawing prefixes and colour codes are
+/// stripped before parsing.
+pub fn parse_opencode_mcp(
+    stdout: &str,
+) -> std::result::Result<Vec<ConnectorMcpServer>, McpParseError> {
+    const STATUSES: [(&str, ConnectorMcpStatus); 6] = [
+        ("connected", ConnectorMcpStatus::Connected),
+        ("disabled", ConnectorMcpStatus::Disabled),
+        ("needs authentication", ConnectorMcpStatus::NeedsAuth),
+        ("needs client registration", ConnectorMcpStatus::NeedsAuth),
+        ("failed", ConnectorMcpStatus::Failed),
+        ("not initialized", ConnectorMcpStatus::Unknown),
+    ];
+    let text = strip_ansi(stdout);
+    let mut out: Vec<ConnectorMcpServer> = Vec::new();
+    let mut continuation: Vec<String> = Vec::new();
+    let mut saw_empty_marker = false;
+    let finish = |out: &mut Vec<ConnectorMcpServer>, continuation: &mut Vec<String>| {
+        if let (Some(server), false) = (out.last_mut(), continuation.is_empty()) {
+            let target = continuation.pop();
+            server.target = target;
+            if !continuation.is_empty() {
+                server.detail = Some(continuation.join("; "));
+            }
+            continuation.clear();
+        }
+    };
+    for raw in text.lines() {
+        let line = raw
+            .trim_start_matches(|c: char| c.is_whitespace() || "┌│└├─▲".contains(c))
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower == "mcp servers" || lower.starts_with("add servers with") {
+            continue;
+        }
+        if lower.starts_with("no mcp servers") {
+            saw_empty_marker = true;
+            continue;
+        }
+        if lower.ends_with("server(s)")
+            && lower
+                .split_whitespace()
+                .next()
+                .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
+        {
+            finish(&mut out, &mut continuation);
+            continue;
+        }
+        let is_server_line = line.starts_with(['●', '✓', '○', '⚠', '✗']);
+        if !is_server_line {
+            if out.last().is_some() {
+                continuation.push(line.to_owned());
+            }
+            continue;
+        }
+        finish(&mut out, &mut continuation);
+        let body = line
+            .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+            .trim();
+        let Some((name, rest)) = body.split_once(char::is_whitespace) else {
+            return Err(McpParseError::Malformed);
+        };
+        let rest = rest.trim();
+        let rest_lower = rest.to_ascii_lowercase();
+        let (status, matched) = STATUSES
+            .iter()
+            .find(|(word, _)| rest_lower.starts_with(word))
+            .map(|(word, status)| (*status, *word))
+            .unwrap_or((ConnectorMcpStatus::Unknown, ""));
+        let hint = rest[matched.len()..].trim();
+        let detail = if status == ConnectorMcpStatus::Unknown {
+            Some(rest.to_owned())
+        } else if hint.is_empty() {
+            None
+        } else {
+            Some(hint.trim_matches(['(', ')']).to_owned())
+        };
+        out.push(ConnectorMcpServer {
+            name: name.to_owned(),
+            transport: None,
+            target: None,
+            status,
+            detail,
+        });
+    }
+    finish(&mut out, &mut continuation);
+    if out.is_empty() && !saw_empty_marker {
+        return Err(McpParseError::Malformed);
+    }
+    for server in &mut out {
+        server.transport = server
+            .target
+            .as_deref()
+            .map(|target| transport_from_target(target).to_owned());
     }
     Ok(out)
 }

@@ -2,9 +2,9 @@
 //! before a task starts.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
+use crate::process::{self, Launch, Line, ProcessGuard};
 use gritt_core::{Error, Result};
 
 /// Finds `name` on `PATH`, or returns an explicit path as given when it
@@ -41,33 +41,81 @@ pub struct ProbeOutput {
     pub stderr: String,
 }
 
-/// Runs `program args` with a timeout and captures its output. A timeout
-/// or spawn failure is a connector error naming the program, never a
-/// panic.
+/// Runs `program args` in this process's directory with a timeout and
+/// captures its output. A timeout or spawn failure is a connector error
+/// naming the program, never a panic.
 pub async fn probe(program: &Path, args: &[String], timeout: Duration) -> Result<ProbeOutput> {
-    let mut command = tokio::process::Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(timeout, command.output()).await;
-    match output {
-        Ok(Ok(output)) => Ok(ProbeOutput {
-            success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        }),
-        Ok(Err(error)) => Err(Error::connector(format!(
-            "cannot run {}: {error}",
-            program.display()
-        ))),
-        Err(_) => Err(Error::connector(format!(
-            "{} did not answer within {}s",
-            program.display(),
-            timeout.as_secs()
-        ))),
+    let cwd =
+        std::env::current_dir().map_err(|_| Error::connector("cannot locate probe directory"))?;
+    probe_in(program, args, &cwd, timeout).await
+}
+
+/// [`probe`] with an explicit working directory, for a command whose
+/// answer depends on project-scoped configuration.
+pub async fn probe_in(
+    program: &Path,
+    args: &[String],
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<ProbeOutput> {
+    let launch = Launch {
+        program: program.to_owned(),
+        args: args.to_vec(),
+        cwd: cwd.to_owned(),
+        env_remove: Vec::new(),
+        transport: gritt_core::connector::Transport::MachineReadable,
+    };
+    let child = process::spawn(&launch)
+        .await
+        .map_err(|_| Error::connector(format!("cannot run {}", program.display())))?;
+    let mut guard = ProcessGuard {
+        supervised: Some(child),
+        finished: false,
+    };
+    let result = tokio::time::timeout(timeout, async {
+        let child = guard.supervised.as_mut().expect("probe process");
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        while let Some(line) = child.lines.recv().await {
+            let (buffer, text) = match line {
+                Line::Out(text) => (&mut stdout, text),
+                Line::Err(text) => (&mut stderr, text),
+            };
+            if buffer.len().saturating_add(text.len()) > 4 * 1024 * 1024 {
+                return Err(Error::connector("probe output exceeded its size limit"));
+            }
+            buffer.push_str(&text);
+            buffer.push('\n');
+        }
+        let exit = child
+            .control
+            .wait(timeout)
+            .await
+            .ok_or_else(|| Error::connector("probe did not exit"))?;
+        Ok(ProbeOutput {
+            success: exit.success,
+            stdout,
+            stderr,
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(output)) => {
+            guard.finished = true;
+            Ok(output)
+        }
+        Ok(Err(error)) => {
+            guard.stop().await;
+            Err(error)
+        }
+        Err(_) => {
+            guard.stop().await;
+            Err(Error::connector(format!(
+                "{} did not answer within {}s",
+                program.display(),
+                timeout.as_secs()
+            )))
+        }
     }
 }
 

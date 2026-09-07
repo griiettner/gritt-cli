@@ -1,0 +1,14 @@
+[0m
+┌  MCP Servers
+│
+●  ✗ demo-local [90mfailed
+│      MCP error -32000: Connection closed
+│      [90mecho hi --token sk-fixture-arg-secret
+│
+●  ○ demo-remote [90mdisabled
+│      [90mhttps://example.invalid/mcp
+│
+●  ✓ memory [90mconnected (OAuth)
+│      [90mhttps://memory.example.invalid/mcp
+│
+└  3 server(s)

@@ -335,6 +335,7 @@ pub fn conversation(theme: Theme) -> App {
         mcp: Some(mcp_servers()),
         mcp_owner: Some("Gritt".into()),
         connector_mcp: None,
+        connector_mcp_inventory: None,
     };
     app
 }

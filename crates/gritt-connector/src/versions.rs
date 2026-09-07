@@ -10,17 +10,19 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use gritt_core::config::ModelListPolicy;
 use gritt_core::connector::{ConnectorId, VersionComparison};
-use gritt_core::secret::Secret;
+use gritt_core::session::BoxFuture;
 use gritt_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::health::compare_versions;
 use crate::models::interval;
-use crate::process::{self, Launch, Line, Supervised};
-use crate::redact::{cap, redact_text};
+use crate::process::{self, Launch, ProcessGuard};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CachedConnectorVersion {
+    /// Executable, installation source, and querying manager this result belongs to.
+    #[serde(default)]
+    pub installation: Option<String>,
     /// When `latest` was last read successfully.
     #[serde(default)]
     pub checked_at: Option<DateTime<Utc>>,
@@ -118,9 +120,6 @@ pub fn comparison(installed: Option<&str>, latest: Option<&str>) -> VersionCompa
     }
 }
 
-/// Lines kept from an update's output, and the length of each.
-pub const OUTPUT_TAIL_LINES: usize = 12;
-pub const OUTPUT_LINE_CHARS: usize = 240;
 /// No update may run longer than this, however busy it looks.
 pub const UPDATE_HARD_CAP: Duration = Duration::from_secs(15 * 60);
 
@@ -129,35 +128,7 @@ pub struct UpdateRun {
     pub success: bool,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
-    /// The last lines the command printed, redacted and capped.
-    pub output: Vec<String>,
-}
-
-/// Kills the child's process tree if the run is dropped before it ends,
-/// so cancelling the future cancels the update.
-struct KillOnDrop {
-    supervised: Option<Supervised>,
-    finished: bool,
-}
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        let Some(mut supervised) = self.supervised.take() else {
-            return;
-        };
-        let pid = supervised.control.pid();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                if let Some(pid) = pid {
-                    process::kill_tree(pid).await;
-                }
-                supervised.control.kill().await;
-            });
-        }
-    }
+    pub cancelled: bool,
 }
 
 /// Runs `program args` through the supervised process path. Output is
@@ -167,8 +138,8 @@ pub async fn run_update(
     program: &Path,
     args: &[String],
     cwd: &Path,
-    secrets: &[Secret],
     idle: Duration,
+    cancel: &mut BoxFuture<'_, ()>,
 ) -> Result<UpdateRun> {
     let launch = Launch {
         program: program.to_path_buf(),
@@ -178,25 +149,30 @@ pub async fn run_update(
         transport: gritt_core::connector::Transport::MachineReadable,
     };
     let supervised = process::spawn(&launch).await?;
-    let mut guard = KillOnDrop {
+    let mut guard = ProcessGuard {
         supervised: Some(supervised),
         finished: false,
     };
     let started = tokio::time::Instant::now();
-    let mut output: Vec<String> = Vec::new();
     let mut timed_out = false;
+    let mut cancelled = false;
     loop {
         let remaining = UPDATE_HARD_CAP.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            timed_out = true;
+            break;
+        }
         let wait = idle.min(remaining);
         let supervised = guard.supervised.as_mut().expect("child until finished");
-        match tokio::time::timeout(wait, supervised.lines.recv()).await {
-            Ok(Some(Line::Out(text) | Line::Err(text))) => {
-                let text = cap(&redact_text(&text, secrets), OUTPUT_LINE_CHARS);
-                if output.len() == OUTPUT_TAIL_LINES {
-                    output.remove(0);
-                }
-                output.push(text);
-            }
+        let next = tokio::select! {
+            biased;
+            () = &mut *cancel => { cancelled = true; break; }
+            next = tokio::time::timeout(wait, supervised.lines.recv()) => next,
+        };
+        match next {
+            // Output is activity only. It may contain credentials unknown
+            // to Gritt, so no stdout/stderr content leaves this runner.
+            Ok(Some(_)) => {}
             Ok(None) => break,
             Err(_) => {
                 timed_out = true;
@@ -205,14 +181,15 @@ pub async fn run_update(
         }
     }
     let supervised = guard.supervised.as_mut().expect("child until finished");
-    let exit = if timed_out {
-        if let Some(pid) = supervised.control.pid() {
-            process::kill_tree(pid).await;
-        }
+    let exit = if timed_out || cancelled {
         supervised.control.kill().await;
         None
     } else {
-        supervised.control.wait(Duration::from_secs(30)).await
+        tokio::select! {
+            biased;
+            () = &mut *cancel => { cancelled = true; None }
+            exit = supervised.control.wait(Duration::from_secs(30)) => exit,
+        }
     };
     if exit.is_none() && !timed_out {
         if let Some(pid) = supervised.control.pid() {
@@ -225,7 +202,7 @@ pub async fn run_update(
         success: exit.is_some_and(|exit| exit.success),
         exit_code: exit.and_then(|exit| exit.code),
         timed_out,
-        output,
+        cancelled,
     })
 }
 
@@ -256,6 +233,7 @@ mod tests {
         let now = Utc::now();
         let policy = ModelListPolicy::default();
         let fresh = CachedConnectorVersion {
+            installation: None,
             checked_at: Some(now),
             last_attempt_at: Some(now),
             latest: Some("1".into()),

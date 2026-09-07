@@ -19,3 +19,19 @@ Origin of each file:
 
 Session, thread, and request identifiers were replaced with fixed placeholder
 values. No credential, account identifier, or base64 payload is present.
+
+`mcp/` holds each connector's own MCP inventory listing, read by the
+parsers under `src/protocols/`:
+
+- `mcp/codex/list.json`: shape of `codex mcp list --json` 0.153.x captured
+  on 2026-09-06, with paths, names, and values replaced by placeholders and
+  an `env`, `http_headers`, and query-string value added so the tests can
+  prove none of them is kept.
+- `mcp/claude/list.txt`: shape of `claude mcp list` 2.1.x captured on
+  2026-09-06 (`Connected`, `Pending approval`, `Failed to connect`), with a
+  `Needs authentication` line and a credential-bearing argument added by
+  hand. `empty.txt` and `malformed.txt` are hand-authored.
+- `mcp/opencode/list.txt` and `empty.txt`: shape of `opencode mcp list`
+  1.18.29 captured on 2026-09-06 against a scratch project config, with a
+  `connected (OAuth)` line added from the CLI source. `malformed.txt` is
+  hand-authored.

@@ -217,6 +217,174 @@ impl ConnectorModelDiscovery {
     }
 }
 
+/// How an external agent reports one of its own MCP servers, normalized
+/// across CLIs. A listing that only reads configuration reports
+/// `Enabled`; one that runs a live check reports `Connected` or `Failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorMcpStatus {
+    /// The agent's live check reached the server.
+    Connected,
+    /// Configured and enabled; the agent's listing runs no live check.
+    Enabled,
+    Disabled,
+    /// The agent's live check did not reach the server.
+    Failed,
+    /// The agent wants a login or client registration before use.
+    NeedsAuth,
+    /// The agent has not approved the server yet.
+    PendingApproval,
+    /// A state Gritt does not classify; `detail` keeps the agent's words.
+    Unknown,
+}
+
+impl ConnectorMcpStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+            Self::Failed => "failed",
+            Self::NeedsAuth => "needs auth",
+            Self::PendingApproval => "pending approval",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One MCP server an external agent reports as its own. Display only:
+/// `target` is the launch command or URL as already-redacted text, never
+/// an argument vector Gritt would run, and no environment value, header,
+/// or credential is kept at all. Gritt shows the list; the agent owns the
+/// servers (ADR-010).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorMcpServer {
+    pub name: String,
+    /// The transport as the CLI names it (`stdio`, `http`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    pub status: ConnectorMcpStatus,
+    /// The agent's own explanation, when it gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// A connector's MCP inventory after discovery. `source` names the
+/// documented command that produced it, never a secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorMcpInventory {
+    pub connector: ConnectorId,
+    pub servers: Vec<ConnectorMcpServer>,
+    pub source: String,
+    pub fetched_at: DateTime<Utc>,
+}
+
+/// Typed result of asking a connector which MCP servers it has. Read
+/// fresh on every session open, so there is no stale variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ConnectorMcpDiscovery {
+    Current {
+        inventory: ConnectorMcpInventory,
+    },
+    Unavailable {
+        connector: ConnectorId,
+        reason: String,
+    },
+    Unsupported {
+        connector: ConnectorId,
+        reason: String,
+    },
+    CommandFailure {
+        connector: ConnectorId,
+        reason: String,
+    },
+    TimedOut {
+        connector: ConnectorId,
+        reason: String,
+    },
+    MalformedOutput {
+        connector: ConnectorId,
+        reason: String,
+    },
+}
+
+impl ConnectorMcpDiscovery {
+    pub fn inventory(&self) -> Option<&ConnectorMcpInventory> {
+        match self {
+            Self::Current { inventory } => Some(inventory),
+            _ => None,
+        }
+    }
+
+    pub fn connector(&self) -> ConnectorId {
+        match self {
+            Self::Current { inventory } => inventory.connector,
+            Self::Unavailable { connector, .. }
+            | Self::Unsupported { connector, .. }
+            | Self::CommandFailure { connector, .. }
+            | Self::TimedOut { connector, .. }
+            | Self::MalformedOutput { connector, .. } => *connector,
+        }
+    }
+
+    /// A short word for a non-current outcome and the reason behind it,
+    /// for an interface that labels the connector's list. `None` for a
+    /// current inventory.
+    pub fn failure(&self) -> Option<(&'static str, &str)> {
+        match self {
+            Self::Current { .. } => None,
+            Self::Unsupported { reason, .. } => Some(("not listable", reason)),
+            Self::Unavailable { reason, .. } => Some(("unavailable", reason)),
+            Self::CommandFailure { reason, .. } => Some(("failed", reason)),
+            Self::TimedOut { reason, .. } => Some(("timed out", reason)),
+            Self::MalformedOutput { reason, .. } => Some(("unreadable", reason)),
+        }
+    }
+
+    /// One line for print, REPL, and TUI diagnostics. Names the CLI and
+    /// the source. Never a key, a header, or an environment value.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Current { inventory } => {
+                let count = match inventory.servers.len() {
+                    0 => "no MCP servers".to_owned(),
+                    1 => "1 MCP server".to_owned(),
+                    n => format!("{n} MCP servers"),
+                };
+                format!(
+                    "{} reports {count} of its own ({})",
+                    inventory.connector.as_str(),
+                    inventory.source
+                )
+            }
+            Self::Unavailable { connector, reason } => {
+                format!("{} is unavailable: {reason}", connector.as_str())
+            }
+            Self::Unsupported { connector, reason } => {
+                format!(
+                    "{} does not list its own MCP servers: {reason}",
+                    connector.as_str()
+                )
+            }
+            Self::CommandFailure { connector, reason } => {
+                format!("{} MCP listing failed: {reason}", connector.as_str())
+            }
+            Self::TimedOut { connector, reason } => {
+                format!("{} MCP listing timed out: {reason}", connector.as_str())
+            }
+            Self::MalformedOutput { connector, reason } => {
+                format!(
+                    "{} MCP listing was unreadable: {reason}",
+                    connector.as_str()
+                )
+            }
+        }
+    }
+}
+
 /// Who installed the connector executable, from evidence on disk (a
 /// Homebrew Cellar or Caskroom path, an npm `node_modules` package with
 /// its `package.json`, a pipx venv with its metadata, a Cargo
@@ -249,10 +417,6 @@ impl InstallSource {
                 format!("ambiguous installer ({})", candidates.join(" or "))
             }
         }
-    }
-
-    pub fn is_known(&self) -> bool {
-        !matches!(self, Self::Unknown | Self::Ambiguous { .. })
     }
 }
 
@@ -492,7 +656,7 @@ pub enum ConnectorUpdateOutcome {
     Failed {
         connector: ConnectorId,
         reason: String,
-        /// The last few output lines, redacted and length-capped.
+        /// Reserved for content-free diagnostics. Raw updater output is never retained.
         output: Vec<String>,
     },
     Cancelled {
@@ -569,6 +733,23 @@ pub trait Connector: Send + Sync {
             }
         })
     }
+    /// Lists the MCP servers the external agent has configured for
+    /// itself, through the agent's own documented command run in
+    /// `workspace`, so project-scoped configuration counts. Default is
+    /// [`ConnectorMcpDiscovery::Unsupported`]. Display only: nothing here
+    /// adds, approves, or connects to a server (ADR-010).
+    fn discover_mcp_inventory(&self, _workspace: PathBuf) -> BoxFuture<'_, ConnectorMcpDiscovery> {
+        let connector = self.id();
+        Box::pin(async move {
+            ConnectorMcpDiscovery::Unsupported {
+                connector,
+                reason: format!(
+                    "{} does not document an MCP listing command",
+                    connector.as_str()
+                ),
+            }
+        })
+    }
     /// Reports the installed version, its owner, and the newest version
     /// that owner publishes. Default is [`ConnectorVersionCheck::Unsupported`].
     /// Advisory: a failure here never stops a session from starting.
@@ -599,6 +780,15 @@ pub trait Connector: Send + Sync {
                 ),
             }
         })
+    }
+    /// Runs an approved update until completion or cancellation. Implementations
+    /// that launch a process must finish cleanup before returning `Cancelled`.
+    fn update_until<'a>(
+        &'a self,
+        action: UpdateAction,
+        _cancel: BoxFuture<'a, ()>,
+    ) -> BoxFuture<'a, ConnectorUpdateOutcome> {
+        self.update(action)
     }
     fn start(&self, request: TaskRequest) -> BoxFuture<'_, Result<EventStream<'_>>>;
     fn send_input(&self, session_id: &SessionId, input: String) -> BoxFuture<'_, Result<()>>;
@@ -716,6 +906,63 @@ mod tests {
         };
         assert!(unknown.summary().contains("ambiguous"));
         assert!(unknown.update.is_none());
+    }
+
+    #[test]
+    fn mcp_inventory_outcomes_round_trip_and_describe_their_source() {
+        let inventory = ConnectorMcpInventory {
+            connector: ConnectorId::Codex,
+            servers: vec![
+                ConnectorMcpServer {
+                    name: "playwright".into(),
+                    transport: Some("stdio".into()),
+                    target: Some("npx".into()),
+                    status: ConnectorMcpStatus::Enabled,
+                    detail: None,
+                },
+                ConnectorMcpServer {
+                    name: "remote".into(),
+                    transport: Some("streamable_http".into()),
+                    target: Some("https://example.invalid/mcp".into()),
+                    status: ConnectorMcpStatus::NeedsAuth,
+                    detail: Some("not logged in".into()),
+                },
+            ],
+            source: "codex mcp list --json".into(),
+            fetched_at: DateTime::parse_from_rfc3339("2026-09-06T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let current = ConnectorMcpDiscovery::Current {
+            inventory: inventory.clone(),
+        };
+        assert_eq!(current.inventory().unwrap().servers.len(), 2);
+        assert_eq!(current.connector(), ConnectorId::Codex);
+        assert!(current.describe().contains("2 MCP servers"));
+        assert!(current.describe().contains("codex mcp list --json"));
+        let text = serde_json::to_string(&current).unwrap();
+        assert!(text.contains("\"current\""));
+        assert!(text.contains("needs_auth"));
+        let back: ConnectorMcpDiscovery = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, current);
+
+        let empty = ConnectorMcpDiscovery::Current {
+            inventory: ConnectorMcpInventory {
+                servers: Vec::new(),
+                ..inventory
+            },
+        };
+        assert!(empty.describe().contains("no MCP servers"));
+        let timed_out = ConnectorMcpDiscovery::TimedOut {
+            connector: ConnectorId::ClaudeCode,
+            reason: "claude did not answer within 15s".into(),
+        };
+        assert!(timed_out.inventory().is_none());
+        assert!(timed_out.describe().contains("timed out"));
+        assert_eq!(
+            ConnectorMcpStatus::PendingApproval.label(),
+            "pending approval"
+        );
     }
 
     #[test]

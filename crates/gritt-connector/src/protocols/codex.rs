@@ -8,13 +8,16 @@
 use std::collections::HashMap;
 
 use gritt_core::connector::{
-    AuthState, ConnectorCapabilities, ConnectorId, ConnectorModel, TaskRequest,
+    AuthState, ConnectorCapabilities, ConnectorId, ConnectorMcpServer, ConnectorMcpStatus,
+    ConnectorModel, TaskRequest,
 };
 use gritt_core::event::{EventKind, SessionStatus, StopReason};
 use gritt_core::tool::native;
 use gritt_core::ErrorKind;
 
-use super::{model_flag, number, render, text, tool_call, tool_result, ModelParseError};
+use super::{
+    model_flag, number, render, text, tool_call, tool_result, McpParseError, ModelParseError,
+};
 use crate::health::ProbeOutput;
 use crate::supervise::{usage, Normalized, Normalizer, Protocol};
 
@@ -43,6 +46,72 @@ pub fn parse_codex_models(
         }
         let display_label = text(model, "display_name").or_else(|| text(model, "displayName"));
         out.push(ConnectorModel { id, display_label });
+    }
+    Ok(out)
+}
+
+/// `codex mcp list --json` prints an array of `{"name","enabled",
+/// "disabled_reason","transport":{"type","command"|"url",...},
+/// "auth_status"}`. The listing reads configuration and runs no live
+/// check, so an enabled server is `Enabled`, not `Connected`. Only the
+/// name, transport type, command or URL, enabled flag, disabled reason,
+/// and auth status are read: `args`, `env`, `env_vars`, headers, and
+/// bearer token variables are never taken from the document.
+pub fn parse_codex_mcp(
+    stdout: &str,
+) -> std::result::Result<Vec<ConnectorMcpServer>, McpParseError> {
+    // The array is the first line-leading `[` that parses as JSON: a
+    // diagnostic line printed before it may begin with a bracket of its
+    // own, and anything after the array is ignored.
+    let value = stdout
+        .match_indices('[')
+        .map(|(index, _)| index)
+        .filter(|index| {
+            let before = &stdout[..*index];
+            before.trim().is_empty() || before.trim_end_matches([' ', '\t']).ends_with('\n')
+        })
+        .find_map(|index| {
+            serde_json::Deserializer::from_str(&stdout[index..])
+                .into_iter::<serde_json::Value>()
+                .next()
+                .and_then(Result::ok)
+                .filter(serde_json::Value::is_array)
+        })
+        .ok_or(McpParseError::Malformed)?;
+    let entries = value.as_array().ok_or(McpParseError::Malformed)?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let name = text(entry, "name").ok_or(McpParseError::Malformed)?;
+        if name.is_empty() {
+            return Err(McpParseError::Malformed);
+        }
+        let enabled = entry
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let transport = entry.get("transport");
+        let kind = transport.and_then(|t| text(t, "type"));
+        let target = transport.and_then(|t| text(t, "command").or_else(|| text(t, "url")));
+        let auth = text(entry, "auth_status")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let (status, detail) = if !enabled {
+            (ConnectorMcpStatus::Disabled, text(entry, "disabled_reason"))
+        } else if auth.contains("not_logged_in") || auth.contains("not logged in") {
+            (
+                ConnectorMcpStatus::NeedsAuth,
+                Some("not logged in".to_owned()),
+            )
+        } else {
+            (ConnectorMcpStatus::Enabled, None)
+        };
+        out.push(ConnectorMcpServer {
+            name,
+            transport: kind,
+            target,
+            status,
+            detail,
+        });
     }
     Ok(out)
 }
@@ -96,6 +165,22 @@ impl Protocol for Codex {
         _stderr: &str,
     ) -> std::result::Result<Vec<ConnectorModel>, ModelParseError> {
         parse_codex_models(stdout)
+    }
+
+    fn mcp_list_args(&self) -> Option<Vec<String>> {
+        Some(vec!["mcp".into(), "list".into(), "--json".into()])
+    }
+
+    fn mcp_list_source(&self) -> &'static str {
+        "codex mcp list --json"
+    }
+
+    fn parse_mcp_inventory(
+        &self,
+        stdout: &str,
+        _stderr: &str,
+    ) -> std::result::Result<Vec<ConnectorMcpServer>, McpParseError> {
+        parse_codex_mcp(stdout)
     }
 
     fn task_args(&self, request: &TaskRequest, external_id: Option<&str>) -> Vec<String> {
