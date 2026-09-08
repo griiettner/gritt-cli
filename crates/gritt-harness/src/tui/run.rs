@@ -30,7 +30,7 @@ use super::theme::Theme;
 use crate::agent::{CancelHandle, TurnOutcome, Ui};
 use crate::changes::{ChangedFiles, FileDiff, WorkspaceChanges};
 use crate::control::{ControlPlane, DraftOpen, ProfileCatalog};
-use crate::draft::SessionDraft;
+use crate::draft::{SessionDraft, SwitchOutcome};
 use crate::driver::Driver;
 use crate::policy::Decision;
 use crate::CancellationToken;
@@ -106,6 +106,19 @@ enum UiMsg {
         operation: u64,
         generation: u64,
         result: Result<DraftOpen>,
+    },
+    /// A provider or model switch's network-bound half (warming the new
+    /// profile's catalog) has returned, so the reserved driver can now
+    /// resolve and, if the pair still checks out, commit the switch
+    /// (TKT-0027). That resolve step repeats here, cheaply, against the
+    /// now-warm cache, so this message carries the request rather than an
+    /// already-decided outcome.
+    SwitchReady {
+        operation: u64,
+        generation: u64,
+        profile: String,
+        model: String,
+        keep_effort: gritt_core::provider::ReasoningEffort,
     },
     Changes {
         generation: u64,
@@ -1361,6 +1374,56 @@ async fn on_message(
                 }
             }
         }
+        UiMsg::SwitchReady {
+            operation,
+            generation,
+            profile,
+            model,
+            keep_effort,
+        } => {
+            // The same reservation discipline `Opened` uses: only the
+            // switch the loop is still waiting for may commit, and a
+            // cancelled or superseded one has already put the driver back.
+            let matches = runtime
+                .pending_open
+                .as_ref()
+                .is_some_and(|pending| pending.operation == operation);
+            if !matches || !app.sidebar.accepts(generation) {
+                if matches {
+                    if let Some(pending) = runtime.release_pending_open(app) {
+                        *idle_agent = pending.previous;
+                    }
+                }
+                return Ok(Action::None);
+            }
+            let pending = runtime.release_pending_open(app).expect("checked above");
+            let mut agent = pending
+                .previous
+                .expect("a provider switch always reserves its own driver");
+            match agent.switch_native(profile, model, keep_effort).await {
+                Ok(SwitchOutcome::Applied { warnings, .. }) => {
+                    app.set_session(agent.session());
+                    let info = agent.info();
+                    app.status.profile = info.backend;
+                    app.status.model = info.detail;
+                    app.set_effective_effort(agent.effort());
+                    let model_info = runtime
+                        .plane
+                        .builder
+                        .catalog
+                        .model(&app.status.profile, &app.status.model);
+                    app.set_model_facts(model_info.as_ref());
+                    app.show_draft_warnings(&warnings);
+                }
+                Ok(SwitchOutcome::Rejected { errors, .. }) => {
+                    app.show_draft_errors(&errors);
+                }
+                Err(error) => {
+                    app.notice = Some(error.message);
+                }
+            }
+            *idle_agent = Some(agent);
+        }
         UiMsg::Changes {
             generation,
             changes,
@@ -1765,6 +1828,45 @@ async fn on_action(
                 }
             }
         }
+        Action::SwitchNative { profile, model } => {
+            if handle.is_some() || runtime.pending_open.is_some() {
+                app.notice = Some("finish or cancel the work in flight first".into());
+                return Ok(());
+            }
+            let Some(previous) = idle_agent.take() else {
+                return Ok(());
+            };
+            app.begin_work(Work::Open, format!("switching to {model} on {profile}"));
+            // The live driver's own effort, not the picker's in-progress
+            // draft: browsing a provider before a model is chosen can
+            // reset the draft's effort for a hypothetical pair that was
+            // never confirmed (`revalidate_effort` leaves `status` alone
+            // on a pinned session for exactly this reason).
+            let keep_effort = app.status.effort;
+            let operation = runtime.next_operation();
+            let generation = app.sidebar.generation;
+            runtime.pending_open = Some(PendingOpen {
+                operation,
+                prompt: None,
+                previous: Some(previous),
+            });
+            let plane = Arc::clone(&runtime.plane);
+            let tx = runtime.tx.clone();
+            runtime.spawn_open(async move {
+                // The only step that can reach the network. The driver held
+                // in `pending_open` is not touched here, so a turn cannot
+                // start on it, but nothing about it changes until the
+                // message below commits or the switch is cancelled.
+                let _ = plane.warm_catalog(&profile).await;
+                let _ = tx.send(UiMsg::SwitchReady {
+                    operation,
+                    generation,
+                    profile,
+                    model,
+                    keep_effort,
+                });
+            });
+        }
         Action::SaveProfile => {
             let Some(submission) = app.take_setup_submission() else {
                 return Ok(());
@@ -2154,9 +2256,19 @@ mod tests {
             })
         }
         fn info(&self) -> crate::driver::DriverInfo {
-            crate::driver::DriverInfo {
-                backend: "openrouter".into(),
-                detail: "openai/gpt-5-nano".into(),
+            match &self.session.kind {
+                SessionKind::Native {
+                    provider_profile,
+                    model,
+                    ..
+                } => crate::driver::DriverInfo {
+                    backend: provider_profile.clone(),
+                    detail: model.clone(),
+                },
+                SessionKind::Connector { id, model } => crate::driver::DriverInfo {
+                    backend: id.as_str().to_owned(),
+                    detail: model.clone().unwrap_or_default(),
+                },
             }
         }
         fn effort(&self) -> Option<gritt_core::provider::ReasoningEffort> {
@@ -2169,6 +2281,28 @@ mod tests {
             Box::pin(async {
                 Ok(crate::driver::EffortOutcome::Applied {
                     effort: Default::default(),
+                })
+            })
+        }
+        fn switch_native(
+            &mut self,
+            profile: String,
+            model: String,
+            _keep_effort: gritt_core::provider::ReasoningEffort,
+        ) -> gritt_core::session::BoxFuture<'_, Result<SwitchOutcome>> {
+            if let SessionKind::Native {
+                provider_profile,
+                model: current,
+                ..
+            } = &mut self.session.kind
+            {
+                *provider_profile = profile;
+                *current = model;
+            }
+            Box::pin(async {
+                Ok(SwitchOutcome::Applied {
+                    catalog: crate::draft::CatalogState::Skipped,
+                    warnings: Vec::new(),
                 })
             })
         }
@@ -2978,6 +3112,128 @@ mod tests {
             "a refused switch left the interface with no session"
         );
         assert!(!h.app.session_transition);
+    }
+
+    /// TKT-0027: a provider or model switch reserves the driver the same
+    /// way `Resume` does, so a prompt cannot start on it mid-flight and
+    /// Escape restores it exactly as an interrupted resume would.
+    #[tokio::test]
+    async fn cancelling_a_switch_restores_the_driver_it_reserved() {
+        let mut h = harness().await;
+        let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        h.idle = Some(Box::new(StubDriver {
+            session: session("live"),
+            turns: Arc::clone(&turns),
+        }));
+        h.app.set_session(&session("live"));
+        h.act(Action::SwitchNative {
+            profile: "anthropic".into(),
+            model: "claude-model".into(),
+        })
+        .await;
+        assert!(
+            h.runtime.pending_open.is_some(),
+            "no reservation was made for the switch"
+        );
+        assert!(
+            h.idle.is_none(),
+            "the driver stayed available to a turn while the switch was in flight"
+        );
+
+        h.act(Action::Cancel).await;
+        assert!(h.idle.is_some(), "cancelling lost the driver");
+        assert!(h.runtime.pending_open.is_none());
+        // The stub only changes its session on a completed `switch_native`
+        // call; cancellation happened before phase two ever ran it.
+        assert_eq!(h.app.status.profile, "openrouter");
+
+        // A prompt works again on the restored driver.
+        h.app.running = true;
+        h.act(Action::Submit("still here".into())).await;
+        // `run_turn` runs on the spawned turn task; give it a turn to run
+        // before reading the counter it increments.
+        let msg = h.rx.recv().await.expect("the turn should finish");
+        h.message(msg).await;
+        assert_eq!(turns.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A `SwitchReady` for a switch that was already cancelled and
+    /// superseded by another one must not touch the driver the newer
+    /// switch reserved.
+    #[tokio::test]
+    async fn a_stale_switch_result_is_dropped_without_touching_the_current_reservation() {
+        let mut h = harness().await;
+        h.idle = Some(Box::new(StubDriver {
+            session: session("live"),
+            turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }));
+        h.app.set_session(&session("live"));
+        h.act(Action::SwitchNative {
+            profile: "anthropic".into(),
+            model: "claude-model".into(),
+        })
+        .await;
+        let stale_operation = h.runtime.pending_open.as_ref().unwrap().operation;
+        h.act(Action::Cancel).await;
+        h.act(Action::SwitchNative {
+            profile: "mistral".into(),
+            model: "mistral-model".into(),
+        })
+        .await;
+        let current = h.runtime.pending_open.as_ref().unwrap().operation;
+        assert_ne!(stale_operation, current);
+
+        h.message(UiMsg::SwitchReady {
+            operation: stale_operation,
+            generation: h.app.sidebar.generation,
+            profile: "anthropic".into(),
+            model: "claude-model".into(),
+            keep_effort: Default::default(),
+        })
+        .await;
+        assert_eq!(
+            h.runtime.pending_open.as_ref().unwrap().operation,
+            current,
+            "a stale result released the reservation a newer switch owns"
+        );
+        assert!(
+            h.idle.is_none(),
+            "the current switch's reserved driver was returned by a stale message"
+        );
+    }
+
+    /// The success path: the reserved driver commits the switch, and the
+    /// interface adopts the confirmed profile, model, and effort.
+    #[tokio::test]
+    async fn a_confirmed_switch_updates_the_status_and_returns_the_driver() {
+        let mut h = harness().await;
+        h.idle = Some(Box::new(StubDriver {
+            session: session("live"),
+            turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }));
+        h.app.set_session(&session("live"));
+        h.act(Action::SwitchNative {
+            profile: "anthropic".into(),
+            model: "claude-model".into(),
+        })
+        .await;
+        let operation = h.runtime.pending_open.as_ref().unwrap().operation;
+
+        h.message(UiMsg::SwitchReady {
+            operation,
+            generation: h.app.sidebar.generation,
+            profile: "anthropic".into(),
+            model: "claude-model".into(),
+            keep_effort: Default::default(),
+        })
+        .await;
+        assert!(h.runtime.pending_open.is_none());
+        assert!(
+            h.idle.is_some(),
+            "the driver was not returned after committing"
+        );
+        assert_eq!(h.app.status.profile, "anthropic");
+        assert_eq!(h.app.status.model, "claude-model");
     }
 
     /// Finding 3: cancelling MCP work signals its token instead of

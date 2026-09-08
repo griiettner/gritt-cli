@@ -152,6 +152,8 @@ pub fn parse_cursor_models(
         out.push(ConnectorModel {
             id,
             display_label: (!label.is_empty()).then_some(label),
+            input_price_per_million: None,
+            output_price_per_million: None,
         });
     }
     if out.is_empty() {

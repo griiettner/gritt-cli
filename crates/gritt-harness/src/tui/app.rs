@@ -194,6 +194,14 @@ pub enum Action {
         connector: ConnectorId,
         action: UpdateAction,
     },
+    /// Move the live native session's next turn to a different provider
+    /// profile or model, chosen from `/connect` or `/models` on a session
+    /// that already has history (TKT-0027). A fresh, still-empty session
+    /// keeps drafting instead: see [`App::choose`].
+    SwitchNative {
+        profile: String,
+        model: String,
+    },
 }
 
 /// What `/mcp` asks the runtime to do. The runtime calls the same typed
@@ -1385,10 +1393,19 @@ impl App {
                 .detail(model.id.clone())
                 .badge(profile.clone())
                 .current(self.draft.model.as_deref() == Some(model.id.as_str()));
+            if let Some(pricing) = Self::model_pricing_note(model) {
+                row = row.note(pricing);
+            }
             if model.deprecated {
-                row = row.note(match &model.replaced_by {
+                let deprecation = match &model.replaced_by {
                     Some(replacement) => format!("deprecated; replaced by {replacement}"),
                     None => "deprecated".into(),
+                };
+                let note = row.note.clone();
+                row = row.note(if note.is_empty() {
+                    deprecation
+                } else {
+                    format!("{note} · {deprecation}")
                 });
             }
             rows.push(row);
@@ -1422,6 +1439,19 @@ impl App {
             .with_status(status)
     }
 
+    /// Model prices are stored as dollars per million tokens so they can be
+    /// used directly for usage estimates. The picker shows the equivalent
+    /// per-million values when both sides are reported by the provider.
+    fn model_pricing_note(model: &ModelInfo) -> Option<String> {
+        let (input, output) = (
+            model.capabilities.input_price_per_million?,
+            model.capabilities.output_price_per_million?,
+        );
+        Some(format!(
+            "${input:.2}/M tokens in · ${output:.2}/M tokens out"
+        ))
+    }
+
     fn connector_model_picker(&self, id: ConnectorId) -> Picker {
         let mut rows = vec![PickerRow::new("__default__", "Agent default")
             .detail("the CLI chooses its own model")
@@ -1432,12 +1462,19 @@ impl App {
                 .display_label
                 .clone()
                 .unwrap_or_else(|| model.id.clone());
-            rows.push(
-                PickerRow::new(model.id.clone(), label)
-                    .detail(model.id.clone())
-                    .badge(id.as_str().to_owned())
-                    .current(self.connector_model.as_deref() == Some(model.id.as_str())),
-            );
+            let mut row = PickerRow::new(model.id.clone(), label)
+                .detail(model.id.clone())
+                .badge(id.as_str().to_owned())
+                .current(self.connector_model.as_deref() == Some(model.id.as_str()));
+            if let (Some(input), Some(output)) = (
+                model.input_price_per_million,
+                model.output_price_per_million,
+            ) {
+                row = row.note(format!(
+                    "${input:.2}/M tokens in · ${output:.2}/M tokens out"
+                ));
+            }
+            rows.push(row);
         }
         let status = if self.connector_catalog.loading {
             ListStatus::Loading {
@@ -2347,6 +2384,10 @@ impl App {
                 if let Some(profile) = id.strip_prefix("profile:") {
                     self.connector_choice = None;
                     self.connector_model = None;
+                    // Only drafted here, on a session with history as much
+                    // as a fresh one: a provider change needs a model
+                    // before there is anything to ask the driver for, so
+                    // `/models` is where a live switch is actually tried.
                     self.select_profile(profile);
                     self.overlays.pop();
                     self.open_picker(PickerKind::Models);
@@ -2380,6 +2421,20 @@ impl App {
                         self.connector_model = Some(id);
                     }
                     return Action::SelectConnector(connector);
+                }
+                // A native session with history asks the live driver to
+                // move there instead of only drafting the choice; a fresh
+                // session (or reselecting the pair it already runs on)
+                // keeps drafting.
+                let profile = self
+                    .draft
+                    .profile
+                    .clone()
+                    .unwrap_or_else(|| self.status.profile.clone());
+                if self.session_pinned
+                    && (profile != self.status.profile || id != self.status.model)
+                {
+                    return Action::SwitchNative { profile, model: id };
                 }
                 self.select_model(&id);
                 Action::None
@@ -2521,51 +2576,14 @@ impl App {
         true
     }
 
-    /// Whether a pinned session refuses this (provider, model) pair, and
-    /// says so.
-    ///
-    /// The check is on the pair, not on either half: the driver keeps
-    /// running the provider and model its transcript was produced under,
-    /// so changing *either* would leave the interface displaying settings
-    /// the driver is not using. A model of the same name under another
-    /// provider is a different model, which a model-only comparison would
-    /// have missed.
-    fn refuses_pinned_change(&mut self, profile: &str, model: Option<&str>) -> bool {
-        if !self.session_pinned || self.status.model.is_empty() {
-            return false;
-        }
-        let same_profile = profile == self.status.profile;
-        let same_model = model.is_none_or(|model| model == self.status.model);
-        if same_profile && same_model {
-            return false;
-        }
-        let wanted = match model {
-            Some(model) => format!("{model} on {profile}"),
-            None => profile.to_owned(),
-        };
-        self.overlays.push(Overlay::Notice(Notice {
-            title: "Changing this needs a new session".into(),
-            body: format!(
-                "This session is pinned to {} on {}. Gritt cannot move its stored transcript \
-                 and continuation state to {wanted}. Run /new to start a session on the new \
-                 choice; this one stays in /sessions and your composer draft is kept.",
-                self.status.model, self.status.profile
-            ),
-            is_error: false,
-            confirm: None,
-        }));
-        true
-    }
-
     /// Selecting a provider clears the model, because a model belongs to
-    /// the profile it was chosen under.
+    /// the profile it was chosen under. On a session with history this
+    /// only updates the draft the `/models` picker shows next: nothing is
+    /// asked of the live driver until a model completes the pair (see
+    /// [`App::choose`] and [`NativeAgent::switch_native`][switch]).
+    ///
+    /// [switch]: crate::agent::NativeAgent::switch_native
     pub fn select_profile(&mut self, profile: &str) {
-        // Nothing below this line may run on a pinned session: the draft,
-        // the catalog, the sidebar's provider, and the effort would all
-        // move away from what the driver is really using.
-        if self.refuses_pinned_change(profile, None) {
-            return;
-        }
         let had_model = self.draft.model.clone();
         self.draft = self.draft.clone().with_profile(profile);
         if had_model.is_some() && self.draft.model.is_none() {
@@ -2587,20 +2605,11 @@ impl App {
         self.revalidate_effort();
     }
 
-    /// Selecting a model revalidates the effort against it and, on a
-    /// session that already has history, explains that the change needs a
-    /// new session instead of silently discarding context.
+    /// Selecting a model drafts it and revalidates the effort against it.
+    /// Only reached for a fresh session or a reselection that changes
+    /// nothing: [`App::choose`] asks the live driver directly instead of
+    /// calling this when a session with history is really changing model.
     pub fn select_model(&mut self, model: &str) {
-        // The profile the model would be chosen under, which is what makes
-        // an identically named model on another provider a change.
-        let profile = self
-            .draft
-            .profile
-            .clone()
-            .unwrap_or_else(|| self.status.profile.clone());
-        if self.refuses_pinned_change(&profile, Some(model)) {
-            return;
-        }
         self.draft = self.draft.clone().with_model(model);
         self.sidebar.model.model = Some(model.to_owned());
         self.revalidate_effort();
@@ -2621,7 +2630,14 @@ impl App {
             .any(|row| row.id == effort.as_str() && row.availability.is_available());
         if !still_valid {
             self.draft.effort = Some(ReasoningEffort::Auto);
-            self.status.effort = ReasoningEffort::Auto;
+            // A pinned session's footer names the live driver's effort,
+            // not the picker's in-progress preview: nothing about it moves
+            // until an actual switch commits (`Action::SwitchNative` reads
+            // it as `keep_effort`, so leaving it alone here is also what
+            // keeps that read honest while a switch is still being drafted).
+            if !self.session_pinned {
+                self.status.effort = ReasoningEffort::Auto;
+            }
             self.sidebar.model.effort = Some(ReasoningEffort::Auto.label().into());
             let explanation = format!(
                 "effort returned to the model default: {effort} is not available on this model"
@@ -3106,16 +3122,10 @@ impl App {
                 ..ModelCatalogView::default()
             };
         }
-        // Writing a profile is always allowed; selecting it is not. A
-        // pinned session's driver keeps its own provider and model, so
-        // adopting the new one here would show a selection the driver is
-        // not using. The save stands and the explanation says what to do
-        // with it.
+        // Writing a profile always saves; drafting it here is the same
+        // cosmetic step `/connect` takes. A session with history only
+        // really changes provider once `/models` names a model too.
         if self.draft.profile.as_deref() != Some(profile.as_str()) {
-            if self.refuses_pinned_change(&profile, None) {
-                self.refresh_open_picker();
-                return Action::None;
-            }
             self.draft = self.draft.clone().with_profile(&profile);
             self.sidebar.model.backend = Some(profile.clone());
         }

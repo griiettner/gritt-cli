@@ -126,30 +126,38 @@ Selecting a provider clears the model, because a model belongs to one
 provider's catalog. An effort the newly selected model cannot take returns
 to the model default, with a notice saying so.
 
-### Sessions are pinned to a provider and model
+### Changing provider or model on a live session
 
-A session that has stored history is pinned to the provider and model it was
-opened with. Gritt cannot move a stored transcript and its continuation state
-to a different model, so it does not pretend to: choosing another provider or
-model on a pinned session opens a notice saying that changing this needs a
-new session.
+A native session with stored history can still move to a different provider
+or model without leaving the conversation: `/connect` then `/models` (or
+`/models` alone to stay on the current provider) ask the live driver to
+switch. Gritt keeps the same session id and transcript; only the
+provider-specific driver underneath is replaced, seeded with whatever text
+turns the outgoing driver still held locally so the new provider does not
+start blind. A protocol that keeps the conversation on the provider's own
+servers instead of locally (OpenAI Responses) has nothing to hand over, so
+the new provider starts from just the system prompt and the next prompt.
 
-Effort is not pinned. `/effort` works on a live session and takes effect from
-the next turn, because it changes what the next request asks for and not what
-the stored transcript means.
+The choice is validated the same way a new session's draft is — credentials,
+model availability, and effort support — before anything changes. A rejection
+(missing credentials, an unavailable model, cancellation, a startup error)
+leaves the driver, the stored session, and the visible selection exactly as
+they were, with a typed explanation. Effort carries forward when the new
+model can take it; when it cannot, it falls back to the model default with a
+notice, the same one the picker shows for a fresh session. The composer
+draft, the transcript, and the session's sidebar identity are untouched
+either way.
 
-The refusal happens before the choice is applied, so the draft still holds the
-session's own provider and model afterwards. The order to change model is
-therefore `/new` first, then `/models`: `/new` clears the transcript view, the
-session identity, and the usage totals, keeps your composer draft, and leaves
-the previous session in `/sessions`; the selection you make after it opens the
-next session. Selecting first and running `/new` afterwards does not carry the
-rejected choice across.
+`/new` still starts a separate conversation and is unaffected: it clears the
+transcript view, the session identity, and the usage totals, keeps your
+composer draft, and leaves the previous session in `/sessions`.
 
-The same rule is enforced twice on purpose: once in the interface, for an
-immediate answer, and once in the control plane, which refuses the draft
-outright. Resuming a session restores the provider, model, effort, phase,
-transcript, and continuation state it was left with.
+Resuming a session restores the provider, model, effort, phase, transcript,
+and continuation state it was left with. A resume whose `--profile` or
+`--model` flag names something the session's transcript was not produced
+under is still refused outright by the control plane — that is a different
+session to open, not a live switch, so the answer is the same typed
+`session pinned` explanation as before.
 
 ### Commands
 

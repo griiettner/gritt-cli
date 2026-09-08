@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use common::*;
 use gritt_core::event::{EventKind, StopReason};
-use gritt_core::provider::{ModelCapabilities, Protocol};
+use gritt_core::provider::{Message, ModelCapabilities, Protocol, Role};
 use gritt_core::tool::{ToolCallId, ToolResult};
 use gritt_core::ErrorKind;
 use gritt_provider::{adapter_for, FixtureResponse};
@@ -306,6 +306,65 @@ async fn continuation_state_restores_into_a_fresh_adapter() {
             .0,
         );
         assert!(wrong.restore(state).await.is_err());
+    }
+}
+
+/// TKT-0027: `history()` is what a provider switch replays into the
+/// replacement adapter, so it has to report what a wire form that keeps a
+/// local message array can actually give back, and admit nothing for one
+/// that does not.
+#[tokio::test]
+async fn history_reports_locally_held_text_turns_and_is_empty_for_responses() {
+    for protocol in PROTOCOLS {
+        let (context, _, _) = make_context(
+            protocol,
+            vec![
+                sse(protocol, "stream-text.sse"),
+                sse(protocol, "stream-text.sse"),
+            ],
+            32,
+        );
+        let adapter = adapter_for(context);
+        assert!(
+            adapter.history().await.unwrap().is_empty(),
+            "{protocol:?}: nothing sent yet"
+        );
+        collect(adapter.send(prompt(protocol, false)).await.unwrap()).await;
+        let mut second = prompt(protocol, false);
+        second.messages = vec![Message {
+            role: Role::User,
+            content: "Say hello again".into(),
+        }];
+        collect(adapter.send(second).await.unwrap()).await;
+        let history = adapter.history().await.unwrap();
+        match protocol {
+            Protocol::Responses => assert!(
+                history.is_empty(),
+                "Responses keeps the conversation on the provider's servers, not locally"
+            ),
+            Protocol::ChatCompletions | Protocol::Messages => assert_eq!(
+                history,
+                vec![
+                    Message {
+                        role: Role::User,
+                        content: "Say hello".into(),
+                    },
+                    Message {
+                        role: Role::Assistant,
+                        content: "Hello, world".into(),
+                    },
+                    Message {
+                        role: Role::User,
+                        content: "Say hello again".into(),
+                    },
+                    Message {
+                        role: Role::Assistant,
+                        content: "Hello, world".into(),
+                    },
+                ],
+                "{protocol:?}"
+            ),
+        }
     }
 }
 

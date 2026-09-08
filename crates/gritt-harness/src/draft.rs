@@ -375,6 +375,23 @@ impl DraftOutcome {
     }
 }
 
+/// The result of asking a live native session to move its next turn to a
+/// different provider profile or model (TKT-0027). Validation is the same
+/// typed contract a new session's draft uses; a rejection changes nothing
+/// about the driver a caller is already running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum SwitchOutcome {
+    Applied {
+        catalog: CatalogState,
+        warnings: Vec<DraftWarning>,
+    },
+    Rejected {
+        errors: Vec<DraftError>,
+        catalog: Option<CatalogState>,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -134,6 +134,30 @@ fn parsers_read_committed_catalog_fixtures() {
 }
 
 #[test]
+fn opencode_verbose_models_keep_reported_per_million_prices() {
+    let models = parse_opencode_models(
+        r#"
+opencode/paid-model
+{
+  "id": "paid-model",
+  "cost": {"input": 2.5, "output": 10}
+}
+opencode/free-model
+{
+  "id": "free-model",
+  "cost": {"input": 0, "output": 0}
+}
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(models[0].input_price_per_million, Some(2.5));
+    assert_eq!(models[0].output_price_per_million, Some(10.0));
+    assert_eq!(models[1].input_price_per_million, Some(0.0));
+    assert_eq!(models[1].output_price_per_million, Some(0.0));
+}
+
+#[test]
 fn parsers_reject_empty_or_whitespace_output() {
     assert_eq!(parse_cursor_models(""), Err(ModelParseError::Malformed));
     assert_eq!(

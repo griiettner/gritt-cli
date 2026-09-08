@@ -930,6 +930,8 @@ async fn connector_refresh_failure_marks_the_cached_list_stale() {
                 models: vec![gritt_core::connector::ConnectorModel {
                     id: "gpt-5.4".into(),
                     display_label: Some("GPT-5.4".into()),
+                    input_price_per_million: None,
+                    output_price_per_million: None,
                 }],
             },
         )

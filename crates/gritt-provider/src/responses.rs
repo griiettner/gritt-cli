@@ -234,6 +234,13 @@ impl ProviderAdapter for ResponsesAdapter {
             .capabilities(&self.context.profile.name, model);
         Box::pin(async move { Ok(found.unwrap_or_default()) })
     }
+
+    /// Responses keeps the conversation behind `previous_response_id` on
+    /// the provider's servers; nothing locally is provider-neutral text to
+    /// replay into a different adapter after a switch.
+    fn history(&self) -> BoxFuture<'_, Result<Vec<gritt_core::provider::Message>>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
 }
 
 #[derive(Default)]

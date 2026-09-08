@@ -266,6 +266,35 @@ impl ProviderAdapter for ChatCompletionsAdapter {
             .capabilities(&self.context.profile.name, model);
         Box::pin(async move { Ok(found.unwrap_or_default()) })
     }
+
+    fn history(&self) -> BoxFuture<'_, Result<Vec<gritt_core::provider::Message>>> {
+        Box::pin(async move {
+            let state = self.state.lock().expect("chat state");
+            let mut history = Vec::new();
+            for entry in &state.messages {
+                let role = entry
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let Some(text) = entry.get("content").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                let role = match role {
+                    "user" => Role::User,
+                    "assistant" => Role::Assistant,
+                    _ => continue,
+                };
+                history.push(gritt_core::provider::Message {
+                    role,
+                    content: text.to_owned(),
+                });
+            }
+            Ok(history)
+        })
+    }
 }
 
 /// Normalizes `choices[].delta` fragments into events and records the

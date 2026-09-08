@@ -106,7 +106,7 @@ impl Protocol for OpenCode {
     }
 
     fn model_list_args(&self, refresh: bool) -> Option<Vec<String>> {
-        let mut args = vec!["models".to_owned()];
+        let mut args = vec!["models".to_owned(), "--verbose".to_owned()];
         if refresh {
             args.push("--refresh".into());
         }
@@ -130,22 +130,41 @@ impl Protocol for OpenCode {
     }
 }
 
-/// `opencode models` prints one `provider/id` line. JSON blobs from
-/// `--verbose` are skipped so a display name is only taken from the id.
+/// `opencode models --verbose` prints one `provider/id` line followed by a
+/// JSON object containing metadata such as per-million-token costs.
 pub fn parse_opencode_models(
     stdout: &str,
 ) -> std::result::Result<Vec<ConnectorModel>, ModelParseError> {
     let text = strip_ansi(stdout);
-    let mut out = Vec::new();
+    let mut out: Vec<ConnectorModel> = Vec::new();
     let mut depth = 0usize;
+    let mut json = String::new();
+    let mut last_model: Option<usize> = None;
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() {
             continue;
         }
-        depth += line.chars().filter(|c| *c == '{').count();
-        depth = depth.saturating_sub(line.chars().filter(|c| *c == '}').count());
-        if depth > 0 || line.starts_with('{') || line.starts_with('}') {
+        if depth > 0 || line.starts_with('{') {
+            if depth == 0 {
+                json.clear();
+            }
+            json.push_str(line);
+            depth += line.chars().filter(|c| *c == '{').count();
+            depth = depth.saturating_sub(line.chars().filter(|c| *c == '}').count());
+            if depth == 0 {
+                if let (Some(index), Ok(value)) =
+                    (last_model, serde_json::from_str::<serde_json::Value>(&json))
+                {
+                    let price = |field: &str| {
+                        value
+                            .pointer(&format!("/cost/{field}"))
+                            .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))
+                    };
+                    out[index].input_price_per_million = price("input");
+                    out[index].output_price_per_million = price("output");
+                }
+            }
             continue;
         }
         let lower = line.to_ascii_lowercase();
@@ -162,7 +181,10 @@ pub fn parse_opencode_models(
                 out.push(ConnectorModel {
                     id: line.to_owned(),
                     display_label: None,
+                    input_price_per_million: None,
+                    output_price_per_million: None,
                 });
+                last_model = Some(out.len() - 1);
             }
         }
     }

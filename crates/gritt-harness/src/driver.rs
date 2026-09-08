@@ -7,6 +7,7 @@ use gritt_core::session::{BoxFuture, ExecutionMode, Phase, Session, SessionKind}
 use gritt_core::Result;
 
 use crate::agent::{CancelHandle, NativeAgent, TurnOutcome, Ui};
+use crate::draft::SwitchOutcome;
 
 /// What changing effort on a driver did. Typed so an interface can show
 /// the right message without parsing one.
@@ -61,6 +62,21 @@ pub trait Driver: Send {
     /// Changes the effort for later turns. Native only; see
     /// [`EffortOutcome`].
     fn set_effort(&mut self, effort: ReasoningEffort) -> BoxFuture<'_, Result<EffortOutcome>>;
+    /// Moves this session's next turn to a different provider profile or
+    /// model, keeping the same session id and transcript (TKT-0027).
+    /// Native only; a connector session manages its own model and refuses.
+    fn switch_native(
+        &mut self,
+        _profile: String,
+        _model: String,
+        _keep_effort: ReasoningEffort,
+    ) -> BoxFuture<'_, Result<SwitchOutcome>> {
+        Box::pin(async {
+            Err(gritt_core::Error::config(
+                "the external agent manages its own provider and model",
+            ))
+        })
+    }
 }
 
 impl Driver for NativeAgent {
@@ -100,6 +116,20 @@ impl Driver for NativeAgent {
 
     fn set_effort(&mut self, effort: ReasoningEffort) -> BoxFuture<'_, Result<EffortOutcome>> {
         Box::pin(NativeAgent::set_effort(self, effort))
+    }
+
+    fn switch_native(
+        &mut self,
+        profile: String,
+        model: String,
+        keep_effort: ReasoningEffort,
+    ) -> BoxFuture<'_, Result<SwitchOutcome>> {
+        Box::pin(NativeAgent::switch_native(
+            self,
+            profile,
+            model,
+            keep_effort,
+        ))
     }
 
     fn info(&self) -> DriverInfo {

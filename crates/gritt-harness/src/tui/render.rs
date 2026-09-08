@@ -1113,7 +1113,7 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, scroll: usize, area: Rect) {
         theme.heading(),
     )));
     for limitation in [
-        "A session is pinned to its provider and model; /new changes them.",
+        "/connect and /models change provider and model for the next turn.",
         "An installed agent manages its own model, effort, and permissions.",
         "Cost is an estimate from listed prices, never a billed amount.",
         "Ctrl-Y copies inside Gritt; it does not write the system clipboard.",

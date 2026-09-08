@@ -43,3 +43,15 @@ pub fn adapter_for(context: AdapterContext) -> Arc<dyn ProviderAdapter> {
         Protocol::Messages => Arc::new(messages::MessagesAdapter::new(context)),
     }
 }
+
+/// The `ContinuationState::owner` a protocol's adapter reads and writes.
+/// Lets a caller tell "this row belongs to a different protocol" (expected
+/// after a provider switch, TKT-0027) apart from "this row is unreadable
+/// for its own protocol" without parsing `restore`'s error message.
+pub fn continuation_owner(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::ChatCompletions => chat_completions::OWNER,
+        Protocol::Responses => responses::OWNER,
+        Protocol::Messages => messages::OWNER,
+    }
+}

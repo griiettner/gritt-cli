@@ -108,13 +108,19 @@ pub struct ConnectorInspection {
     pub diagnostic: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConnectorModel {
     pub id: String,
     /// Human label from the CLI when it reports one. Absent means the
     /// interface should show `id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_label: Option<String>,
+    /// Provider-reported price per million input tokens, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_price_per_million: Option<f64>,
+    /// Provider-reported price per million output tokens, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_price_per_million: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,7 +132,7 @@ pub enum ConnectorModelFreshness {
 
 /// A connector's model catalog after discovery. `source` names the
 /// documented command or interface that produced it, never a secret.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConnectorModelCatalog {
     pub connector: ConnectorId,
     pub models: Vec<ConnectorModel>,
@@ -136,7 +142,7 @@ pub struct ConnectorModelCatalog {
 }
 
 /// Typed result of asking a connector for its current models.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ConnectorModelDiscovery {
     Current {
@@ -819,6 +825,8 @@ mod tests {
             models: vec![ConnectorModel {
                 id: "gpt-5.4".into(),
                 display_label: Some("GPT-5.4".into()),
+                input_price_per_million: None,
+                output_price_per_million: None,
             }],
             source: "codex debug models".into(),
             fetched_at: DateTime::parse_from_rfc3339("2026-09-06T12:00:00Z")

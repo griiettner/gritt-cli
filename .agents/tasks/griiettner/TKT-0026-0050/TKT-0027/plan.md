@@ -3,7 +3,7 @@ id: TKT-0027
 namespace: griiettner
 title: Allow provider and model changes within an active conversation
 artifact: plan
-status: ready
+status: done
 owner: griiettner
 created: 2026-09-06
 updated: 2026-09-06

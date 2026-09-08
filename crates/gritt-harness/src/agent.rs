@@ -30,7 +30,7 @@ use gritt_provider::models::{load_models, ModelCache, ModelCatalog};
 use gritt_provider::transport::HttpTransport;
 use gritt_provider::{adapter_for, AdapterContext, CancellationToken};
 
-use crate::draft::{DraftError, DraftWarning};
+use crate::draft::{DraftError, DraftWarning, SwitchOutcome};
 use crate::driver::EffortOutcome;
 use crate::mcp::{is_dispatch_name, McpRuntime, McpToolSet};
 use crate::policy::{Decision, PolicyEngine};
@@ -151,6 +151,16 @@ pub struct NativeAgent {
     /// at creation and again when the effort changes, cleared once a
     /// completed turn has written the record.
     remember_pending: bool,
+    /// The config, keys, transport, and catalog needed to build a
+    /// replacement adapter for a provider or model switch (TKT-0027). The
+    /// agent already owns its own store, telemetry, and workspace, so this
+    /// only ever supplies what a switch needs beyond them.
+    builder: Arc<AgentBuilder>,
+    /// The prior conversation's text turns, taken from the outgoing
+    /// adapter right after a switch and consumed by the next `request()`
+    /// so the new provider starts with the same normalized history
+    /// instead of an empty conversation.
+    pending_replay: Option<Vec<Message>>,
 }
 
 /// Redacts every registered secret out of an event's text, arguments,
@@ -275,6 +285,135 @@ impl NativeAgent {
         );
         self.store.append_events(vec![event]).await?;
         Ok(EffortOutcome::Applied { effort })
+    }
+
+    /// Moves this session's next turn to a different provider profile or
+    /// model without leaving the conversation (TKT-0027). `profile` is
+    /// pinned: this never fails over to another one. `model` follows the
+    /// same resolution a new session's draft uses (alias, deprecation,
+    /// catalog membership); `keep_effort` is the level to try carrying
+    /// forward, typically the session's current one, with the same
+    /// graceful reset to the provider default a picker uses when the new
+    /// model cannot take it.
+    ///
+    /// Nothing about the running driver changes until every check passes:
+    /// the profile exists, its credentials resolve, the model is in its
+    /// list (or explicitly typed past an unavailable list), and, when
+    /// `keep_effort` is explicit, it is at least accepted with a fallback.
+    /// A rejection leaves the adapter, the stored session, and the visible
+    /// selection exactly as they were.
+    pub async fn switch_native(
+        &mut self,
+        profile: String,
+        model: String,
+        keep_effort: ReasoningEffort,
+    ) -> Result<SwitchOutcome> {
+        let builder = Arc::clone(&self.builder);
+        let request = StartupRequest {
+            profile: Some(profile),
+            pinned: true,
+            profile_is_hint: false,
+            model: Some(model),
+            effort: None,
+        };
+        let mut selection = match builder.resolve_startup(&request).await? {
+            StartupOutcome::Rejected { errors, catalog } => {
+                return Ok(SwitchOutcome::Rejected { errors, catalog });
+            }
+            StartupOutcome::Ready(selection) => selection,
+        };
+        if keep_effort.is_explicit() {
+            match builder.effort_error(&selection.profile, &selection.model, keep_effort) {
+                None => selection.effort = keep_effort,
+                Some(DraftError::EffortUnsupported { reason, .. }) => {
+                    selection.warnings.push(DraftWarning::EffortReset {
+                        effort: keep_effort,
+                        profile: selection.profile.clone(),
+                        model: selection.model.clone(),
+                        reason,
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        self.apply_switch(&builder, &selection).await?;
+        Ok(SwitchOutcome::Applied {
+            catalog: selection.catalog,
+            warnings: selection.warnings,
+        })
+    }
+
+    /// Commits a validated selection: builds the replacement adapter,
+    /// carries the outgoing adapter's normalized history to it, and
+    /// persists the new provider, model, and effort on this session's
+    /// existing row. Only called once [`NativeAgent::switch_native`] has a
+    /// [`crate::startup::StartupOutcome::Ready`] selection in hand, so
+    /// this step itself does not reject.
+    async fn apply_switch(
+        &mut self,
+        builder: &AgentBuilder,
+        selection: &crate::startup::StartupSelection,
+    ) -> Result<()> {
+        let profile_definition = builder
+            .config
+            .profiles
+            .get(&selection.profile)
+            .cloned()
+            .ok_or_else(|| Error::config(format!("unknown profile `{}`", selection.profile)))?;
+        let secrets: Vec<Secret> = builder
+            .keys
+            .key(&selection.profile, &profile_definition.key)
+            .ok()
+            .into_iter()
+            .collect();
+        let capabilities: Arc<dyn CapabilitySource> = builder.catalog.clone();
+        let new_adapter = adapter_for(AdapterContext {
+            profile: profile_definition,
+            session_id: self.session.id.clone(),
+            transport: Arc::clone(&builder.transport),
+            keys: Arc::clone(&builder.keys),
+            capabilities,
+            cancel: self.cancel.clone(),
+        });
+        // Read before the swap: this is the outgoing adapter's own memory
+        // of the conversation, not a continuation token, and never reaches
+        // the new provider's wire format directly.
+        let history = self.adapter.history().await?;
+        builder
+            .store
+            .set_native_provider(
+                &self.session.id,
+                selection.profile.clone(),
+                selection.model.clone(),
+                selection.effort,
+            )
+            .await?;
+        if let SessionKind::Native {
+            provider_profile,
+            model,
+            effort,
+        } = &mut self.session.kind
+        {
+            *provider_profile = selection.profile.clone();
+            *model = selection.model.clone();
+            *effort = selection.effort;
+        }
+        self.adapter = new_adapter;
+        self.secrets = secrets;
+        self.pending_replay = if history.is_empty() {
+            None
+        } else {
+            Some(history)
+        };
+        // The new adapter has never heard the system prompt or been told
+        // the current phase; the next request sends both fresh.
+        self.started = false;
+        self.sent_phase = None;
+        self.labels = BTreeMap::from([
+            ("profile".to_string(), selection.profile.clone()),
+            ("model".to_string(), selection.model.clone()),
+        ]);
+        Ok(())
     }
 
     pub fn approval_mode(&self) -> ApprovalMode {
@@ -416,6 +555,11 @@ impl NativeAgent {
         }
     }
 
+    /// Peeks `pending_replay` rather than draining it: this is called by
+    /// [`NativeAgent::request_preview`] too, which promises not to send
+    /// anything, so it must not be what consumes a switch's carried-over
+    /// history. [`NativeAgent::run_turn`] clears it once the request it
+    /// built here is the one that actually goes out.
     fn request(&self, prompt: &str) -> PromptRequest {
         let (model, effort) = match &self.session.kind {
             SessionKind::Native { model, effort, .. } => (model.clone(), *effort),
@@ -428,6 +572,13 @@ impl NativeAgent {
                 role: Role::System,
                 content: self.system_prompt(),
             });
+            // A provider or model switch left the prior turns' text here;
+            // the new adapter has never seen them, so they go out ahead of
+            // the new prompt instead of relying on this adapter's own
+            // (empty) continuation state.
+            if let Some(replay) = &self.pending_replay {
+                messages.extend(replay.iter().cloned());
+            }
         } else if self.sent_phase != Some(self.session.phase) {
             // The system prompt went out under the old phase; tell the
             // model what changed rather than leaving it believing tools
@@ -502,6 +653,11 @@ impl NativeAgent {
             .content(&self.session.id, "user", prompt, &self.secrets)
             .await?;
         let request = self.request(prompt);
+        // This request is the one that actually goes out, so a switch's
+        // carried-over history goes with it exactly once; a later retry of
+        // this same turn (on failure) rebuilds without it, same as a
+        // second real turn would.
+        self.pending_replay = None;
         let adapter = Arc::clone(&self.adapter);
         let status = self.harness_event(
             EventKind::StatusChanged {
@@ -1274,8 +1430,18 @@ impl AgentBuilder {
         });
         let mut started = false;
         if let Some(state) = self.store.load_continuation(&session.id).await? {
-            adapter.restore(state).await?;
-            started = true;
+            // A provider switch (TKT-0027) can leave a continuation row
+            // whose owner the current adapter does not recognize: the
+            // session's stored profile has already moved on, but no turn
+            // has run on the new adapter to overwrite the row yet. That is
+            // not a corrupt session, so it starts fresh instead of failing
+            // to open. A state that *does* belong to this adapter but is
+            // otherwise unreadable is still a real failure and still
+            // propagates, exactly as before this case existed.
+            if state.owner == gritt_provider::continuation_owner(adapter.protocol()) {
+                adapter.restore(state).await?;
+                started = true;
+            }
         }
         let next_sequence = self.store.next_sequence(&session.id).await?;
         let policy = PolicyEngine::new(self.config.policy.clone(), self.workspace.root());
@@ -1319,6 +1485,8 @@ impl AgentBuilder {
             labels,
             new_session: false,
             remember_pending: false,
+            builder: Arc::new(self.clone()),
+            pending_replay: None,
         })
     }
 

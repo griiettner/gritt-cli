@@ -30,15 +30,17 @@ tickets:
   - id: TKT-0027
     namespace: griiettner
     title: Allow provider and model changes within an active conversation
-    status: ready
+    status: done
     owner: griiettner
     priority: normal
     created: 2026-09-06
-    updated: 2026-09-06
+    updated: 2026-09-08
     artifacts:
       concept: .agents/tasks/griiettner/TKT-0026-0050/TKT-0027/concept.md
       plan: .agents/tasks/griiettner/TKT-0026-0050/TKT-0027/plan.md
       task: .agents/tasks/griiettner/TKT-0026-0050/TKT-0027/task.md
+      report: .agents/tasks/griiettner/TKT-0026-0050/TKT-0027/report.md
+      updates: .agents/tasks/griiettner/TKT-0026-0050/TKT-0027/updates/
     dependencies:
       - TKT-0015
     areas:

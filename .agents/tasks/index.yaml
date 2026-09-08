@@ -25,10 +25,9 @@
   range: TKT-0026-0050
   file: .agents/tasks/griiettner/TKT-0026-0050/index.yaml
   count: 2
-  updated: 2026-09-06
+  updated: 2026-09-08
   statuses:
-    - done: 1
-    - ready: 1
+    - done: 2
   areas:
     - crates/gritt
     - crates/gritt-connector

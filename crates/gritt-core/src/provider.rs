@@ -316,6 +316,14 @@ pub trait ProviderAdapter: Send + Sync {
     /// Exports the state needed to continue later.
     fn continuation(&self) -> BoxFuture<'_, Result<Option<ContinuationState>>>;
     fn capabilities(&self, model: &str) -> BoxFuture<'_, Result<ModelCapabilities>>;
+    /// The user and assistant turns this adapter still holds locally,
+    /// oldest first, system messages excluded. Used to seed a replacement
+    /// adapter after a provider or model change instead of reusing this
+    /// adapter's own continuation state, which a different wire protocol
+    /// cannot read. A protocol whose continuation is opaque server-side
+    /// state (for example Responses' `previous_response_id`) reports
+    /// whatever text it still holds locally, which may be empty.
+    fn history(&self) -> BoxFuture<'_, Result<Vec<Message>>>;
 }
 
 #[cfg(test)]

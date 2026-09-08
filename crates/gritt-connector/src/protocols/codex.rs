@@ -45,7 +45,12 @@ pub fn parse_codex_models(
             return Err(ModelParseError::Malformed);
         }
         let display_label = text(model, "display_name").or_else(|| text(model, "displayName"));
-        out.push(ConnectorModel { id, display_label });
+        out.push(ConnectorModel {
+            id,
+            display_label,
+            input_price_per_million: None,
+            output_price_per_million: None,
+        });
     }
     Ok(out)
 }

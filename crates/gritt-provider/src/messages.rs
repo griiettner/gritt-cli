@@ -233,6 +233,58 @@ impl ProviderAdapter for MessagesAdapter {
             .capabilities(&self.context.profile.name, model);
         Box::pin(async move { Ok(found.unwrap_or_default()) })
     }
+
+    fn history(&self) -> BoxFuture<'_, Result<Vec<gritt_core::provider::Message>>> {
+        Box::pin(async move {
+            let state = self.state.lock().expect("messages state");
+            let mut history = Vec::new();
+            for entry in &state.messages {
+                let role = entry
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let content = entry.get("content");
+                match role {
+                    // A plain string is a typed turn; an array is tool
+                    // result blocks (Anthropic sends those under the user
+                    // role too), which carry no conversation text to replay.
+                    "user" => {
+                        if let Some(text) = content.and_then(|v| v.as_str()) {
+                            if !text.is_empty() {
+                                history.push(gritt_core::provider::Message {
+                                    role: Role::User,
+                                    content: text.to_owned(),
+                                });
+                            }
+                        }
+                    }
+                    "assistant" => {
+                        let text = content
+                            .and_then(|v| v.as_array())
+                            .map(|blocks| {
+                                blocks
+                                    .iter()
+                                    .filter(|block| {
+                                        block.get("type").and_then(|t| t.as_str()) == Some("text")
+                                    })
+                                    .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .join("")
+                            })
+                            .unwrap_or_default();
+                        if !text.is_empty() {
+                            history.push(gritt_core::provider::Message {
+                                role: Role::Assistant,
+                                content: text,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(history)
+        })
+    }
 }
 
 #[derive(Debug, Clone)]

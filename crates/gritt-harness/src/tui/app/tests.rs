@@ -71,6 +71,8 @@ fn changing_connectors_removes_foreign_models_before_loading() {
                 models: vec![ConnectorModel {
                     id: "codex-only".into(),
                     display_label: None,
+                    input_price_per_million: None,
+                    output_price_per_million: None,
                 }],
                 source: "fixture".into(),
                 fetched_at: Utc::now(),
@@ -682,17 +684,41 @@ fn the_effort_picker_offers_auto_and_explains_every_refusal() {
 }
 
 #[test]
-fn a_pinned_session_explains_that_a_model_change_needs_a_new_session() {
+fn a_pinned_session_asks_the_driver_to_switch_model_instead_of_only_drafting_it() {
     let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
     assert!(app.session_pinned);
-    let draft_before = app.draft.clone();
-    app.select_model("openai/gpt-5");
-    assert_eq!(app.draft, draft_before, "the pinned draft is untouched");
-    let Some(Overlay::Notice(notice)) = app.top_overlay() else {
-        panic!("expected the new-session explanation");
-    };
-    assert!(notice.body.contains("/new"));
-    assert!(notice.body.contains("draft is kept"));
+    assert_eq!(app.status.profile, "openai");
+    assert_eq!(app.status.model, "openai/gpt-5-nano");
+    app.dispatch(Command::Models, None);
+    // Row 0 is the current model; row 1 ("openai/gpt-5") is a real change.
+    app.on_key(key(KeyCode::Down));
+    let action = app.on_key(key(KeyCode::Enter));
+    assert_eq!(
+        action,
+        Action::SwitchNative {
+            profile: "openai".into(),
+            model: "openai/gpt-5".into(),
+        },
+        "a session with history asks the live driver instead of only drafting"
+    );
+    // Nothing is shown as changed until the driver confirms it: that is
+    // the runtime's job once the switch resolves, not the picker's.
+    assert_eq!(app.status.model, "openai/gpt-5-nano");
+    assert!(app.top_overlay().is_none(), "the picker still closes");
+}
+
+#[test]
+fn reselecting_a_pinned_session_s_own_model_is_a_no_op() {
+    let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
+    assert!(app.session_pinned);
+    app.dispatch(Command::Models, None);
+    // Row 0 is "openai/gpt-5-nano", the model this session already runs.
+    let action = app.on_key(key(KeyCode::Enter));
+    assert_eq!(
+        action,
+        Action::None,
+        "reselecting the driver's own pair asks nothing of it"
+    );
 }
 
 #[test]
@@ -844,6 +870,40 @@ fn a_stale_or_missing_catalog_renders_as_state_not_as_a_blank_list() {
         }
         other => panic!("expected a failed status, got {other:?}"),
     }
+}
+
+#[test]
+fn the_model_picker_shows_reported_input_and_output_price_per_million_tokens() {
+    let mut app = fixture::home(Theme::new(ThemeMode::NoColor));
+    app.catalog.models = vec![model("openai/gpt-5-nano")];
+
+    let picker = app.model_picker();
+    let row = picker
+        .rows()
+        .iter()
+        .find(|row| row.id == "openai/gpt-5-nano")
+        .expect("the model should be listed");
+    assert_eq!(row.note, "$2.00/M tokens in · $8.00/M tokens out");
+}
+
+#[test]
+fn the_connector_model_picker_shows_reported_input_and_output_price() {
+    let mut app = fixture::home(Theme::new(ThemeMode::NoColor));
+    app.connector_choice = Some(ConnectorId::OpenCode);
+    app.connector_catalog.models = vec![ConnectorModel {
+        id: "opencode/paid-model".into(),
+        display_label: Some("Paid model".into()),
+        input_price_per_million: Some(2.5),
+        output_price_per_million: Some(10.0),
+    }];
+
+    let picker = app.model_picker();
+    let row = picker
+        .rows()
+        .iter()
+        .find(|row| row.id == "opencode/paid-model")
+        .expect("the connector model should be listed");
+    assert_eq!(row.note, "$2.50/M tokens in · $10.00/M tokens out");
 }
 
 #[test]
@@ -1486,8 +1546,10 @@ fn a_failed_apply_keeps_the_draft_and_shows_the_typed_error() {
     assert!(notice.body.contains("/models"), "{:?}", notice.body);
 }
 
-/// A resumed session is pinned to its stored provider, model, and effort,
-/// and changing the model explains that a new session is needed.
+/// A resumed session is pinned to its stored provider, model, and effort.
+/// Picking a different model asks the live driver to switch instead of
+/// drafting a change nothing will use, and the composer draft survives
+/// the trip through the picker either way.
 #[test]
 fn a_resumed_session_is_pinned_and_keeps_the_composer_draft() {
     let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
@@ -1495,15 +1557,23 @@ fn a_resumed_session_is_pinned_and_keeps_the_composer_draft() {
     assert_eq!(app.draft.profile.as_deref(), Some("openai"));
     assert_eq!(app.draft.model.as_deref(), Some("openai/gpt-5-nano"));
     type_text(&mut app, "keep me");
-    app.select_model("openai/gpt-5-mini");
-    let Some(Overlay::Notice(notice)) = app.top_overlay() else {
-        panic!("changing the model on a pinned session said nothing")
-    };
-    assert!(notice.body.contains("/new"), "{:?}", notice.body);
+    app.dispatch(Command::Models, None);
+    // Row 0 is the current model; row 1 ("openai/gpt-5") is a real change.
+    app.on_key(key(KeyCode::Down));
+    let action = app.on_key(key(KeyCode::Enter));
+    assert_eq!(
+        action,
+        Action::SwitchNative {
+            profile: "openai".into(),
+            model: "openai/gpt-5".into(),
+        }
+    );
+    // Nothing about the draft or the stored pair moves until the
+    // runtime's switch actually confirms it; the picker only asks.
     assert_eq!(
         app.draft.model.as_deref(),
         Some("openai/gpt-5-nano"),
-        "the pinned model was changed anyway"
+        "the pinned model changed before any driver confirmed it"
     );
     assert_eq!(app.composer.text(), "keep me");
 }
@@ -1844,36 +1914,37 @@ fn debugging_the_setup_form_cannot_print_the_key() {
     assert!(!format!("{:?}", app.overlays).contains("sk-never-printed"));
 }
 
-/// Round 2, finding 5: setting up a provider from a pinned session writes
-/// the profile but does not move the selection the driver is using.
+/// Setting up a provider from a pinned session drafts the new profile and
+/// asks for its catalog, exactly like an unpinned draft: nothing about
+/// the live driver moves until a model actually completes a switch (see
+/// [`a_pinned_session_asks_the_driver_to_switch_model_instead_of_only_drafting_it`]).
 #[test]
-fn setup_from_a_pinned_session_saves_without_changing_the_selection() {
+fn setup_from_a_pinned_session_drafts_the_new_profile_and_reloads_its_catalog() {
     let mut app = fixture::conversation(Theme::new(ThemeMode::NoColor));
     assert!(app.session_pinned);
     assert_eq!(app.status.profile, "openai");
     type_text(&mut app, "a draft worth keeping");
     app.overlays
         .push(Overlay::Setup(SetupForm::for_preset(&PRESETS[0])));
-    // The write succeeded; only the selection is in question.
     let action = app.setup_outcome("saved to /somewhere/config.toml".into(), true);
     assert_eq!(
-        action,
-        Action::None,
-        "a pinned session loaded a new catalog"
-    );
-    assert_eq!(
         app.draft.profile.as_deref(),
-        Some("openai"),
-        "the pinned session's provider was replaced by the one just saved"
+        Some("openrouter"),
+        "the draft did not pick up the profile just saved"
     );
-    assert_eq!(app.status.profile, "openai");
-    assert_eq!(app.sidebar.model.backend.as_deref(), Some("openai"));
-    assert_eq!(app.composer.text(), "a draft worth keeping");
-    // The explanation says what to do with the profile that was saved.
-    let Some(Overlay::Notice(notice)) = app.top_overlay() else {
-        panic!("no explanation was shown")
+    let Action::LoadCatalog { profile, .. } = action else {
+        panic!("the catalog was not reloaded after setup: {action:?}")
     };
-    assert!(notice.body.contains("/new"), "{:?}", notice.body);
+    assert_eq!(profile, "openrouter");
+    // The live driver is untouched: it is still shown running openai
+    // until a model is chosen and the switch actually confirms.
+    assert_eq!(app.status.profile, "openai");
+    assert_eq!(app.sidebar.model.backend.as_deref(), Some("openrouter"));
+    assert_eq!(app.composer.text(), "a draft worth keeping");
+    assert!(
+        app.top_overlay().is_none(),
+        "only the setup form should close"
+    );
 }
 
 /// The same write on an unpinned draft does adopt the new profile and
@@ -1939,6 +2010,8 @@ fn an_installed_agent_opens_its_model_picker_instead_of_starting() {
                 models: vec![gritt_core::connector::ConnectorModel {
                     id: "gpt-5.4".into(),
                     display_label: Some("GPT-5.4".into()),
+                    input_price_per_million: None,
+                    output_price_per_million: None,
                 }],
                 source: "codex debug models".into(),
                 fetched_at: Utc::now(),
@@ -1984,6 +2057,8 @@ fn a_new_draft_after_a_connector_choice_keeps_the_native_model() {
                 models: vec![gritt_core::connector::ConnectorModel {
                     id: "gpt-5.4".into(),
                     display_label: Some("GPT-5.4".into()),
+                    input_price_per_million: None,
+                    output_price_per_million: None,
                 }],
                 source: "codex debug models".into(),
                 fetched_at: Utc::now(),
@@ -2037,6 +2112,8 @@ fn a_connector_catalog_result_updates_the_visible_picker() {
                 models: vec![gritt_core::connector::ConnectorModel {
                     id: "gpt-5.4".into(),
                     display_label: Some("GPT-5.4".into()),
+                    input_price_per_million: None,
+                    output_price_per_million: None,
                 }],
                 source: "codex debug models".into(),
                 fetched_at: Utc::now(),
@@ -2081,6 +2158,8 @@ fn a_connector_catalog_result_updates_the_visible_picker() {
                 models: vec![gritt_core::connector::ConnectorModel {
                     id: "gpt-5.4".into(),
                     display_label: None,
+                    input_price_per_million: None,
+                    output_price_per_million: None,
                 }],
                 source: "codex debug models".into(),
                 fetched_at: Utc::now(),
@@ -2126,6 +2205,8 @@ fn a_stale_connector_catalog_is_not_shown_as_current() {
                 models: vec![gritt_core::connector::ConnectorModel {
                     id: "gpt-5.4".into(),
                     display_label: None,
+                    input_price_per_million: None,
+                    output_price_per_million: None,
                 }],
                 source: "codex debug models".into(),
                 fetched_at: Utc::now(),

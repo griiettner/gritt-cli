@@ -109,6 +109,46 @@ impl Store {
         Ok(())
     }
 
+    /// Replaces a native session's provider, model, and effort at once and
+    /// bumps `updated_at`. Used to move a live session's next turn to a
+    /// different driver while keeping its id, transcript, and continuation
+    /// row (the caller decides whether the old continuation is still
+    /// readable by the new provider). A connector session has no native
+    /// provider and is refused.
+    pub async fn set_native_provider(
+        &self,
+        id: &SessionId,
+        provider_profile: String,
+        model: String,
+        effort: ReasoningEffort,
+    ) -> Result<()> {
+        let session = self
+            .get(id)
+            .await?
+            .ok_or_else(|| Error::storage(format!("no session with id `{}`", id.0)))?;
+        if !matches!(session.kind, SessionKind::Native { .. }) {
+            return Err(Error::config(format!(
+                "session `{}` does not run on the native driver",
+                session.name
+            )));
+        }
+        let kind = SessionKind::Native {
+            provider_profile,
+            model,
+            effort,
+        };
+        let kind =
+            serde_json::to_string(&kind).map_err(|error| Error::storage(error.to_string()))?;
+        self.connection()
+            .execute(
+                "UPDATE gritt_sessions SET kind = ?1, updated_at = ?2 WHERE id = ?3",
+                turso::params![kind, Utc::now().to_rfc3339(), id.0.clone()],
+            )
+            .await
+            .map_err(storage_error)?;
+        Ok(())
+    }
+
     /// Records the phase the model was last told about, or clears it.
     pub async fn set_told_phase(&self, id: &SessionId, phase: Option<Phase>) -> Result<()> {
         self.connection()

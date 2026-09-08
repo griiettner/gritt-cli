@@ -37,7 +37,7 @@
                      │ Ctrl-Q                    quit                                             │cal-memory ready
                      │                                                                            │s
                      │Limitations                                                                 │cal-memory starting
-                     │ · A session is pinned to its provider and model; /new changes them.        │ting and negotiatin
+                     │ · /connect and /models change provider and model for the next turn.        │ting and negotiatin
  ╭───────────────────│ · An installed agent manages its own model, effort, and permissions.       │───────────────────╮
  │Ask Gritt to do som│ · Cost is an estimate from listed prices, never a billed amount.           │                   │
  ╰───────────────────╰ j/k scrolls · Esc closes ──────────────────────────────────────────────────╯───────────────────╯

@@ -1,6 +1,10 @@
 //! The `gritt` binary: argument parsing, configuration, key loading, and
 //! mode selection. The harness crate owns the modes themselves.
 
+// The TUI's nested Tokio setup task exceeds the default trait-solving depth
+// under rustc's stricter recursion accounting (rust-lang/rust#159228).
+#![recursion_limit = "256"]
+
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
