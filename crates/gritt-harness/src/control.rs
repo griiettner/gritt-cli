@@ -189,12 +189,93 @@ impl ControlPlane {
                 reason: "native sessions use the provider model catalog".into(),
             };
         }
+        if id == ConnectorId::ClaudeCode {
+            return self.claude_api_models(refresh).await;
+        }
         match self.connector(id) {
             Some(connector) => connector.discover_models(refresh).await,
             None => ConnectorModelDiscovery::Unavailable {
                 connector: id,
                 reason: format!("{} is not available in this control plane", id.as_str()),
             },
+        }
+    }
+
+    async fn claude_api_models(&self, refresh: bool) -> ConnectorModelDiscovery {
+        use gritt_core::connector::{
+            ConnectorModel, ConnectorModelCatalog, ConnectorModelFreshness,
+        };
+        let unavailable = |reason: String| ConnectorModelDiscovery::Unavailable {
+            connector: ConnectorId::ClaudeCode,
+            reason,
+        };
+        let profiles = &self.builder.config.profiles;
+        let candidates: Vec<_> = profiles
+            .iter()
+            .filter(|(_, profile)| profile.protocol == Protocol::Messages)
+            .collect();
+        let selected = candidates
+            .iter()
+            .find(|(name, _)| self.builder.config.default_profile.as_ref() == Some(*name))
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|(name, _)| name.as_str() == "anthropic")
+            })
+            .or_else(|| (candidates.len() == 1).then(|| &candidates[0]));
+        let Some((name, _)) = selected else {
+            return unavailable("configure an Anthropic API profile (named anthropic or set as default) to list models; Agent default remains available".into());
+        };
+        let mut source = self.clone();
+        if refresh {
+            Arc::make_mut(&mut source.builder)
+                .config
+                .model_list
+                .refresh_interval_secs = 0;
+        }
+        let result = match source.catalog(name).await {
+            Ok(result) => result,
+            Err(error) => return unavailable(error.message),
+        };
+        let (fetched_at, stale) = match result.state {
+            CatalogState::Fresh { fetched_at } => (fetched_at, false),
+            CatalogState::Stale { fetched_at } => (fetched_at, true),
+            CatalogState::Missing { reason } | CatalogState::RefreshFailed { reason } => {
+                return unavailable(reason)
+            }
+            CatalogState::Skipped => {
+                return unavailable(
+                    "API model catalog loading is disabled; Agent default remains available".into(),
+                )
+            }
+        };
+        let catalog = ConnectorModelCatalog {
+            connector: ConnectorId::ClaudeCode,
+            models: result
+                .models
+                .into_iter()
+                .map(|model| ConnectorModel {
+                    id: model.id,
+                    display_label: model.display_name,
+                    input_price_per_million: model.capabilities.input_price_per_million,
+                    output_price_per_million: model.capabilities.output_price_per_million,
+                })
+                .collect(),
+            source: format!("Anthropic API profile {name}; Claude Code validates availability"),
+            fetched_at,
+            freshness: if stale {
+                ConnectorModelFreshness::Stale
+            } else {
+                ConnectorModelFreshness::Current
+            },
+        };
+        if stale {
+            ConnectorModelDiscovery::CachedStale {
+                catalog,
+                reason: "API refresh failed; using cached models".into(),
+            }
+        } else {
+            ConnectorModelDiscovery::Current { catalog }
         }
     }
 
