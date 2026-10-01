@@ -184,6 +184,14 @@ impl ChildControl for PipeChild {
 }
 
 async fn spawn_piped(launch: &Launch) -> Result<Supervised> {
+    spawn_piped_with_input(launch, None).await
+}
+
+/// A bounded control request followed by EOF, for metadata probes only.
+pub(crate) async fn spawn_piped_with_input(
+    launch: &Launch,
+    input: Option<&str>,
+) -> Result<Supervised> {
     let mut command = tokio::process::Command::new(&launch.program);
     // Stdin is closed: every supported agent takes its prompt as an
     // argument, and Codex waits for end-of-input on an open pipe before it
@@ -191,7 +199,11 @@ async fn spawn_piped(launch: &Launch) -> Result<Supervised> {
     command
         .args(&launch.args)
         .current_dir(&launch.cwd)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -209,6 +221,18 @@ async fn spawn_piped(launch: &Launch) -> Result<Supervised> {
             launch.program.display()
         ))
     })?;
+    if let Some(input) = input {
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(input.as_bytes())
+                .await
+                .map_err(|_| Error::connector("cannot write probe control request"))?;
+            stdin
+                .shutdown()
+                .await
+                .map_err(|_| Error::connector("cannot close probe control input"))?;
+        }
+    }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdin = child.stdin.take();

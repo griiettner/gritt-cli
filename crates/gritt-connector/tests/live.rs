@@ -7,9 +7,7 @@ use futures::StreamExt;
 use gritt_connector::protocols::{claude::ClaudeCode, codex::Codex, opencode::OpenCode};
 use gritt_connector::ExternalConnector;
 use gritt_core::config::ConnectorSettings;
-use gritt_core::connector::{
-    AuthState, Connector, ConnectorId, ConnectorModelDiscovery, TaskRequest,
-};
+use gritt_core::connector::{AuthState, Connector, ConnectorId, TaskRequest};
 use gritt_core::event::EventKind;
 use gritt_core::session::SessionId;
 
@@ -187,7 +185,7 @@ async fn live_codex_model_listing() {
 }
 
 #[tokio::test]
-async fn live_claude_model_listing_is_unsupported() {
+async fn live_claude_model_listing() {
     if !gated() {
         eprintln!("GRITT_LIVE_CONNECTOR_TESTS is not set; skipping");
         return;
@@ -201,8 +199,10 @@ async fn live_claude_model_listing_is_unsupported() {
     let outcome = connector.discover_models(true).await;
     eprintln!("claude models: {}", outcome.describe());
     assert!(
-        matches!(outcome, ConnectorModelDiscovery::Unsupported { .. }),
-        "claude has no documented listing command, got {outcome:?}"
+        outcome
+            .catalog()
+            .is_some_and(|catalog| !catalog.models.is_empty()),
+        "Claude Code initialization did not return models: {outcome:?}"
     );
 }
 

@@ -175,6 +175,9 @@ pub trait Protocol: Send + Sync + 'static {
     fn model_list_source(&self) -> &'static str {
         self.executable()
     }
+    fn model_list_input(&self) -> Option<&'static str> {
+        None
+    }
     fn parse_models(
         &self,
         _stdout: &str,
@@ -778,7 +781,20 @@ impl<P: Protocol> ExternalConnector<P> {
                 }
             }
         }
-        let fetched = probe(program, &args, self.timeouts.health).await;
+        let fetched = match self.protocol.model_list_input() {
+            Some(input) => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                crate::health::probe_with_input(
+                    program,
+                    &args,
+                    &cwd,
+                    self.timeouts.health,
+                    Some(input),
+                )
+                .await
+            }
+            None => probe(program, &args, self.timeouts.health).await,
+        };
         match fetched {
             Ok(output) if output.success => {
                 match self.protocol.parse_models(&output.stdout, &output.stderr) {

@@ -58,6 +58,16 @@ pub async fn probe_in(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<ProbeOutput> {
+    probe_with_input(program, args, cwd, timeout, None).await
+}
+
+pub(crate) async fn probe_with_input(
+    program: &Path,
+    args: &[String],
+    cwd: &Path,
+    timeout: Duration,
+    input: Option<&str>,
+) -> Result<ProbeOutput> {
     let launch = Launch {
         program: program.to_owned(),
         args: args.to_vec(),
@@ -65,7 +75,7 @@ pub async fn probe_in(
         env_remove: Vec::new(),
         transport: gritt_core::connector::Transport::MachineReadable,
     };
-    let child = process::spawn(&launch)
+    let child = process::spawn_piped_with_input(&launch, input)
         .await
         .map_err(|_| Error::connector(format!("cannot run {}", program.display())))?;
     let mut guard = ProcessGuard {
