@@ -18,6 +18,17 @@
 #   FAKE_AGENT_MCP_EXIT     exit status of `mcp list` (default 0)
 #   FAKE_AGENT_MCP_SLEEP    seconds `mcp list` sleeps before printing
 case "$1" in
+  -p)
+    if [ "$2" = "--input-format" ]; then
+      IFS= read -r request || exit 2
+      case "$request" in
+        *'"request_id":"gritt-models"'*) ;;
+        *) exit 3 ;;
+      esac
+      printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"gritt-models","response":{"models":[{"value":"sonnet","displayName":"Sonnet"},{"value":"haiku","displayName":"Haiku"}]}}}'
+      exit 0
+    fi
+    ;;
   mcp)
     if [ "$2" = "list" ]; then
       if [ -n "$FAKE_AGENT_MCP_SLEEP" ]; then sleep "$FAKE_AGENT_MCP_SLEEP"; fi

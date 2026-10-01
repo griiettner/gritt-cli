@@ -277,22 +277,16 @@ async fn missing_executable_is_unavailable() {
 }
 
 #[tokio::test]
-async fn claude_listing_is_unsupported_and_selection_still_works() {
+async fn claude_initialization_lists_models_and_selection_still_works() {
     let args_dir = tempfile::tempdir().unwrap();
     let args_path = args_dir.path().join("args.txt");
     let fake = Fake::new(&[("FAKE_AGENT_ARGS_FILE", args_path.display().to_string())]);
     let connector = fake.connector(ClaudeCode, "claude");
     let outcome = connector.discover_models(false).await;
-    assert!(
-        matches!(
-            outcome,
-            ConnectorModelDiscovery::Unsupported {
-                connector: ConnectorId::ClaudeCode,
-                ..
-            }
-        ),
-        "{outcome:?}"
-    );
+    let catalog = outcome.catalog().expect("initialization returns a catalog");
+    assert_eq!(catalog.models[0].id, "sonnet");
+    assert_eq!(catalog.models[1].id, "haiku");
+    assert_eq!(catalog.source, "Claude Code initialization");
     let mut stream = connector
         .start(fake.request("hi", Some("sonnet")))
         .await

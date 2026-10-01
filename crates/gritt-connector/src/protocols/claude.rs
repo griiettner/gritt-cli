@@ -100,6 +100,74 @@ fn classify_claude_status(words: &str) -> (ConnectorMcpStatus, Option<String>) {
 }
 
 impl Protocol for ClaudeCode {
+    fn model_list_args(&self, _refresh: bool) -> Option<Vec<String>> {
+        Some(
+            [
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--no-session-persistence",
+                "--strict-mcp-config",
+                "--mcp-config",
+                "{\"mcpServers\":{}}",
+                "--settings",
+                "{\"disableAllHooks\":true}",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        )
+    }
+
+    fn model_list_input(&self) -> Option<&'static str> {
+        Some("{\"type\":\"control_request\",\"request_id\":\"gritt-models\",\"request\":{\"subtype\":\"initialize\"}}\n")
+    }
+
+    fn model_list_source(&self) -> &'static str {
+        "Claude Code initialization"
+    }
+
+    fn parse_models(
+        &self,
+        stdout: &str,
+        _stderr: &str,
+    ) -> std::result::Result<Vec<gritt_core::connector::ConnectorModel>, super::ModelParseError>
+    {
+        for line in stdout.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if value["type"] != "control_response"
+                || value["response"]["request_id"] != "gritt-models"
+            {
+                continue;
+            }
+            let models = value
+                .pointer("/response/response/models")
+                .and_then(|v| v.as_array())
+                .ok_or(super::ModelParseError::Malformed)?;
+            return models
+                .iter()
+                .map(|model| {
+                    let id = model["value"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .ok_or(super::ModelParseError::Malformed)?;
+                    Ok(gritt_core::connector::ConnectorModel {
+                        id: id.to_owned(),
+                        display_label: model["displayName"].as_str().map(str::to_owned),
+                        input_price_per_million: None,
+                        output_price_per_million: None,
+                    })
+                })
+                .collect();
+        }
+        Err(super::ModelParseError::Malformed)
+    }
+
     fn id(&self) -> ConnectorId {
         ConnectorId::ClaudeCode
     }

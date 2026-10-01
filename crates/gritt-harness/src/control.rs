@@ -190,6 +190,12 @@ impl ControlPlane {
             };
         }
         if id == ConnectorId::ClaudeCode {
+            if let Some(connector) = self.connector(id) {
+                let discovery = connector.discover_models(refresh).await;
+                if discovery.catalog().is_some() {
+                    return discovery;
+                }
+            }
             return self.claude_api_models(refresh).await;
         }
         match self.connector(id) {

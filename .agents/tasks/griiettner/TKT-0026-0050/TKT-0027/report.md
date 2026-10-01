@@ -221,6 +221,7 @@ blind.
 
 ## Updates
 
+- [2026-09-08 verified Claude Code discovery](updates/2026-09-08-claude-discovery-verified.md)
 - [2026-09-08 connector pricing](updates/2026-09-08-connector-pricing.md)
 - [2026-09-08 pricing unit correction](updates/2026-09-08-pricing-unit-correction.md)
 - [2026-09-08 model picker pricing](updates/2026-09-08-model-picker-pricing.md)
